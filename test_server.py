@@ -1131,6 +1131,119 @@ class TestBuildRemoteCommand(unittest.TestCase):
         cmd = server._build_remote_command("ok", "tmux", 3600)
         self.assertIn("has-session -t websh-ok 2>/dev/null || exit", cmd)
 
+    def test_tmux_options_chained_after_new_session(self):
+        """Per-connect tmux options are tacked onto the same `tmux …`
+        invocation via `\\;`, so they apply to the global tmux server
+        whether the session was newly created or re-attached."""
+        cmd = server._build_remote_command(
+            "ok", "tmux", 0,
+            tmux_options=[("mouse", "on"), ("set-clipboard", "on"),
+                          ("history-limit", "100000")])
+        self.assertIn(
+            'new-session -A -D -s websh-ok -- "$SHELL" -l'
+            ' \\; set -g mouse on'
+            ' \\; set -g set-clipboard on'
+            ' \\; set -g history-limit 100000',
+            cmd)
+
+    def test_tmux_options_none_leaves_command_unchanged(self):
+        baseline = server._build_remote_command("ok", "tmux", 0)
+        self.assertEqual(
+            server._build_remote_command("ok", "tmux", 0, tmux_options=None),
+            baseline)
+        self.assertEqual(
+            server._build_remote_command("ok", "tmux", 0, tmux_options=[]),
+            baseline)
+
+    def test_tmux_options_sh_syntax_valid_with_ttl(self):
+        ok, err = self._sh_syntax_ok(server._build_remote_command(
+            "ok", "tmux", 86400,
+            tmux_options=[("mouse", "off"), ("history-limit", "50000")]))
+        self.assertTrue(ok, "sh -n rejected with tmux_options: " + err)
+
+
+# ── _validate_tmux_options ─────────────────────────────────────────────
+
+class TestValidateTmuxOptions(unittest.TestCase):
+    """The /api/connect body is untrusted — only the keys/values listed
+    in _TMUX_BOOL_OPTS / _TMUX_INT_OPTS may flow into the tmux command,
+    and only with values that pass the type/range checks. Everything
+    else must be silently dropped (we don't want to fail a connect over
+    a stale toggle from a future client)."""
+
+    def test_bool_true_becomes_on(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_mouse": True}),
+            [("mouse", "on")])
+
+    def test_bool_false_becomes_off(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_mouse": False}),
+            [("mouse", "off")])
+
+    def test_bool_string_on_off(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_set_clipboard": "on"}),
+            [("set-clipboard", "on")])
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_set_clipboard": "off"}),
+            [("set-clipboard", "off")])
+
+    def test_bool_garbage_dropped(self):
+        # 'true', 2, None — none of these match the allow-list
+        for v in ("true", 2, None, "yes", [], {}):
+            self.assertEqual(
+                server._validate_tmux_options({"tmux_mouse": v}), [],
+                "value %r should have been dropped" % (v,))
+
+    def test_history_limit_in_range(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_history_limit": 100000}),
+            [("history-limit", "100000")])
+
+    def test_history_limit_string_int_accepted(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_history_limit": "5000"}),
+            [("history-limit", "5000")])
+
+    def test_history_limit_below_min_dropped(self):
+        self.assertEqual(
+            server._validate_tmux_options({"tmux_history_limit": 50}), [])
+
+    def test_history_limit_above_max_dropped(self):
+        self.assertEqual(
+            server._validate_tmux_options(
+                {"tmux_history_limit": 99_999_999}),
+            [])
+
+    def test_history_limit_non_numeric_dropped(self):
+        self.assertEqual(
+            server._validate_tmux_options(
+                {"tmux_history_limit": "lots"}),
+            [])
+
+    def test_unknown_keys_ignored(self):
+        body = {
+            "tmux_evil": "rm -rf /",
+            "tmux_status": "on",  # not on the allow-list
+            "host": "ignored",
+            "tmux_mouse": True,
+        }
+        self.assertEqual(
+            server._validate_tmux_options(body), [("mouse", "on")])
+
+    def test_combined_body(self):
+        body = {
+            "tmux_mouse": True,
+            "tmux_set_clipboard": False,
+            "tmux_history_limit": 200000,
+        }
+        self.assertEqual(
+            server._validate_tmux_options(body),
+            [("mouse", "on"),
+             ("set-clipboard", "off"),
+             ("history-limit", "200000")])
+
 
 # Fake tmux used by TestWatchdogRuntime — simulates has-session,
 # display, kill-session, new-session using a files-on-disk state
@@ -1463,6 +1576,786 @@ class TestTerminateRemoteTmux(unittest.TestCase):
         with unittest.mock.patch.object(server.subprocess, "run", fake_run):
             s.terminate_remote_tmux()
         self.assertEqual(called["n"], 0)
+
+
+class TestPushTmuxOptions(unittest.TestCase):
+    """Direct unit tests for SSHSession.push_tmux_options() — the
+    side-channel path that applies tmux options live without typing
+    into the foreground PTY."""
+
+    def _fake_session(self, persistent=True, slot_id="ok", control_path=None,
+                      tmux_cmd="tmux"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-tmuxopts"
+        s.persistent = persistent
+        s.slot_id = slot_id
+        s.alive = True
+        s.master_fd = None
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = tmux_cmd
+        return s
+
+    def test_noop_when_not_persistent(self):
+        s = self._fake_session(persistent=False)
+        ok, err = s.push_tmux_options([("mouse", "on")])
+        self.assertFalse(ok)
+        self.assertIn("not a persistent", err)
+
+    def test_noop_when_no_slot_id(self):
+        s = self._fake_session(slot_id=None)
+        ok, err = s.push_tmux_options([("mouse", "on")])
+        self.assertFalse(ok)
+
+    def test_error_when_socket_missing(self):
+        s = self._fake_session(control_path="/nonexistent/mux.sock")
+        ok, err = s.push_tmux_options([("mouse", "on")])
+        self.assertFalse(ok)
+        self.assertIn("control socket", err)
+
+    def test_empty_options_no_ssh_invocation(self):
+        # An empty list should short-circuit before spawning ssh.
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            called = {"n": 0}
+            def fake_run(cmd, **kw):
+                called["n"] += 1
+                class R:
+                    returncode = 0
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options([])
+            self.assertTrue(ok)
+            self.assertEqual(called["n"], 0)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_invokes_ssh_with_chained_set_g(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            calls = []
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                class R:
+                    returncode = 0
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options(
+                    [("mouse", "on"), ("set-clipboard", "off"),
+                     ("history-limit", "200000")])
+            self.assertTrue(ok, err)
+            self.assertEqual(len(calls), 1)
+            cmd = calls[0]
+            self.assertEqual(cmd[0], "ssh")
+            self.assertIn("ControlPath=" + sock, cmd)
+            # The remote command is the last element. All three set-g
+            # lines must end up chained into a *single* tmux invocation
+            # via tmux's own `\;` separator — one ssh roundtrip, one
+            # tmux server fork on the target, atomic application.
+            remote = cmd[-1]
+            self.assertEqual(
+                remote,
+                "tmux set -g mouse on \\; set -g set-clipboard off "
+                "\\; set -g history-limit 200000")
+            # `--` separator must precede the host so an attacker-controlled
+            # _host can never be parsed as an ssh flag.
+            self.assertIn("--", cmd)
+            self.assertLess(cmd.index("--"), cmd.index(s._host))
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_nonzero_exit_returns_error(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            def fake_run(cmd, **kw):
+                class R:
+                    returncode = 2
+                    stderr = b"unknown option mouse"
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options([("mouse", "on")])
+            self.assertFalse(ok)
+            self.assertIn("tmux exit", err)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_timeout_returns_error(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            def fake_run(cmd, **kw):
+                raise subprocess.TimeoutExpired(cmd, 10)
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.push_tmux_options([("mouse", "on")])
+            self.assertFalse(ok)
+            self.assertIn("timeout", err)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_custom_tmux_cmd_inlined(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock,
+                                   tmux_cmd="/usr/local/bin/tmux")
+            calls = []
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                class R:
+                    returncode = 0
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                s.push_tmux_options([("mouse", "on")])
+            # Single option case: no chaining, just one set-g.
+            self.assertEqual(
+                calls[0][-1], "/usr/local/bin/tmux set -g mouse on")
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestTmuxOptionsHTTPDispatch(unittest.TestCase):
+    """HTTP-level dispatch for POST /api/tmux_options — checks routing,
+    body validation, and unknown-session handling. Live ssh is mocked
+    via push_tmux_options."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18768
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(
+            target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _post(self, path, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}{}".format(self.port, path)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    def test_unknown_session_404(self):
+        body, code = self._post("/api/tmux_options",
+                                {"session_id": str(uuid.uuid4()),
+                                 "tmux_mouse": True})
+        self.assertEqual(code, 404)
+
+    def test_invalid_session_id_404(self):
+        body, code = self._post("/api/tmux_options",
+                                {"session_id": "not-a-uuid",
+                                 "tmux_mouse": True})
+        self.assertEqual(code, 404)
+
+    def test_invalid_json_400(self):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/tmux_options".format(self.port)
+        req = Request(url, data=b"{bad",
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            body = json.loads(resp.read().decode("utf-8"))
+            code = resp.getcode()
+        except Exception as e:
+            body = json.loads(e.read().decode("utf-8"))
+            code = e.code
+        self.assertEqual(code, 400)
+
+    def test_dispatches_to_session_with_validated_options(self):
+        # Plant a fake session in the registry, capture push_tmux_options call.
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            def push_tmux_options(self, opts):
+                captured["opts"] = list(opts)
+                return True, ""
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/tmux_options", {
+                "session_id": sid,
+                "tmux_mouse": True,
+                "tmux_set_clipboard": False,
+                "tmux_history_limit": 50000,
+                # Garbage that must be dropped by validation, never passed
+                # through to the session:
+                "tmux_evil": "rm -rf /",
+                "tmux_status": "on",
+            })
+            self.assertEqual(code, 200)
+            self.assertTrue(body["ok"])
+            self.assertEqual(set(body["applied"]),
+                             {"mouse", "set-clipboard", "history-limit"})
+            self.assertIn(("mouse", "on"), captured["opts"])
+            self.assertIn(("set-clipboard", "off"), captured["opts"])
+            self.assertIn(("history-limit", "50000"), captured["opts"])
+            self.assertEqual(len(captured["opts"]), 3)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_session_error_propagated_as_502(self):
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            def push_tmux_options(self, opts):
+                return False, "control socket not ready"
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/tmux_options",
+                                    {"session_id": sid, "tmux_mouse": True})
+            self.assertEqual(code, 502)
+            self.assertIn("control socket", body["error"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+
+class TestFinalizeUpload(unittest.TestCase):
+    """Direct unit tests for SSHSession.finalize_upload() — the
+    side-channel path that mv's an uploaded $HOME/<tmp> into the
+    pane's cwd via tmux's #{pane_current_path}."""
+
+    def _fake_session(self, persistent=True, slot_id="ok",
+                      control_path=None, tmux_cmd="tmux"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-finalize"
+        s.persistent = persistent
+        s.slot_id = slot_id
+        s.alive = True
+        s.master_fd = None
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = tmux_cmd
+        return s
+
+    def test_non_persistent_returns_signal(self):
+        # Caller relies on the literal "non-persistent" string to know
+        # it should fall back to the foreground-mv path. Test guards
+        # the exact return value so a typo doesn't break that contract.
+        s = self._fake_session(persistent=False)
+        ok, msg = s.finalize_upload("tmp", "final.txt")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "non-persistent")
+
+    def test_no_slot_id_returns_signal(self):
+        s = self._fake_session(slot_id=None)
+        ok, msg = s.finalize_upload("tmp", "final.txt")
+        self.assertFalse(ok)
+        self.assertEqual(msg, "non-persistent")
+
+    def test_socket_missing_errors(self):
+        s = self._fake_session(control_path="/nonexistent/mux.sock")
+        ok, msg = s.finalize_upload("tmp", "final.txt")
+        self.assertFalse(ok)
+        self.assertIn("control socket", msg)
+
+    def test_remote_command_uses_pane_current_path(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            calls = []
+            def fake_run(cmd, **kw):
+                calls.append(cmd)
+                class R:
+                    returncode = 0
+                    stdout = b"/home/alice/work/file.txt"
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, path = s.finalize_upload(
+                    ".websh-tmp-abc", "file.txt")
+            self.assertTrue(ok, path)
+            self.assertEqual(path, "/home/alice/work/file.txt")
+            self.assertEqual(len(calls), 1)
+            cmd = calls[0]
+            remote = cmd[-1]
+            # Must ask tmux for pane_current_path — that's the whole
+            # point of going server-side. /proc isn't portable; tmux is.
+            self.assertIn("#{pane_current_path}", remote)
+            self.assertIn("websh-ok", remote)
+            # Filenames must be base64-encoded — never interpolated raw.
+            import base64
+            self.assertIn(
+                base64.b64encode(b".websh-tmp-abc").decode(), remote)
+            self.assertIn(
+                base64.b64encode(b"file.txt").decode(), remote)
+            # `--` after rm/mv/cd protects against `-`-prefixed inputs.
+            # (mv and cd both get `--`; we don't currently use rm here.)
+            self.assertIn('mv -- "$HOME/$t"', remote)
+            self.assertIn('cd -- "$cwd"', remote)
+            # ssh argv: `--` must precede the host.
+            self.assertIn("--", cmd)
+            self.assertLess(cmd.index("--"), cmd.index(s._host))
+            # ControlMaster path threaded through.
+            self.assertIn("ControlPath=" + sock, cmd)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_falls_back_to_home_when_tmux_unavailable(self):
+        # The remote command does `[ -n "$cwd" ] || cwd="$HOME"` —
+        # we want to make sure that fallback is in the script, since
+        # tmux can fail (e.g. session was killed between connect and
+        # finalize) and we don't want the mv to end up in /.
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            captured = {}
+            def fake_run(cmd, **kw):
+                captured["remote"] = cmd[-1]
+                class R:
+                    returncode = 0
+                    stdout = b""
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                s.finalize_upload("t", "f")
+            self.assertIn('cwd="$HOME"', captured["remote"])
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_nonzero_exit_returns_error(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            def fake_run(cmd, **kw):
+                class R:
+                    returncode = 1
+                    stdout = b""
+                    stderr = b"mv: target not writable"
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, msg = s.finalize_upload("tmp", "final.txt")
+            self.assertFalse(ok)
+            self.assertIn("finalize exit", msg)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_timeout_returns_error(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            def fake_run(cmd, **kw):
+                raise subprocess.TimeoutExpired(cmd, 15)
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, msg = s.finalize_upload("tmp", "final.txt")
+            self.assertFalse(ok)
+            self.assertIn("timeout", msg)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_pathological_filename_stays_base64(self):
+        """A filename with shell metacharacters / newline must end up
+        base64-encoded — never interpolated raw into the remote command."""
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            captured = {}
+            def fake_run(cmd, **kw):
+                captured["remote"] = cmd[-1]
+                class R:
+                    returncode = 0
+                    stdout = b""
+                    stderr = b""
+                return R()
+            evil = "; rm -rf ~; echo \"\n"
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                s.finalize_upload(".websh-tmp-x", evil)
+            # The literal string must NOT appear — only its base64.
+            self.assertNotIn(evil, captured["remote"])
+            self.assertNotIn("rm -rf", captured["remote"])
+            import base64
+            self.assertIn(
+                base64.b64encode(evil.encode()).decode(), captured["remote"])
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_no_extension_increment_strips_prior_suffix(self):
+        """Regression: the no-extension branch of the auto-increment
+        loop must strip a prior `(n)` before appending the next one,
+        matching the JS client's makeUploadMvCmd. Otherwise repeated
+        collisions on a name like `Makefile` produce `Makefile(1)(2)(3)`
+        instead of `Makefile(1)`, `Makefile(2)`, `Makefile(3)`."""
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            captured = {}
+            def fake_run(cmd, **kw):
+                captured["remote"] = cmd[-1]
+                class R:
+                    returncode = 0
+                    stdout = b""
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                s.finalize_upload("tmp", "Makefile")
+            remote = captured["remote"]
+            # The fixed pattern uses ${f%(*)} to drop any prior `(n)`
+            # before appending the new one.
+            self.assertIn('${f%(*)}($n)', remote)
+            # The buggy pattern f="$f($n)" must not be present.
+            self.assertNotIn('f="$f($n)"', remote)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestRemoveRemoteTmp(unittest.TestCase):
+    """Direct unit tests for SSHSession.remove_remote_tmp() — the
+    side-channel cancel-cleanup path."""
+
+    def _fake_session(self, control_path=None):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-rmtmp"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s.master_fd = None
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = "tmux"
+        return s
+
+    def test_socket_missing_errors(self):
+        s = self._fake_session(control_path="/nonexistent/mux.sock")
+        ok, err = s.remove_remote_tmp(".websh-tmp-x")
+        self.assertFalse(ok)
+        self.assertIn("control socket", err)
+
+    def test_runs_rm_with_double_dash(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            captured = {}
+            def fake_run(cmd, **kw):
+                captured["cmd"] = cmd
+                class R:
+                    returncode = 0
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.remove_remote_tmp(".websh-tmp-abc")
+            self.assertTrue(ok, err)
+            remote = captured["cmd"][-1]
+            self.assertIn('rm -f -- "$HOME/$n"', remote)
+            # `--` separator before host in the ssh argv.
+            self.assertIn("--", captured["cmd"])
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_nonzero_exit_returns_error(self):
+        tmpdir = tempfile.mkdtemp()
+        sock = os.path.join(tmpdir, "mux.sock")
+        open(sock, "w").close()
+        try:
+            s = self._fake_session(control_path=sock)
+            def fake_run(cmd, **kw):
+                class R:
+                    returncode = 1
+                    stderr = b""
+                return R()
+            with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+                ok, err = s.remove_remote_tmp(".websh-tmp-x")
+            self.assertFalse(ok)
+            self.assertIn("rm exit", err)
+        finally:
+            import shutil
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class TestUploadFinalizeHTTPDispatch(unittest.TestCase):
+    """HTTP-level dispatch for /api/upload_finalize and /api/upload_cancel.
+    The session methods are mocked; we're testing routing, body
+    validation, and the non_persistent-vs-error response shape."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18769
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(
+            target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _post(self, path, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}{}".format(self.port, path)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    # ── /api/upload_finalize ──
+    def test_finalize_unknown_session_404(self):
+        body, code = self._post("/api/upload_finalize", {
+            "session_id": str(uuid.uuid4()),
+            "tmp": ".websh-tmp-x", "final": "f.txt"})
+        self.assertEqual(code, 404)
+
+    def test_finalize_invalid_tmp_400(self):
+        # absolute path must be rejected
+        body, code = self._post("/api/upload_finalize", {
+            "session_id": str(uuid.uuid4()),
+            "tmp": "/etc/passwd", "final": "f.txt"})
+        self.assertEqual(code, 400)
+        self.assertIn("tmp", body["error"])
+
+    def test_finalize_traversal_in_tmp_400(self):
+        body, code = self._post("/api/upload_finalize", {
+            "session_id": str(uuid.uuid4()),
+            "tmp": "../etc/passwd", "final": "f.txt"})
+        self.assertEqual(code, 400)
+
+    def test_finalize_nul_in_tmp_400(self):
+        body, code = self._post("/api/upload_finalize", {
+            "session_id": str(uuid.uuid4()),
+            "tmp": "ok\x00.tmp", "final": "f.txt"})
+        self.assertEqual(code, 400)
+
+    def test_finalize_slash_in_final_400(self):
+        # final must be a basename — slashes would let the client
+        # write outside the pane cwd.
+        body, code = self._post("/api/upload_finalize", {
+            "session_id": str(uuid.uuid4()),
+            "tmp": "ok.tmp", "final": "../escape.txt"})
+        self.assertEqual(code, 400)
+        self.assertIn("final", body["error"])
+
+    def test_finalize_dot_in_final_400(self):
+        for f in (".", "..", ""):
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": str(uuid.uuid4()),
+                "tmp": "ok.tmp", "final": f})
+            self.assertEqual(code, 400, "final=%r should reject" % f)
+
+    def test_finalize_success_returns_path(self):
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            last_activity = 0
+            def finalize_upload(self, tmp, final):
+                captured["tmp"] = tmp
+                captured["final"] = final
+                return True, "/home/alice/work/" + final
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": ".websh-tmp-x",
+                "final": "report.csv"})
+            self.assertEqual(code, 200)
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["path"], "/home/alice/work/report.csv")
+            self.assertEqual(captured["tmp"], ".websh-tmp-x")
+            self.assertEqual(captured["final"], "report.csv")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_finalize_non_persistent_returns_200_with_flag(self):
+        # The client uses non_persistent: true to know it should fall
+        # back to its foreground-mv path. This must NOT be a 502 — the
+        # client treats 502 as a hard failure.
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = False
+            slot_id = None
+            last_activity = 0
+            def finalize_upload(self, tmp, final):
+                return False, "non-persistent"
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": "x", "final": "f"})
+            self.assertEqual(code, 200)
+            self.assertFalse(body["ok"])
+            self.assertTrue(body["non_persistent"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_finalize_session_error_502(self):
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            last_activity = 0
+            def finalize_upload(self, tmp, final):
+                return False, "finalize exit 1: mv refused"
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": "x", "final": "f"})
+            self.assertEqual(code, 502)
+            self.assertIn("mv refused", body["error"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    # ── /api/upload_cancel ──
+    def test_cancel_unknown_session_404(self):
+        body, code = self._post("/api/upload_cancel", {
+            "session_id": str(uuid.uuid4()), "tmp": ".websh-tmp-x"})
+        self.assertEqual(code, 404)
+
+    def test_cancel_invalid_tmp_400(self):
+        body, code = self._post("/api/upload_cancel", {
+            "session_id": str(uuid.uuid4()), "tmp": "/abs/path"})
+        self.assertEqual(code, 400)
+
+    def test_cancel_success(self):
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            def remove_remote_tmp(self, tmp):
+                captured["tmp"] = tmp
+                return True, ""
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_cancel", {
+                "session_id": sid, "tmp": ".websh-tmp-abc"})
+            self.assertEqual(code, 200)
+            self.assertTrue(body["ok"])
+            self.assertEqual(captured["tmp"], ".websh-tmp-abc")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_cancel_session_error_502(self):
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            def remove_remote_tmp(self, tmp):
+                return False, "rm exit 1"
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_cancel", {
+                "session_id": sid, "tmp": ".websh-tmp-x"})
+            self.assertEqual(code, 502)
+            self.assertIn("rm exit", body["error"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+
+class TestUploadPathNULRejection(unittest.TestCase):
+    """The /api/upload validator rejects \\x00 in rel_path because bash
+    silently truncates NUL bytes in variable values, which would land
+    a file at a different name than the client asked for."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18770
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(
+            target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def test_nul_byte_in_path_400(self):
+        from urllib.request import urlopen, Request
+        # %00 in the URL-encoded path query.
+        url = "http://127.0.0.1:{}/api/upload?session_id={}&path=ok%00.tmp".format(
+            self.port, uuid.uuid4())
+        req = Request(url, data=b"hello",
+                      headers={"Content-Type": "application/octet-stream"})
+        try:
+            resp = urlopen(req, timeout=5)
+            body = json.loads(resp.read().decode("utf-8"))
+            code = resp.getcode()
+        except Exception as e:
+            body = json.loads(e.read().decode("utf-8"))
+            code = e.code
+        self.assertEqual(code, 400)
+        self.assertIn("invalid", body["error"])
 
 
 class TestSlotIdSecurity(unittest.TestCase):

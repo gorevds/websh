@@ -36,7 +36,13 @@ let pendingSplit = null; // {fromId, dir} while overlayMode==='split' pre-materi
 let serverConfig = null;
 // ── Terminal display settings (size / line-height / weight / font) ─
 const SETTINGS_KEY = 'websh_settings';
-const DEFAULT_SETTINGS = { fontSize: 14, lineHeight: 1.0, fontWeight: 400, font: 'jetbrains-mono' };
+const DEFAULT_SETTINGS = {
+  fontSize: 14, lineHeight: 1.0, fontWeight: 400, font: 'jetbrains-mono',
+  // tmux options sent on /api/connect when persistent. Defaults give a
+  // sensible "wheel scrolls" UX out of the box; users on hosts with their
+  // own .tmux.conf can uncheck them to fall back to that file.
+  tmuxMouse: true, tmuxClipboard: true, tmuxHistory: 100000
+};
 // id → [label, webfont-name-or-null, fallback-stack]
 // webfont-name is the family loaded via Google Fonts; null = system only.
 const FONTS = {
@@ -499,6 +505,13 @@ function buildConnectBody(rec, termCols, termRows) {
   if (rec.persistent) {
     b.persistent = true;
     b.slot_id = rec.slot_id || slotIdFor(rec.user, rec.host, rec.port);
+    // tmux options from local settings, applied on every connect/resume.
+    // Server validates against an allow-list, so unexpected values are
+    // dropped silently rather than fail the connect.
+    b.tmux_mouse = !!settings.tmuxMouse;
+    b.tmux_set_clipboard = !!settings.tmuxClipboard;
+    let hl = parseInt(settings.tmuxHistory, 10);
+    if (Number.isFinite(hl) && hl >= 100) b.tmux_history_limit = hl;
   }
   if (rec.tmux_cmd && rec.tmux_cmd !== 'tmux') b.tmux_cmd = rec.tmux_cmd;
   return b;
@@ -594,19 +607,56 @@ function clearSavedSessions() {
 // ── Export terminal ─────────────────────────────────────────────────
 function exportTerminal() {
   let p = panes[activeId]; if (!p) return;
-  let buf = p.term.buffer.active;
-  let lines = [];
-  for (let i = 0; i <= buf.length - 1; i++) {
-    let line = buf.getLine(i);
-    if (line) lines.push(line.translateToString(true));
+  let filename = (p.label || 'terminal') + '.txt';
+  // Persistent panes run inside tmux, which keeps its own scrollback —
+  // xterm.js only sees the alt-screen, so its buffers are useless for
+  // export. Pull the real buffer over the ControlMaster side-channel.
+  if (p.persistent && p.sid) {
+    let url = `${API}?action=tmux_capture&session_id=${encodeURIComponent(p.sid)}`;
+    fetch(url).then(r => {
+      if (!r.ok) {
+        return r.json().catch(() => ({error: 'capture failed'}))
+          .then(j => Promise.reject(j.error || 'capture failed'));
+      }
+      return r.text();
+    }).then(text => {
+      // tmux capture-pane keeps trailing blank lines; trim them off so
+      // the file ends at the last real output.
+      text = text.replace(/\n+$/, '') + '\n';
+      saveTextAs(filename, text);
+    }).catch(err => {
+      console.warn('tmux capture failed, falling back to xterm buffer:', err);
+      saveTextAs(filename, dumpXtermBuffers(p));
+    });
+    return;
   }
-  // Trim trailing empty lines
+  saveTextAs(filename, dumpXtermBuffers(p));
+}
+
+function dumpXtermBuffers(p) {
+  let lines = [];
+  let dump = (buf) => {
+    if (!buf) return;
+    for (let i = 0; i < buf.length; i++) {
+      let line = buf.getLine(i);
+      if (line) lines.push(line.translateToString(true));
+    }
+  };
+  dump(p.term.buffer.normal);
+  if (p.term.buffer.active.type === 'alternate') {
+    lines.push('');
+    lines.push('─── alternate screen ───');
+    dump(p.term.buffer.alternate);
+  }
   while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-  let text = lines.join('\n') + '\n';
+  return lines.join('\n') + '\n';
+}
+
+function saveTextAs(filename, text) {
   let blob = new Blob([text], {type: 'text/plain'});
   let a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
-  a.download = (p.label || 'terminal') + '.txt';
+  a.download = filename;
   document.body.appendChild(a); a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(a.href);
@@ -1563,9 +1613,7 @@ function renderServerConnections() {
   if(serverConfig.restrict_hosts){$('manualForm').classList.add('h');$('divider').classList.add('h')}
 }
 
-// ── File upload (background SSH session) ────────────────────────────
-const SLICE_SIZE = 32768; // 32KB file slices
-
+// ── File upload (binary stream via SSH ControlMaster) ───────────────
 function delay(ms) { return new Promise(r => { setTimeout(r, ms); }); }
 
 function bgSend(u, data) {
@@ -1593,49 +1641,87 @@ function handleUpload(id, input) {
   p.upload = {
     files:files, fileIndex:0, cancelled:false,
     totalSize:totalSize, sentBytes:0, fileOffset:0, fileSize:0,
-    bgSid:null, currentFile:null
+    currentFile:null, currentTmp:null, xhr:null,
+    // Persistent sessions: server-side finalize landed each file at
+    // a known absolute path. Surfaced in the final banner so the
+    // user knows exactly where each upload went.
+    placed:[],
+    // Non-persistent + alt-screen: mv was skipped, file is at
+    // $HOME/.websh-tmp-* and the user must move it themselves.
+    staged:[]
   };
   showUploadProgress(p);
   updatePaneBadge(p);
-
-  // Create background SSH session with same credentials (no tmux wrap).
-  let body = buildConnectBody(paneRecord(p), 80, 24);
-  delete body.persistent; delete body.slot_id;
-  body.background = true;
-  api('connect', {body: body}).then(r => {
-    if (!p.upload || p.upload.cancelled) return;
-    if (r.error || r.alive === false) { finishUpload(p, false); return; }
-    p.upload.bgSid = r.session_id;
-    // Wait for SSH to fully connect
-    return delay(2000);
-  }).then(() => {
-    if (!p.upload || p.upload.cancelled) return;
-    // Drain initial output (MOTD etc) so it doesn't interfere
-    return api('output', {query: '&session_id=' + p.upload.bgSid});
-  }).then(() => {
-    if (!p.upload || p.upload.cancelled) return;
-    uploadNextFile(p);
-  }).catch(() => { finishUpload(p, false); });
+  uploadNextFile(p);
 }
 
 // Encode filename as base64 to avoid ANY shell injection
 function safeShellName(name) { return btoa(unescape(encodeURIComponent(name))); }
 
-function makeRenamCmd(name) {
-  // Shell command: mv tmp → final, with auto-increment if final exists.
-  // All filenames base64-encoded to prevent injection.
-  let b64 = safeShellName(name);
-  let b64tmp = safeShellName('.' + name + '.websh.tmp');
-  // Decode names into shell vars, then increment if needed, then mv
-  return `t="$(echo ${b64tmp} | base64 -d)"; ` +
-    `f="$(echo ${b64} | base64 -d)"; ` +
+// Move uploaded tmp file from $HOME → cwd of foreground shell, with
+// auto-increment if a file with that name already exists.
+function makeUploadMvCmd(finalName, tmpName) {
+  let bf = safeShellName(finalName);
+  let bt = safeShellName(tmpName);
+  return `t="$HOME/$(echo ${bt} | base64 -d)"; ` +
+    `f="$(echo ${bf} | base64 -d)"; ` +
     'b="${f%.*}"; e="${f##*.}"; ' +
     'if [ "$b.$e" = "$f" ]; then ' +
       'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; ' +
     'else ' +
       'n=1; while [ -e "$f" ]; do f="${f%(*)}($n)"; n=$((n+1)); done; ' +
     'fi; ' +
-    'mv "$t" "$f"\n';
+    // `--` plus `./` keep mv from parsing the destination as a flag if
+    // the user uploaded a file whose name starts with `-`. Mirrors the
+    // server-side finalize_upload path.
+    'mv -- "$t" "./$f"\n';
+}
+
+// After bytes have landed at $HOME/<tmp>, move them into the user's
+// shell cwd. Persistent sessions take the server-side path: a single
+// /api/upload_finalize call uses tmux's #{pane_current_path} +
+// ControlMaster to do the mv with no foreground keystrokes, so vim,
+// less, htop etc. are never disturbed. Non-persistent sessions fall
+// back to typing the mv into the foreground PTY (the only thing
+// that knows their cwd), with an alt-screen guard so the keystrokes
+// are skipped while a TUI is in front — those files are surfaced as
+// staged at $HOME/.websh-tmp-* in the upload banner so the user can
+// move them by hand.
+function finalizeUploadedFile(p, file) {
+  let u = p.upload;
+  let tmp = u.currentTmp, fname = u.currentFile;
+  if (p.persistent) {
+    return api('upload_finalize', { body: { session_id: p.sid,
+                                             tmp: tmp, final: fname } })
+      .then(r => {
+        if (r && r.ok && r.path) {
+          u.placed.push({ name: fname, path: r.path });
+          return;
+        }
+        // Server says non-persistent (shouldn't happen for a persistent
+        // pane, but is the documented graceful-fallback shape) — fall
+        // through to the keystroke path. Any other error is a hard
+        // failure.
+        if (r && r.non_persistent) return foregroundMv(p, fname, tmp);
+        return Promise.reject(r && r.error ? r.error : 'finalize failed');
+      });
+  }
+  return foregroundMv(p, fname, tmp);
+}
+
+// Type the mv into the foreground PTY. Only path that knows the
+// non-persistent shell's cwd. Skipped under alt-screen so we don't
+// stuff text into a running editor.
+function foregroundMv(p, fname, tmp) {
+  let u = p.upload;
+  let altScreen = p.term && p.term.buffer.active &&
+    p.term.buffer.active.type === 'alternate';
+  if (altScreen) {
+    u.staged.push({ name: fname, tmp: tmp });
+    return Promise.resolve();
+  }
+  return api('input', { body: { session_id: p.sid,
+                                data: makeUploadMvCmd(fname, tmp) } });
 }
 
 function uploadNextFile(p) {
@@ -1643,65 +1729,48 @@ function uploadNextFile(p) {
   if (!u || u.cancelled) return;
   if (u.fileIndex >= u.files.length) { finishUpload(p, true); return; }
   let file = u.files[u.fileIndex];
-  u.fileOffset = 0;
   u.fileSize = file.size;
+  u.fileOffset = 0;
   u.currentFile = file.name;
-  u.currentTmp = '.' + file.name + '.websh.tmp';
+  // Random tmp name in $HOME — avoids collisions and makes cleanup easy.
+  u.currentTmp = '.websh-tmp-' +
+    Math.random().toString(36).slice(2, 12) + '-' +
+    Date.now().toString(36);
 
-  let b64tmp = safeShellName(u.currentTmp);
-  // Start base64 decode into temp file (filename base64-encoded — injection-safe)
-  bgSend(u, `base64 -d > "$(echo ${b64tmp} | base64 -d)"\n`).then(() => {
+  let xhr = new XMLHttpRequest();
+  u.xhr = xhr;
+  let url = `${API}?action=upload` +
+    `&session_id=${encodeURIComponent(p.sid)}` +
+    `&path=${encodeURIComponent(u.currentTmp)}`;
+  xhr.open('POST', url, true);
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.upload.onprogress = e => {
     if (!u || u.cancelled) return;
-    return delay(50);
-  }).then(() => {
-    sendNextSlice(p, file);
-  }).catch(() => { finishUpload(p, false); });
-}
-
-function sendNextSlice(p, file) {
-  let u = p.upload;
-  if (!u || u.cancelled || !u.bgSid) return;
-
-  if (u.fileOffset >= file.size) {
-    // Send Ctrl+D to end base64, rename tmp → final, move to next file
-    bgSend(u, '\x04').then(() => {
-      return delay(50);
-    }).then(() => {
-      // Rename tmp → final (auto-increments if file already exists)
-      return bgSend(u, makeRenamCmd(u.currentFile));
-    }).then(() => {
+    u.fileOffset = e.loaded;
+    updateUploadProgress(p);
+  };
+  xhr.onload = () => {
+    if (!u || u.cancelled) return;
+    let resp = null;
+    try { resp = JSON.parse(xhr.responseText); } catch(e) {}
+    if (xhr.status !== 200 || !resp || !resp.ok) {
+      finishUpload(p, false); return;
+    }
+    finalizeUploadedFile(p, file).then(() => {
+      if (!u || u.cancelled) return;
       u.sentBytes += file.size;
+      u.fileOffset = 0;
       u.fileIndex++;
       u.currentFile = null;
       u.currentTmp = null;
+      u.xhr = null;
       updateUploadProgress(p);
-      return delay(100);
-    }).then(() => {
       uploadNextFile(p);
-    }).catch(() => { finishUpload(p, false); });
-    return;
-  }
-
-  let end = Math.min(u.fileOffset + SLICE_SIZE, file.size);
-  let slice = file.slice(u.fileOffset, end);
-  let reader = new FileReader();
-  reader.onload = e => {
-    if (!u || u.cancelled) return;
-    let bytes = new Uint8Array(e.target.result);
-    let binary = '';
-    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-    let b64 = btoa(binary);
-    let lines = '';
-    for (let j = 0; j < b64.length; j += 76) lines += b64.substring(j, j + 76) + '\n';
-    bgSend(u, lines).then(() => {
-      if (!u || u.cancelled) return;
-      u.fileOffset = end;
-      updateUploadProgress(p);
-      sendNextSlice(p, file);
-    }).catch(() => { finishUpload(p, false); });
+    })
+    .catch(() => { finishUpload(p, false); });
   };
-  reader.onerror = () => { finishUpload(p, false); };
-  reader.readAsArrayBuffer(slice);
+  xhr.onerror = () => { if (u && !u.cancelled) finishUpload(p, false); };
+  xhr.send(file);
 }
 
 function showUploadProgress(p) {
@@ -1740,10 +1809,8 @@ function updateUploadProgress(p) {
 }
 
 function closeUploadSession(u) {
-  if (u && u.bgSid) {
-    api('disconnect', {body: {session_id: u.bgSid}}).catch(() => {});
-    u.bgSid = null;
-  }
+  if (!u) return;
+  if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
 }
 
 function finishUpload(p, success) {
@@ -1751,45 +1818,56 @@ function finishUpload(p, success) {
   let u = p.upload;
   u.cancelled = true;
   closeUploadSession(u);
+  let staged = u.staged || [];
+  let placed = u.placed || [];
   let el = p.el.querySelector('[data-upload-progress]');
   if (el) {
     let bar = el.querySelector('.upload-progress-bar');
     let text = el.querySelector('.upload-progress-text');
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
-      text.textContent = 'Upload complete';
+      if (staged.length) {
+        // Files landed in $HOME but auto-mv was skipped (alt-screen).
+        // Tell the user where to look so the upload isn't a silent no-op.
+        text.textContent = staged.length === 1
+          ? 'Saved to $HOME/' + staged[0].tmp + ' (alt-screen — mv manually)'
+          : 'Saved ' + staged.length + ' files to $HOME/.websh-tmp-* (alt-screen)';
+      } else if (placed.length === 1) {
+        // Persistent finalize gave us the absolute path — show it.
+        text.textContent = 'Saved to ' + placed[0].path;
+      } else {
+        text.textContent = 'Upload complete';
+      }
     } else {
       bar.style.background = 'var(--dg)';
       text.textContent = 'Upload failed';
     }
   }
+  // Banner stays visible longer when there's a path the user needs to
+  // act on, so they have time to read it before it disappears.
+  let dismissAfter = (success && (staged.length || placed.length === 1))
+    ? 6000 : 2000;
   setTimeout(() => {
     p.upload = null;
     hideUploadProgress(p);
     updatePaneBadge(p);
     if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  }, dismissAfter);
 }
 
 function cancelUpload(id) {
   let p = panes[id];
   if (!p || !p.upload) return;
   let u = p.upload;
-  let fileName = u.currentFile;
-  u.cancelled = true;
-
-  // Abort base64, delete temp file, close background session
   let tmpName = u.currentTmp;
-  if (u.bgSid) {
-    bgSend(u, '\x03\n').then(() => {
-      if (tmpName) { let b=safeShellName(tmpName); return bgSend(u, `rm -f "$(echo ${b} | base64 -d)"\n`); }
-    }).then(() => {
-      return delay(100);
-    }).then(() => {
-      closeUploadSession(u);
-    }).catch(() => {
-      closeUploadSession(u);
-    });
+  u.cancelled = true;
+  if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
+  // Best-effort cleanup of the partial $HOME/<tmp> via the
+  // ControlMaster side-channel — keystroke-free, so a TUI in front
+  // of the foreground PTY (vim/less/htop) is left alone.
+  if (tmpName) {
+    api('upload_cancel', { body: { session_id: p.sid, tmp: tmpName } })
+      .catch(() => {});
   }
 
   let el = p.el.querySelector('[data-upload-progress]');
@@ -2090,6 +2168,9 @@ function openOptions(){
   $('optLineHeightVal').textContent = Number(settings.lineHeight).toFixed(2);
   $('optWeight').value = settings.fontWeight;
   $('optWeightVal').textContent = settings.fontWeight;
+  let cm = $('optTmuxMouse'); if (cm) cm.checked = !!settings.tmuxMouse;
+  let cc = $('optTmuxClipboard'); if (cc) cc.checked = !!settings.tmuxClipboard;
+  let ch = $('optTmuxHistory'); if (ch) ch.value = settings.tmuxHistory;
   renderOptPreview();
   $('ovOpt').classList.remove('h');
 }
@@ -2120,10 +2201,39 @@ document.addEventListener('DOMContentLoaded', () => {
   lh.addEventListener('input', () => onOptInput('lineHeight', lh, lhv, v => v.toFixed(2)));
   w.addEventListener('input', () => onOptInput('fontWeight', w, wv, v => String(v)));
   f.addEventListener('change', () => { settings.font = f.value; saveSettings(); applySettings(); renderOptPreview(); });
+  let cm = $('optTmuxMouse'), cc = $('optTmuxClipboard'), ch = $('optTmuxHistory');
+  if (cm) cm.addEventListener('change', () => { settings.tmuxMouse = cm.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
+  if (cc) cc.addEventListener('change', () => { settings.tmuxClipboard = cc.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
+  if (ch) ch.addEventListener('change', () => {
+    let v = parseInt(ch.value, 10);
+    if (!Number.isFinite(v) || v < 100) v = DEFAULT_SETTINGS.tmuxHistory;
+    settings.tmuxHistory = v; ch.value = v; saveSettings();
+    pushTmuxOptionsToActiveSessions();
+  });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !$('ovOpt').classList.contains('h')) closeOptions();
   });
 });
+
+// Ship the current tmux toggles into every running persistent pane so
+// the change takes effect immediately (no reconnect). Routed through
+// /api/tmux_options, which runs `tmux set -g …` over the existing
+// ControlMaster channel server-side — so the change can't bleed into
+// a running editor / pager that happens to occupy the foreground PTY.
+function pushTmuxOptionsToActiveSessions() {
+  let payload = {
+    tmux_mouse: !!settings.tmuxMouse,
+    tmux_set_clipboard: !!settings.tmuxClipboard,
+  };
+  let hl = parseInt(settings.tmuxHistory, 10);
+  if (Number.isFinite(hl) && hl >= 100) payload.tmux_history_limit = hl;
+  Object.keys(panes).forEach(k => {
+    let p = panes[k];
+    if (!p || !p.sid || !p.persistent) return;
+    api('tmux_options', { body: Object.assign({ session_id: p.sid }, payload) })
+      .catch(() => {});
+  });
+}
 
 // ── Fullscreen ──────────────────────────────────────────────────────
 function toggleFullscreen(){
