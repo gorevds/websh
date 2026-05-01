@@ -77,6 +77,12 @@ MAX_SESSIONS = _int_env("MAX_SESSIONS", "10")
 MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "10")
 # Hard cap on a single binary upload via /api/upload (bytes).
 MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
+# Hard cap on a single binary download via /api/download (bytes). The
+# browser accumulates the whole stream into a Blob before saving, so a
+# multi-GB file would OOM the tab. The old base64 download path had a
+# 37 MB cap; 2 GB matches the upload limit and modern browsers' Blob
+# ceilings without eating the tab on typical hardware.
+MAX_DOWNLOAD_SIZE = _int_env("MAX_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 # How long a single upload may take before we kill the side-channel ssh.
 UPLOAD_TIMEOUT = _int_env("UPLOAD_TIMEOUT", "1800")
 
@@ -1097,6 +1103,117 @@ class SSHSession(object):
             return False, "rm exit %d" % proc.returncode
         return True, ""
 
+    def list_dir(self, remote_path):
+        """List a directory via the ControlMaster side-channel.
+        remote_path may be absolute, ~, ~/sub, or relative-to-$HOME.
+        Returns (entries, abs_path, error_string)."""
+        if not self._control_path or not os.path.exists(self._control_path):
+            return None, None, "control socket not ready"
+
+        b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
+        # Entry rows are NUL-terminated (not \n) so filenames containing
+        # an embedded newline don't split a row in half. The PWD: line
+        # before the find output still uses \n — easy to peel off first.
+        remote_cmd = (
+            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            'case "$P" in '
+              '/*) D="$P";; '
+              '"~") D="$HOME";; '
+              '"~/"*) D="$HOME/${P#~/}";; '
+              '*) D="$HOME/$P";; '
+            'esac; '
+            'cd "$D" 2>/dev/null || exit 1; '
+            'printf "PWD:%s\\n" "$(pwd)"; '
+            'find . -maxdepth 1 ! -name . '
+            '-printf "%y\\t%s\\t%Ts\\t%f\\0" 2>/dev/null'
+        )
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            result = subprocess.run(ssh_cmd, capture_output=True, timeout=10)
+        except subprocess.TimeoutExpired:
+            return None, None, "timeout"
+        except Exception as e:
+            return None, None, str(e)
+        if result.returncode != 0:
+            return None, None, "directory not found"
+
+        # Peel the PWD:<path>\n preamble off the front, then split the
+        # rest on NUL — every find -printf row ends with \0 so embedded
+        # newlines in filenames stay intact.
+        raw = result.stdout
+        abs_path = remote_path
+        nl = raw.find(b"\n")
+        if nl >= 0 and raw[:4] == b"PWD:":
+            abs_path = raw[4:nl].decode("utf-8", "replace").strip()
+            raw = raw[nl + 1:]
+
+        entries = []
+        for row in raw.split(b"\0"):
+            if not row:
+                continue
+            parts = row.decode("utf-8", "replace").split("\t", 3)
+            if len(parts) != 4 or not parts[3]:
+                continue
+            ftype, size_s, mtime_s, name = parts
+            entries.append({
+                "name": name,
+                "type": ftype,
+                "size": int(size_s) if size_s.isdigit() else 0,
+                "mtime": int(mtime_s) if mtime_s.isdigit() else 0,
+            })
+        entries.sort(key=lambda e: (e["type"] != "d", e["name"].lower()))
+        return entries, abs_path, None
+
+    def download_file(self, remote_path):
+        """Stream a file via ControlMaster. Returns (Popen, error).
+        Subprocess stdout starts with a header "OK\\t<size>\\n" or
+        "ERR\\t<msg>\\n" so the caller can detect failure before
+        sending HTTP response headers."""
+        if not self._control_path or not os.path.exists(self._control_path):
+            return None, "control socket not ready"
+
+        b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
+        remote_cmd = (
+            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            'case "$P" in '
+              '/*) F="$P";; '
+              '"~") F="$HOME";; '
+              '"~/"*) F="$HOME/${P#~/}";; '
+              '*) F="$HOME/$P";; '
+            'esac; '
+            'if [ -f "$F" ]; then '
+              'SZ=$(stat -c%s "$F" 2>/dev/null || stat -f%z "$F" 2>/dev/null || printf -- -1); '
+              'printf "OK\\t%s\\n" "$SZ"; '
+              'cat -- "$F"; '
+            'else printf "ERR\\tFile not found\\n"; fi'
+        )
+        ssh_cmd = [
+            "ssh", "-T",
+            "-o", "BatchMode=yes",
+            "-o", "ControlPath=" + self._control_path,
+            "--", self._host, remote_cmd,
+        ]
+        try:
+            # stderr→DEVNULL: the protocol header (OK/ERR on stdout) already
+            # signals failure to the caller, and a PIPE that nobody drains
+            # would deadlock the child once ssh writes >~64 KB of warnings
+            # (host-key prompts, banners, debug). Same pattern as
+            # terminate_remote_tmux.
+            proc = subprocess.Popen(
+                ssh_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            return proc, None
+        except Exception as e:
+            return None, str(e)
+
     def close(self):
         self.alive = False
         try:
@@ -1258,6 +1375,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"ok": True, "version": __version__})
         elif action == "tmux_capture":
             self._tmux_capture()
+        elif action == "ls":
+            self._ls()
+        elif action == "download":
+            self._download()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -1686,6 +1807,141 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": err}, 502)
             return
         self._json({"ok": True})
+
+    def _ls(self):
+        """GET /api/ls?session_id=<sid>&path=<path>
+        List a remote directory via ControlMaster. path defaults to ~."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+        path = params.get("path", ["~"])[0] or "~"
+
+        if "\x00" in path:
+            self._json({"error": "invalid path"}, 400)
+            return
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+
+        entries, abs_path, err = session.list_dir(path)
+        if err:
+            self._json({"error": err}, 502)
+            return
+        session.last_activity = time.time()
+        self._json({"path": abs_path, "entries": entries})
+
+    def _download(self):
+        """GET /api/download?session_id=<sid>&path=<path>
+        Stream a file via ControlMaster (binary, no base64)."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+        path = params.get("path", [""])[0]
+
+        if not path or "\x00" in path:
+            self._json({"error": "invalid path"}, 400)
+            return
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+
+        proc, err = session.download_file(path)
+        if err:
+            self._json({"error": err}, 502)
+            return
+
+        def _reap():
+            # Reap the side-channel ssh after kill so it doesn't linger as
+            # a zombie. Mirrors the upload_file TimeoutExpired branch.
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+        # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n")
+        header_line = b""
+        try:
+            while True:
+                c = proc.stdout.read(1)
+                if not c or c == b"\n":
+                    break
+                header_line += c
+        except Exception:
+            proc.kill()
+            _reap()
+            self._json({"error": "download failed"}, 502)
+            return
+
+        parts = header_line.decode("utf-8", "replace").split("\t", 1)
+        if not parts or parts[0] != "OK":
+            proc.kill()
+            _reap()
+            msg = parts[1].strip() if len(parts) > 1 else "download failed"
+            self._json({"error": msg}, 404)
+            return
+
+        filename = path.rsplit("/", 1)[-1] or "download"
+        safe_name = urllib.parse.quote(filename, safe="")
+        content_length = None
+        if len(parts) > 1:
+            sz_str = parts[1].strip().lstrip("-")
+            if sz_str.isdigit():
+                sz = int(parts[1].strip())
+                if sz >= 0:
+                    content_length = sz
+
+        # Hard cap: refuse files above MAX_DOWNLOAD_SIZE before sending
+        # any HTTP response headers, so the browser doesn't try to
+        # accumulate a multi-GB Blob into memory.
+        if content_length is not None and content_length > MAX_DOWNLOAD_SIZE:
+            proc.kill()
+            _reap()
+            self._json({"error": "file too large"}, 413)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header(
+            "Content-Disposition",
+            "attachment; filename*=UTF-8''" + safe_name,
+        )
+        if content_length is not None:
+            self.send_header("Content-Length", str(content_length))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+
+        try:
+            BUF = 256 * 1024
+            while True:
+                chunk = proc.stdout.read(BUF)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+                # Multi-GB downloads can outlast SESSION_TIMEOUT; without
+                # this stamp the cleanup loop would close the master
+                # mid-stream and the side-channel ssh would die with it.
+                session.last_activity = time.time()
+        except Exception:
+            pass
+        finally:
+            proc.stdout.close()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _reap()
+        session.last_activity = time.time()
 
     def _disconnect(self):
         try:
