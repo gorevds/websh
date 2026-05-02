@@ -2357,6 +2357,26 @@ class TestUploadPathNULRejection(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("invalid", body["error"])
 
+    def test_zero_length_body_passes_size_check(self):
+        # Regression: an empty file (Content-Length: 0) was rejected at
+        # the size-check stage with 400 "empty body". Now it must clear
+        # that check and only fail later at session-not-found (404).
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/upload?session_id={}&path=empty.txt".format(
+            self.port, uuid.uuid4())
+        req = Request(url, data=b"",
+                      headers={"Content-Type": "application/octet-stream",
+                               "Content-Length": "0"})
+        try:
+            resp = urlopen(req, timeout=5)
+            body = json.loads(resp.read().decode("utf-8"))
+            code = resp.getcode()
+        except Exception as e:
+            body = json.loads(e.read().decode("utf-8"))
+            code = e.code
+        self.assertEqual(code, 404)
+        self.assertIn("session", body["error"])
+
 
 class TestSlotIdSecurity(unittest.TestCase):
     """Document the security model around slot_id.

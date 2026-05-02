@@ -1699,11 +1699,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            length = int(self.headers.get("Content-Length", "0"))
+            length = int(self.headers.get("Content-Length", "-1"))
         except ValueError:
-            length = 0
-        if length <= 0:
-            self._json({"error": "empty body"}, 400)
+            length = -1
+        if length < 0:
+            self._json({"error": "missing Content-Length"}, 400)
             return
         if length > MAX_UPLOAD_SIZE:
             self._json({"error": "file too large"}, 413)
