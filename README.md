@@ -1,8 +1,8 @@
-# <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="32" height="32" align="absmiddle"></picture> websh
+# <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"></picture> websh
 
 Lightweight but powerful web-based SSH terminal. No build step, no server dependencies.
 
-![websh split panes](assets/screenshot.png)
+![websh split panes](screenshot.png)
 
 ```
 Browser (xterm.js) ──── server.py ──── ssh
