@@ -2,7 +2,7 @@
 
 Lightweight but powerful web-based SSH terminal. No build step, no server dependencies.
 
-![websh split panes](screenshot.png)
+![websh split panes](assets/screenshot.png)
 
 ```
 Browser (xterm.js) ──── server.py ──── ssh
