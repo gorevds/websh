@@ -6,7 +6,7 @@ Lightweight but powerful web-based SSH terminal.
 - 🌐 **Plain HTTP, no WebSocket** — output streams over Server-Sent Events, input over short POSTs. Tunnels through corporate proxies and shared hosting; falls back to long-polling automatically where SSE is buffered.
 - ⭐ **Persistent sessions — survive tab close, reboot, even backend restart (up to 72 h).** Your shell, scrollback, and running processes keep going on the target host (wrapped in tmux). One click and you're back exactly where you left off.
 
-![websh split panes](screenshot.png)
+![websh split panes](assets/screenshot.png)
 
 ```
 Browser (xterm.js) ──── server.py ──── ssh
