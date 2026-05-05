@@ -27,6 +27,9 @@ API endpoints:
     POST /api/connect     — start SSH session
     POST /api/input       — send keystrokes
     GET  /api/output      — long-poll for terminal output
+    GET  /api/stream      — Server-Sent Events stream of terminal output
+                            (low-latency alternative to /api/output; falls
+                            back to long-poll if the proxy buffers it)
     POST /api/resize      — resize terminal
     POST /api/disconnect  — close session
     POST /api/upload      — stream a file body to $HOME/<path> on remote
@@ -1369,6 +1372,8 @@ class Handler(BaseHTTPRequestHandler):
         action = self._resolve_action()
         if action == "output":
             self._output()
+        elif action == "stream":
+            self._stream()
         elif action == "config":
             self._json(config_public())
         elif action == "ping":
@@ -1599,6 +1604,91 @@ class Handler(BaseHTTPRequestHandler):
 
         self._json({"data": "", "alive": session.alive,
                     "auth_failed": session.auth_failed})
+
+    def _stream(self):
+        """SSE: stream output as 'data' events until session dies or client
+        disconnects. Each 'data' event carries the same JSON payload as
+        /api/output ({data, alive, auth_failed}). On clean termination an
+        'end' event is sent. Comment heartbeats keep proxies from idling
+        the connection out."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("Connection", "keep-alive")
+            # Tell nginx and similar proxies not to buffer the response.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.flush()
+            # Send an initial comment immediately so the client's
+            # first-message timer fires fast — proves the channel isn't
+            # being held open by an upstream buffer.
+            self.wfile.write(b": ok\n\n")
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        last_send = time.time()
+        KEEPALIVE = 15  # seconds between heartbeats when no real data
+
+        try:
+            while True:
+                data = session.read()
+                if data:
+                    payload = json.dumps({
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "alive": session.alive,
+                        "auth_failed": session.auth_failed,
+                    })
+                    self.wfile.write(
+                        ("event: data\ndata: " + payload + "\n\n")
+                        .encode("utf-8"))
+                    self.wfile.flush()
+                    last_send = time.time()
+                if not session.alive:
+                    break
+                if not data:
+                    if time.time() - last_send > KEEPALIVE:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        last_send = time.time()
+                    time.sleep(POLL_INTERVAL)
+
+            # Drain any remaining buffered output before sending 'end'.
+            tail = session.read()
+            if tail:
+                payload = json.dumps({
+                    "data": base64.b64encode(tail).decode("ascii"),
+                    "alive": False,
+                    "auth_failed": session.auth_failed,
+                })
+                self.wfile.write(
+                    ("event: data\ndata: " + payload + "\n\n")
+                    .encode("utf-8"))
+            end_payload = json.dumps({
+                "alive": False,
+                "auth_failed": session.auth_failed,
+            })
+            self.wfile.write(
+                ("event: end\ndata: " + end_payload + "\n\n")
+                .encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client went away — that's the normal exit path.
+            return
 
     def _resize(self):
         try:
