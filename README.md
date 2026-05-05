@@ -2,9 +2,9 @@
 
 Lightweight but powerful web-based SSH terminal.
 
-- 📦 **No build step, no server dependencies** — Python 3 stdlib only. No npm, no pip install, no compile step. Drop the files on FTP and it works.
-- 🌐 **Plain HTTP, no WebSocket** — output streams over Server-Sent Events, input over short POSTs. Tunnels through corporate proxies and shared hosting; falls back to long-polling automatically where SSE is buffered.
-- ⭐ **Persistent sessions — survive tab close, reboot, even backend restart (up to 72 h).** Your shell, scrollback, and running processes keep going on the target host (wrapped in tmux). One click and you're back exactly where you left off.
+- 📦 **No build step, no server dependencies**
+- 🌐 **Plain HTTP, no WebSocket**
+- ⭐ **Persistent sessions — survive tab close, reboot, even backend restart (up to 72 h)**
 
 ![websh split panes](assets/screenshot.png)
 
