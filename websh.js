@@ -94,7 +94,17 @@ function loadSettings() {
 function saveSettings() {
   try { localStorage.setItem(storageKey(SETTINGS_KEY), JSON.stringify(settings)); } catch(e) {}
 }
-const MAX_POLL_RETRIES = 5;
+// How long the transport (SSE or long-poll) is allowed to stay broken
+// before we surface the red banner. Until this elapses the failure is
+// retried silently with exponential backoff so brief Wi-Fi blips don't
+// startle the user. Wall-clock budget, not retry count.
+const RECONNECT_BUDGET_MS = 60000;
+// Backoff steps used for both SSE retry-after and long-poll retry.
+const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 10000, 15000];
+// If SSE doesn't deliver any event (data or comment) within this window,
+// assume an upstream proxy is buffering it and silently fall back to
+// /api/output long-polling for the rest of the session.
+const SSE_FIRST_MSG_TIMEOUT_MS = 5000;
 // Hard cap on a single download (bytes). Server enforces this too via
 // MAX_DOWNLOAD_SIZE, but the client also bails early so a misconfigured
 // or trusted-but-misbehaving server can't OOM the tab. 2 GB matches the
@@ -196,9 +206,19 @@ function createPane(container) {
   el.addEventListener('mousedown', () => { activatePane(id) });
 
   // Terminal events
-  term.onData(d => { if(p.sid) queueInput(p,d) });
+  term.onData(d => {
+    if (!p.sid) return;
+    // Predict only single printable keystrokes — paste, escape sequences
+    // and IME composition arrive as multi-byte and aren't safely echoed.
+    if (d.length === 1) predictKey(p, d);
+    queueInput(p, d);
+  });
   term.onBinary(d => { if(p.sid) queueInput(p,d) });
   term.onResize(size => {
+    // Pending predictions reference cursor coordinates that the resize
+    // may have just invalidated — drop them silently.
+    let undo = rewindEcho(p);
+    if (undo) p.term.write(undo);
     if(!p.sid) return;
     if(p.resizeTimer) clearTimeout(p.resizeTimer);
     p.resizeTimer = setTimeout(() => {
@@ -415,10 +435,13 @@ function _destroyPane(id, terminate) {
   if (p.sid) {
     p.polling = false;
     stopKeepalive(p);
+    closeStream(p);
     let body = {session_id: p.sid};
     if (terminate) body.terminate = true;
     api('disconnect', {body: body}).catch(() => {});
   }
+  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
+  p.echoQueue = '';
   p.term.dispose();
 
   let wrap = p.el.parentNode;
@@ -728,91 +751,310 @@ function commitPendingSave(p) {
   renderSaved();
 }
 
+// ── Local echo prediction (Mosh-style lite) ─────────────────────────
+// Render printable keystrokes in dim style at the cursor before the
+// server has had a chance to echo them. When the real echo arrives we
+// either "promote" the dim chars to normal (common case: shell prompt
+// echoes verbatim) or rewind them and let the server's bytes draw
+// freely (vim, programs that filter/replace input). Only enabled in
+// the normal buffer — alt-screen apps (vim/htop/less) get raw bytes.
+//
+// Stale predictions self-clear after PREDICT_TTL_MS so a missed echo
+// (e.g. piped command swallows input) doesn't leave dim ghosts behind.
+
+const PREDICT_TTL_MS = 1000;
+
+function predictionsEnabled(p) {
+  if (p.echoEnabled === false) return false;
+  if (!p.term || !p.term.buffer || !p.term.buffer.active) return false;
+  return p.term.buffer.active.type === 'normal';
+}
+
+function rewindEcho(p) {
+  if (!p.echoQueue) return '';
+  let n = p.echoQueue.length;
+  p.echoQueue = '';
+  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
+  // Backspace, overwrite with spaces, backspace again — visually clears
+  // the predicted glyphs and leaves the cursor at the original position.
+  return '\b'.repeat(n) + ' '.repeat(n) + '\b'.repeat(n);
+}
+
+function predictKey(p, ch) {
+  if (!predictionsEnabled(p)) return;
+  if (!ch || ch.length !== 1) return;
+  let code = ch.charCodeAt(0);
+  // Control chars (Enter, Backspace, arrows, Esc-prefixed sequences):
+  // any prediction we held is now suspect, so wipe it. The server's
+  // next bytes will redraw correctly without our interference.
+  if (code < 32 || code === 127) {
+    let undo = rewindEcho(p);
+    if (undo) p.term.write(undo);
+    return;
+  }
+  p.echoQueue = (p.echoQueue || '') + ch;
+  p.term.write('\x1b[2m' + ch + '\x1b[22m');
+  if (p.echoTimer) clearTimeout(p.echoTimer);
+  p.echoTimer = setTimeout(() => {
+    p.echoTimer = null;
+    let undo = rewindEcho(p);
+    if (undo) p.term.write(undo);
+  }, PREDICT_TTL_MS);
+}
+
+// Called from handleOutputPayload before writing server bytes. Returns
+// the (possibly modified) byte string to write, after reconciling any
+// pending predictions with the incoming echo.
+function consumeEcho(p, chunk) {
+  if (!p.echoQueue) return chunk;
+  let q = p.echoQueue;
+  // Find the longest common prefix between the prediction queue and
+  // the leading bytes of the server chunk.
+  let common = 0;
+  let m = Math.min(q.length, chunk.length);
+  while (common < m && q.charCodeAt(common) === chunk.charCodeAt(common)) {
+    common++;
+  }
+  if (common === 0) {
+    // Server didn't echo what we predicted (e.g. autocomplete, vim).
+    // Rewind everything so its bytes draw on a clean slate.
+    return rewindEcho(p) + chunk;
+  }
+  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
+  if (common === q.length) {
+    // Whole prediction confirmed: backspace over the dim chars and
+    // rewrite them as normal-intensity, then append the rest.
+    p.echoQueue = '';
+    return '\b'.repeat(common) + chunk.slice(0, common) + chunk.slice(common);
+  }
+  // Partial match: confirm `common` chars, drop the unconfirmed tail.
+  let unconfirmed = q.length - common;
+  p.echoQueue = '';
+  return '\b'.repeat(q.length)               // back to start of predictions
+       + chunk.slice(0, common)              // promote confirmed (normal SGR)
+       + ' '.repeat(unconfirmed)             // erase unconfirmed dim
+       + '\b'.repeat(unconfirmed)            // back to end of confirmed
+       + chunk.slice(common);                // remaining server bytes
+}
+
+// ── Output transport ────────────────────────────────────────────────
+// Two transports share one payload shape ({data, alive, auth_failed}).
+// Primary: SSE via /api/stream, opened with EventSource. Falls back to
+// long-poll automatically if (a) EventSource is missing, (b) the first
+// SSE event doesn't arrive within SSE_FIRST_MSG_TIMEOUT_MS (a buffering
+// proxy), or (c) the SSE connection errors before any event landed. A
+// pane that has fallen back stays on long-poll for the rest of the
+// session — no flapping.
+
+function closeStream(p) {
+  if (p.eventSource) {
+    try { p.eventSource.close(); } catch (e) {}
+    p.eventSource = null;
+  }
+  if (p.sseFirstMsgTimer) {
+    clearTimeout(p.sseFirstMsgTimer);
+    p.sseFirstMsgTimer = null;
+  }
+}
+
+// Apply one decoded JSON payload from either transport. Returns true if
+// the session ended (auth_failed / alive=false / fatal session error)
+// so callers know to stop their read loop.
+function handleOutputPayload(p, r) {
+  if (r.error) {
+    // Session not found — stale restore or server restarted. Persistent
+    // panes try to re-attach via tmux; short-lived panes just reconnect.
+    console.log('output: session error:', r.error);
+    closeStream(p);
+    stopKeepalive(p); p.polling=false; p.sid=null; p.connecting=false;
+    updatePaneBadge(p);
+    if(p.host || p.connection) {
+      connectPane(p, {label:p.label, resume:p.persistent});
+    } else { doAutoConnect(); }
+    return true;
+  }
+  p.connecting=false;
+  if(r.data){
+    updatePaneBadge(p);
+    let chunk = atob(r.data);
+    let processed = consumeEcho(p, chunk);
+    p.term.write(Uint8Array.from(processed, c => c.charCodeAt(0)));
+    // Keep a short tail of decoded output only while we're still
+    // within the tmux-death detection window on a persistent pane.
+    if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
+      p.recentOutput = ((p.recentOutput || '') + chunk).slice(-4096);
+    }
+  }
+  // SSH auth rejected our password/key: stop the loop cleanly and
+  // do NOT save the entry. Surface the failure on the pane itself
+  // (reconnect placeholder). The login form never reopens on its own.
+  if (r.auth_failed) {
+    p.pendingSave = null;
+    p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
+    closeStream(p);
+    stopKeepalive(p); p.polling = false;
+    if (p.sid) {
+      api('disconnect', {body: {session_id: p.sid}}).catch(() => {});
+      p.sid = null;
+    }
+    p.recentOutput = '';
+    updatePaneBadge(p);
+    if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
+    saveSessions();
+    return true;
+  }
+  // Commit the deferred save once the session has proven healthy
+  // (alive and no auth failure for ≥2.5 s).
+  if (p.pendingSave && r.alive !== false &&
+      p.connectedAt && (Date.now() - p.connectedAt) >= 2500) {
+    commitPendingSave(p);
+  }
+  if(r.alive===false){
+    p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
+    closeStream(p);
+    stopKeepalive(p); p.polling=false; p.sid=null;
+    saveSessions();
+    // Smart tmux fallback: a persistent pane whose session dies quickly
+    // with a "not found" shape in the output is almost certainly a
+    // missing tmux binary on the target. Offer re-probe / short-lived.
+    let quick = p.connectedAt && (Date.now() - p.connectedAt) < 5000;
+    let tail = p.recentOutput || '';
+    let hit = /tmux: not found|tmux: command not found|No such file|command not found/i.test(tail);
+    if (p.persistent && quick && hit) {
+      showTmuxBar(p, 'tmux seems missing on ' + (p.host || 'target') + '.');
+    } else if (p.host || p.connection) {
+      showReconnectBar(p);
+    }
+    p.recentOutput = '';
+    if(activeId===p.id) updatePaneBadge(p);
+    return true;
+  }
+  return false;
+}
+
+// Compute the silent-retry delay. While the failure window is under
+// RECONNECT_BUDGET_MS, returns ms to wait for the next attempt and
+// bumps the failure clock if needed. Returns -1 once the budget is
+// exhausted; the caller should then surface the red banner.
+function nextRetryDelay(p) {
+  if (!p.firstFailureAt) p.firstFailureAt = Date.now();
+  let elapsed = Date.now() - p.firstFailureAt;
+  if (elapsed >= RECONNECT_BUDGET_MS) return -1;
+  let n = (p.retryCount = (p.retryCount || 0) + 1);
+  let i = Math.min(n - 1, RECONNECT_BACKOFF_MS.length - 1);
+  return RECONNECT_BACKOFF_MS[i];
+}
+
+function clearRetryClock(p) {
+  p.firstFailureAt = 0;
+  p.retryCount = 0;
+  p.pollRetries = 0;
+}
+
+function transportFatal(p, e) {
+  // Final fallback: budget exhausted, give up and surface banner.
+  console.error('transport gave up:', p.id, e);
+  let msg = (e && e.message && e.message.indexOf('502') !== -1)
+    ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
+    : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
+  p.term.write(msg);
+  closeStream(p);
+  stopKeepalive(p); p.polling=false; p.sid=null;
+  saveSessions();
+  if(p.host || p.connection) showReconnectBar(p);
+  if(activeId===p.id) updatePaneBadge(p);
+}
+
+// Entry point used in place of the old pollOutput(). Tries SSE first,
+// then transparently downgrades to long-poll on incompatible proxies.
+function startOutput(p) {
+  if (!p.sid || !p.polling) return;
+  if (typeof EventSource !== 'undefined' && !p.sseDisabled) {
+    streamOutput(p);
+  } else {
+    pollOutput(p);
+  }
+}
+
+function streamOutput(p) {
+  if (!p.sid || !p.polling) return;
+  closeStream(p);
+  let url = `${API}?action=stream&session_id=${encodeURIComponent(p.sid)}`;
+  let es;
+  try { es = new EventSource(url); }
+  catch (e) {
+    console.log('SSE: EventSource construction failed, using long-poll');
+    p.sseDisabled = true;
+    pollOutput(p);
+    return;
+  }
+  p.eventSource = es;
+  p.sseGotAnyMessage = false;
+  // First-message timer: a buffering proxy will hold the response
+  // until N bytes accumulate, so no event reaches us. The backend
+  // sends ': ok\n\n' on connect specifically to defeat this — if we
+  // don't see anything within the timeout, we're behind a buffer.
+  if (p.sseFirstMsgTimer) clearTimeout(p.sseFirstMsgTimer);
+  p.sseFirstMsgTimer = setTimeout(() => {
+    if (!p.sseGotAnyMessage && p.eventSource === es) {
+      console.log('SSE: no event in', SSE_FIRST_MSG_TIMEOUT_MS,
+                  'ms, falling back to long-poll');
+      p.sseDisabled = true;
+      closeStream(p);
+      if (p.polling) pollOutput(p);
+    }
+  }, SSE_FIRST_MSG_TIMEOUT_MS);
+
+  let onAnyEvent = () => {
+    p.sseGotAnyMessage = true;
+    clearRetryClock(p);
+  };
+  es.addEventListener('open', onAnyEvent);
+  // EventSource fires onmessage for unnamed events; the ': ok' comment
+  // doesn't trigger it but still arrives on the wire. We rely on the
+  // 'data' / 'end' named events here.
+  es.addEventListener('data', e => {
+    onAnyEvent();
+    let r;
+    try { r = JSON.parse(e.data); }
+    catch (err) { console.error('SSE bad payload:', err); return; }
+    handleOutputPayload(p, r);
+  });
+  es.addEventListener('end', e => {
+    onAnyEvent();
+    let r = {alive: false};
+    try { r = JSON.parse(e.data); } catch (err) {}
+    handleOutputPayload(p, r);
+    closeStream(p);
+  });
+  es.onerror = () => {
+    // EventSource auto-reconnects on transient errors; we let it for
+    // a while, then escalate. If we never got a message at all, treat
+    // it as "this transport doesn't work here" and switch to long-poll.
+    if (!p.sseGotAnyMessage) {
+      console.log('SSE: error before first event, falling back to long-poll');
+      p.sseDisabled = true;
+      closeStream(p);
+      if (p.polling) pollOutput(p);
+      return;
+    }
+    let d = nextRetryDelay(p);
+    if (d < 0) { transportFatal(p, new Error('SSE reconnect budget exhausted')); return; }
+    // EventSource will retry on its own ~3s; we just enforce the
+    // total-elapsed budget. No need to schedule an explicit retry.
+  };
+}
+
 function pollOutput(p) {
   if(!p.sid || !p.polling) return;
   api('output',{query:'&session_id='+p.sid}).then(r => {
-    p.pollRetries=0;
-    if(r.error){
-      // Session not found — stale restore or server restarted. Persistent
-      // panes try to re-attach via tmux; short-lived panes just reconnect.
-      console.log('poll: session error:', r.error);
-      stopKeepalive(p); p.polling=false; p.sid=null; p.connecting=false;
-      updatePaneBadge(p);
-      if(p.host || p.connection) {
-        connectPane(p, {label:p.label, resume:p.persistent});
-      } else { doAutoConnect(); }
-      return;
-    }
-    p.connecting=false;
-    if(r.data){
-      updatePaneBadge(p);
-      let chunk = atob(r.data);
-      p.term.write(Uint8Array.from(chunk, c => c.charCodeAt(0)));
-      // Keep a short tail of decoded output only while we're still
-      // within the tmux-death detection window on a persistent pane.
-      if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
-        p.recentOutput = ((p.recentOutput || '') + chunk).slice(-4096);
-      }
-    }
-    // SSH auth rejected our password/key: stop the loop cleanly and
-    // do NOT save the entry. Surface the failure on the pane itself
-    // (reconnect placeholder). The login form never reopens on its own.
-    if (r.auth_failed) {
-      p.pendingSave = null;
-      p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
-      stopKeepalive(p); p.polling = false;
-      if (p.sid) {
-        api('disconnect', {body: {session_id: p.sid}}).catch(() => {});
-        p.sid = null;
-      }
-      p.recentOutput = '';
-      updatePaneBadge(p);
-      if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
-      saveSessions();
-      return;
-    }
-    // Commit the deferred save once the session has proven healthy
-    // (alive and no auth failure for ≥2.5 s).
-    if (p.pendingSave && r.alive !== false &&
-        p.connectedAt && (Date.now() - p.connectedAt) >= 2500) {
-      commitPendingSave(p);
-    }
-    if(r.alive===false){
-      p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
-      stopKeepalive(p); p.polling=false; p.sid=null;
-      saveSessions();
-      // Smart tmux fallback: a persistent pane whose session dies quickly
-      // with a "not found" shape in the output is almost certainly a
-      // missing tmux binary on the target. Offer re-probe / short-lived.
-      let quick = p.connectedAt && (Date.now() - p.connectedAt) < 5000;
-      let tail = p.recentOutput || '';
-      let hit = /tmux: not found|tmux: command not found|No such file|command not found/i.test(tail);
-      if (p.persistent && quick && hit) {
-        showTmuxBar(p, 'tmux seems missing on ' + (p.host || 'target') + '.');
-      } else if (p.host || p.connection) {
-        showReconnectBar(p);
-      }
-      p.recentOutput = '';
-      if(activeId===p.id) updatePaneBadge(p);
-      return;
-    }
+    clearRetryClock(p);
+    if (handleOutputPayload(p, r)) return;
     if(p.polling) pollOutput(p);
   }).catch(e => {
-    console.error('poll error:', p.id, e);
-    p.pollRetries++;
-    if(p.pollRetries>=MAX_POLL_RETRIES){
-      let msg = (e && e.message && e.message.indexOf('502') !== -1)
-        ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
-        : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
-      p.term.write(msg);
-      stopKeepalive(p); p.polling=false; p.sid=null;
-      saveSessions();
-      if(p.host || p.connection) showReconnectBar(p);
-      if(activeId===p.id) updatePaneBadge(p);
-      return;
-    }
-    let d=Math.min(1000*Math.pow(2,p.pollRetries-1),10000);
-    setTimeout(() => { if(p.polling) pollOutput(p) },d);
+    let d = nextRetryDelay(p);
+    if (d < 0) { transportFatal(p, e); return; }
+    setTimeout(() => { if(p.polling) pollOutput(p) }, d);
   });
 }
 
@@ -926,7 +1168,7 @@ function connectPane(p, opts) {
       api('resize', {body:{session_id:p.sid, cols:cols, rows:rows}}).catch(() => {});
       startKeepalive(p);
       saveSessions();
-      pollOutput(p);
+      startOutput(p);
     })
     .catch(e => {
       p.connecting = false;
@@ -1316,7 +1558,7 @@ function finalizeSuccess(opts, result, run) {
   api('resize', {body: {session_id: p.sid, cols: cols, rows: rows}}).catch(() => {});
   startKeepalive(p);
   saveSessions();
-  pollOutput(p);
+  startOutput(p);
 }
 
 function cleanupRun(run) {
