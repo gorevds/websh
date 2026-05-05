@@ -21,8 +21,7 @@
     /* ── Top bar ── */
     .top{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;background:var(--sf);border-bottom:1px solid var(--bd);flex-shrink:0;min-height:40px}
     .top-l{display:flex;align-items:center;gap:10px}
-    .logo{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:16px;font-weight:700;letter-spacing:-0.01em;color:#c9d1d9}
-    [data-theme="light"] .logo{color:#1f2328}
+    .logo{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:16px;font-weight:700;letter-spacing:-0.01em;color:var(--tx)}
     .top-slogan{font-size:11px;color:var(--dim)}
     .s-off{background:rgba(248,81,73,.15);color:var(--dg)}
     .s-wait{background:rgba(210,153,34,.15);color:var(--wn)}
@@ -125,7 +124,7 @@
     .upload-progress-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:10px;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;padding:0 6px}
     .upload-progress-cancel{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:2px 4px;border-radius:3px;transition:.15s;flex-shrink:0}
     .upload-progress-cancel:hover{color:var(--dg);background:rgba(248,81,73,.1)}
-    .pane-term{flex:1;overflow:hidden;padding:2px}
+    .pane-term{flex:1;overflow:hidden}
     .xterm-viewport::-webkit-scrollbar{width:8px}
     .xterm-viewport::-webkit-scrollbar-track{background:transparent}
     .xterm-viewport::-webkit-scrollbar-thumb{background:var(--bd);border-radius:4px}

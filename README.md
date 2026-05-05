@@ -1,4 +1,4 @@
-# <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="32" height="32" align="absmiddle"></picture> websh
+# <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"></picture> websh
 
 Lightweight but powerful web-based SSH terminal.
 
@@ -6,7 +6,7 @@ Lightweight but powerful web-based SSH terminal.
 - 🌐 **Plain HTTP, no WebSocket**
 - ⭐ **Persistent sessions — survive tab close, reboot, even backend restart (up to 72 h)**
 
-![websh split panes](assets/screenshot.png)
+![websh split panes](screenshot.png)
 
 ```
 Browser (xterm.js) ──── server.py ──── ssh
