@@ -86,8 +86,8 @@ click-to-connect — pick the model that fits your team.
 ### 🚀 Deploy anywhere
 Made to fit where other web terminals can't.
 
-- **Shared hosting** — upload 4 files via FTP, `api.php` auto-starts
-  the backend. No SSH access to the host needed
+- **Shared hosting** — upload 4 files + the `assets/` folder via FTP,
+  `api.php` auto-starts the backend. No SSH access to the host needed
 - **Python-only mode** — backend serves the frontend directly, zero extras
 - Docker, systemd, reverse proxy examples included
 - Plain HTTP transport (SSE for output, POSTs for input) — works through corporate HTTPS, no WebSocket required, with automatic long-poll fallback for hosts that buffer SSE
@@ -131,12 +131,13 @@ A typical shared hosting directory structure:
         websh.js            <- frontend logic
         api.php             <- PHP proxy
         server.py           <- backend (auto-started by api.php)
+        assets/             <- brand SVGs (logo, light/dark variants)
 ```
 
 **Steps:**
 
 1. Create a folder in your web root (e.g. `www/console/`)
-2. Upload `index.html`, `websh.js`, `api.php`, and `server.py` there
+2. Upload `index.html`, `websh.js`, `api.php`, `server.py`, and the `assets/` folder there
 3. Open `https://your-host/console/` in a browser
 
 That's it. `api.php` starts `server.py` automatically on the first request.
@@ -338,8 +339,9 @@ The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
 
 ### Shared hosting (PHP + Python)
 
-Upload the four files (`index.html`, `websh.js`, `api.php`, `server.py`) to your web
-directory. The backend starts automatically.
+Upload the four files (`index.html`, `websh.js`, `api.php`, `server.py`)
+and the `assets/` folder (brand SVGs) to your web directory. The backend
+starts automatically.
 
 For manual control (e.g. custom config path):
 
@@ -355,9 +357,10 @@ The backend can serve the frontend directly — no PHP or separate web server ne
 HOST=0.0.0.0 python3 server.py
 ```
 
-Open `http://your-host:8765/` in a browser. The backend serves `index.html` and
-`websh.js` from the same directory as `server.py`, and handles API requests on
-the same port. See [HTTPS via reverse proxy](#https-via-reverse-proxy) below.
+Open `http://your-host:8765/` in a browser. The backend serves the static
+files (`index.html`, `websh.js`, `assets/*.svg`) from the same directory as
+`server.py`, and handles API requests on the same port. See
+[HTTPS via reverse proxy](#https-via-reverse-proxy) below.
 
 ### Docker
 
@@ -470,10 +473,11 @@ index.html                Frontend — xterm.js terminal + connection UI
 websh.js                  Frontend logic — pane management, file transfer, themes
 api.php                   PHP proxy — forwards browser requests to backend (optional)
 server.py                 Python backend — manages SSH sessions via PTY, serves frontend
+assets/                   Brand SVGs (logo light/dark variants) loaded by index.html
 websh.json.example        Example server-side config
 test_server.py            Backend tests (unit + integration)
 tests/frontend/           jsdom-based frontend tests
-docs/                     Design notes (e.g. auth-fail-detection.md)
+docs/                     Design notes (e.g. auth-fail-detection.md, sse-transport.md)
 Dockerfile                Container deployment
 websh.service             systemd unit file
 LICENSE                   MIT license
