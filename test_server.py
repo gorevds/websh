@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for websh server.py — config loading, restrict_hosts, API."""
 
+import base64
 import json
 import os
 import signal
@@ -485,6 +486,64 @@ class TestHTTPApi(unittest.TestCase):
         body, code = self._get("/api/stream?session_id=not-a-uuid")
         self.assertEqual(code, 404)
         self.assertIn("error", body)
+
+    def test_stream_happy_path(self):
+        """Plant a fake session that emits one chunk then dies.
+        Verify SSE headers, the initial ': ok' comment, the encoded
+        'data' event, and the closing 'end' event, in that order."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class FakeSession:
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self._chunks = [b"hello\r\n"]
+            def read(self):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                self.alive = False
+                return b""
+
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            conn.request("GET", "/api/stream?session_id=" + sid)
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.getheader("Content-Type"),
+                             "text/event-stream")
+            self.assertEqual(resp.getheader("X-Accel-Buffering"), "no")
+            # Read until we see both events. The session emits one chunk
+            # then read() returns b"" + alive=False, which the handler
+            # turns into 'event: end'. ~1 KB is plenty.
+            buf = b""
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: end" not in buf:
+                chunk = resp.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.close()
+            text = buf.decode("utf-8")
+            self.assertIn(": ok", text)
+            self.assertIn("event: data", text)
+            self.assertIn("event: end", text)
+            # The data event carries our chunk base64-encoded. Parse the
+            # JSON line that follows the 'event: data' marker.
+            data_line = next(
+                line for line in text.splitlines()
+                if line.startswith("data: ") and '"data"' in line
+            )
+            payload = json.loads(data_line[len("data: "):])
+            self.assertEqual(base64.b64decode(payload["data"]),
+                             b"hello\r\n")
+            self.assertFalse(payload["auth_failed"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
 
     def test_resize_missing_session(self):
         body, code = self._post("/api/resize", {

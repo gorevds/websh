@@ -1630,7 +1630,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache, no-store")
-            self.send_header("Connection", "keep-alive")
+            # We deliberately don't send "Connection: keep-alive": this is
+            # HTTP/1.0 and we have no Content-Length. The client signals
+            # end-of-stream by seeing the connection close, which the
+            # server does naturally once the session dies.
+            self.send_header("Connection", "close")
             # Tell nginx and similar proxies not to buffer the response.
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
