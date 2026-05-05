@@ -473,6 +473,19 @@ class TestHTTPApi(unittest.TestCase):
         body, code = self._post("/api/input", {"session_id": "fake", "data": "x"})
         self.assertEqual(code, 404)
 
+    def test_stream_unknown_session(self):
+        # Well-formed UUID but no such session: SSE handler 404s as JSON
+        # (same shape as /api/output) before opening the event stream.
+        body, code = self._get(
+            "/api/stream?session_id=12345678-1234-1234-1234-123456789abc")
+        self.assertEqual(code, 404)
+        self.assertIn("error", body)
+
+    def test_stream_invalid_uuid(self):
+        body, code = self._get("/api/stream?session_id=not-a-uuid")
+        self.assertEqual(code, 404)
+        self.assertIn("error", body)
+
     def test_resize_missing_session(self):
         body, code = self._post("/api/resize", {
             "session_id": "fake", "cols": 80, "rows": 24

@@ -16,7 +16,16 @@ if ($proto === 'http') {
     exit;
 }
 
-@set_time_limit(55);
+$action  = isset($_GET['action']) ? $_GET['action'] : '';
+
+// SSE stream needs a longer execution window than the JSON endpoints.
+// Some shared hosts cap this hard, in which case the stream is killed
+// after the cap and the browser falls back to long-poll automatically.
+if ($action === 'stream') {
+    @set_time_limit(0);
+} else {
+    @set_time_limit(55);
+}
 
 if (!extension_loaded('curl')) {
     header('HTTP/1.1 500 Internal Server Error');
@@ -24,11 +33,12 @@ if (!extension_loaded('curl')) {
     exit;
 }
 
-header('Content-Type: application/json');
-header('Cache-Control: no-cache, no-store, must-revalidate');
+if ($action !== 'stream') {
+    header('Content-Type: application/json');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+}
 
 $BACKEND = 'http://127.0.0.1:' . (getenv('WEBSH_PORT') ?: '8765');
-$action  = isset($_GET['action']) ? $_GET['action'] : '';
 
 // Path to config file (must be OUTSIDE the web root for security).
 $WEBSH_CONFIG = getenv('WEBSH_CONFIG') ?: dirname(__FILE__) . '/../../websh.json';
@@ -45,6 +55,10 @@ switch ($action) {
     case 'output':
         $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
         proxy_get($BACKEND . '/api/output?session_id=' . urlencode($sid));
+        break;
+    case 'stream':
+        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
+        proxy_stream($BACKEND . '/api/stream?session_id=' . urlencode($sid));
         break;
     case 'ping':
         proxy_get($BACKEND . '/api/ping');
@@ -101,6 +115,40 @@ function proxy_get($url) {
         return;
     }
     echo $resp;
+}
+
+// SSE passthrough: must NOT buffer. Each chunk from the backend is
+// flushed to the browser immediately. On hosts that buffer responses
+// regardless (mod_deflate, fastcgi_buffering on, etc.) the stream may
+// arrive in clumps — the frontend detects this via the first-message
+// timer and falls back to /api/output long-polling.
+function proxy_stream($url) {
+    @ini_set('zlib.output_compression', '0');
+    @ini_set('output_buffering', '0');
+    @ini_set('implicit_flush', '1');
+    while (ob_get_level() > 0) { ob_end_clean(); }
+    @ob_implicit_flush(true);
+
+    header('Content-Type: text/event-stream');
+    header('Cache-Control: no-cache, no-store');
+    header('X-Accel-Buffering: no');
+    header('Connection: keep-alive');
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+    curl_setopt($ch, CURLOPT_HEADER, false);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: text/event-stream'));
+    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
+        echo $data;
+        @flush();
+        // Stop early if the browser has gone away.
+        if (connection_aborted()) return 0;
+        return strlen($data);
+    });
+    curl_exec($ch);
+    curl_close($ch);
 }
 
 function ensure_backend($backend, $config_path) {
