@@ -10,11 +10,11 @@ Browser (xterm.js) ──── server.py ──── ssh
 
 ## How it works
 
-The browser runs a full terminal emulator (xterm.js) and communicates with the Python backend via HTTP long-polling. The backend manages SSH sessions as PTY subprocesses and serves the frontend directly.
+The browser runs a full terminal emulator (xterm.js) and talks to the Python backend over plain HTTP. Output streams back via Server-Sent Events (`/api/stream`); keystrokes go up as short POSTs (`/api/input`). The backend manages SSH sessions as PTY subprocesses and serves the frontend directly.
 
 On shared hosting where you can't run a long-lived process, an optional PHP proxy (`api.php`) auto-starts the backend and forwards requests to it.
 
-**Why not WebSocket?** Most shared hosting PHP environments don't support WebSocket. HTTP long-polling works everywhere — no open ports, no special server configuration. The trade-off is slightly higher latency compared to a native SSH client, but it's negligible for interactive use.
+**Why not WebSocket?** Two reasons. First, many shared-hosting PHP environments don't support WebSocket — and we want websh to drop in there without a separate server. Second, we don't need it: SSE delivers the same low latency as a WebSocket but is plain HTTP, so it tunnels through any HTTPS proxy or PHP host without a protocol upgrade. If even SSE gets buffered by an aggressive upstream (some shared hosts compress every response and won't flush), the frontend silently falls back to HTTP long-polling on `/api/output` for that session. Slower, but works literally anywhere.
 
 ## Requirements
 
@@ -86,7 +86,7 @@ Made to fit where other web terminals can't.
   the backend. No SSH access to the host needed
 - **Python-only mode** — backend serves the frontend directly, zero extras
 - Docker, systemd, reverse proxy examples included
-- HTTP long-polling — works through corporate HTTPS, no WebSocket required
+- Plain HTTP transport (SSE for output, POSTs for input) — works through corporate HTTPS, no WebSocket required, with automatic long-poll fallback for hosts that buffer SSE
 - Python 3.5+ stdlib only — no pip install, no npm, no build step
 
 ## Use cases
@@ -393,9 +393,13 @@ server {
 }
 ```
 
-`proxy_read_timeout` must comfortably exceed the long-poll window (30 s). If
-the proxy runs on a different host, add its IP to `TRUSTED_PROXIES` so rate
-limiting uses the real client IP — see [Rate limiting & proxies](#rate-limiting--proxies).
+`proxy_read_timeout` must comfortably exceed both the long-poll window
+(10 s) and the SSE keep-alive interval (15 s) — 60 s leaves plenty of
+headroom. The backend sets `X-Accel-Buffering: no` on the SSE response,
+so nginx flushes each event immediately without further configuration.
+If the proxy runs on a different host, add its IP to `TRUSTED_PROXIES`
+so rate limiting uses the real client IP — see
+[Rate limiting & proxies](#rate-limiting--proxies).
 
 ## Authentication & security
 
