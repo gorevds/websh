@@ -1,6 +1,10 @@
 # websh
 
-Lightweight but powerful web-based SSH terminal. No build step, no server dependencies.
+Lightweight but powerful web-based SSH terminal.
+
+- 📦 **No build step, no server dependencies** — Python 3 stdlib only. No npm, no pip install, no compile step. Drop the files on FTP and it works.
+- 🌐 **HTTP long-polling, no WebSocket** — tunnels through corporate proxies, restricted networks, and shared hosting environments where WebSocket isn't an option.
+- ⭐ **Persistent sessions — survive tab close, reboot, even backend restart (up to 72 h).** Your shell, scrollback, and running processes keep going on the target host (wrapped in tmux). One click and you're back exactly where you left off.
 
 ![websh split panes](screenshot.png)
 
