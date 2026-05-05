@@ -545,6 +545,106 @@ class TestHTTPApi(unittest.TestCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_stream_returns_undelivered_bytes_to_buffer(self):
+        """Regression: when the client closes /api/stream mid-flight,
+        bytes the SSE handler had already drained from the session must
+        not vanish. The handler peeks the socket for FIN before each
+        read(); if it sees FIN after a read but before delivery, it
+        pushes the bytes back via session.unread(). Either way the next
+        consumer (e.g. long-poll fallback) can still pick them up."""
+        import socket as _socket
+        sid = str(uuid.uuid4())
+
+        # Real-ish session: holds bytes in output_buf under buf_lock and
+        # supports the same read()/unread() contract as SSHSession.
+        class Sess:
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self.buf_lock = __import__("threading").Lock()
+                self.output_buf = b""
+                self.last_activity = 0
+            def read(self):
+                with self.buf_lock:
+                    d = self.output_buf
+                    self.output_buf = b""
+                return d
+            def unread(self, data):
+                if not data:
+                    return
+                with self.buf_lock:
+                    self.output_buf = data + self.output_buf
+            def feed(self, b):
+                with self.buf_lock:
+                    self.output_buf += b
+
+        sess = Sess()
+        with server.sessions_lock:
+            server.sessions[sid] = sess
+        try:
+            # Raw socket so we can read what's actually arrived without
+            # blocking on http.client buffering. We just need to confirm
+            # the handler reached its main loop (the ': ok' priming
+            # comment was sent).
+            s = _socket.create_connection(("127.0.0.1", self.port),
+                                          timeout=5)
+            req = ("GET /api/stream?session_id=" + sid + " HTTP/1.1\r\n"
+                   "Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            s.sendall(req.encode("ascii"))
+            buf = b""
+            deadline = time.time() + 2
+            s.settimeout(0.2)
+            while time.time() < deadline and b": ok" not in buf:
+                try:
+                    chunk = s.recv(256)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except _socket.timeout:
+                    pass
+            self.assertIn(b": ok", buf,
+                "handler did not reach its main loop")
+
+            # Plant bytes, then tear down the client. The handler may
+            # either (a) peek FIN first and leave the buffer untouched,
+            # or (b) read the bytes, hit a write failure, and unread()
+            # them. Both paths must end with the bytes still in the
+            # session for the next reader.
+            sess.feed(b"do-not-lose-me\r\n")
+            try:
+                s.shutdown(_socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+
+            deadline = time.time() + 3
+            recovered = False
+            while time.time() < deadline:
+                with sess.buf_lock:
+                    if b"do-not-lose-me" in sess.output_buf:
+                        recovered = True
+                        break
+                time.sleep(0.05)
+            self.assertTrue(recovered,
+                "bytes drained by SSE handler were lost when client "
+                "disconnected; peek/unread did not preserve them")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_session_unread_prepends(self):
+        """Session.unread() must push bytes back to the FRONT of the
+        buffer so they're delivered in original order on the next read."""
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.output_buf = b"world"
+        s.buf_lock = __import__("threading").Lock()
+        s.last_activity = 0
+        s.unread(b"hello ")
+        self.assertEqual(s.read(), b"hello world")
+        # Idempotent on empty input
+        s.unread(b"")
+        self.assertEqual(s.output_buf, b"")
+
     def test_resize_missing_session(self):
         body, code = self._post("/api/resize", {
             "session_id": "fake", "cols": 80, "rows": 24

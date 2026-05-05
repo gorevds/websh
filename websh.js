@@ -216,9 +216,12 @@ function createPane(container) {
   term.onBinary(d => { if(p.sid) queueInput(p,d) });
   term.onResize(size => {
     // Pending predictions reference cursor coordinates that the resize
-    // may have just invalidated — drop them silently.
-    let undo = rewindEcho(p);
-    if (undo) p.term.write(undo);
+    // just invalidated — drop them without writing. rewindEcho()'s
+    // \b/space/\b sequence isn't actually silent: after xterm.js reflow
+    // the cursor sits in a new logical position, and backspace is
+    // column-only so on narrowing it misses the predicted glyphs while
+    // the spaces clobber legitimate content.
+    clearEchoState(p);
     if(!p.sid) return;
     if(p.resizeTimer) clearTimeout(p.resizeTimer);
     p.resizeTimer = setTimeout(() => {
@@ -440,8 +443,7 @@ function _destroyPane(id, terminate) {
     if (terminate) body.terminate = true;
     api('disconnect', {body: body}).catch(() => {});
   }
-  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
-  p.echoQueue = '';
+  clearEchoState(p);
   p.term.dispose();
 
   let wrap = p.el.parentNode;
@@ -780,6 +782,18 @@ function rewindEcho(p) {
   return '\b'.repeat(n) + ' '.repeat(n) + '\b'.repeat(n);
 }
 
+// Drop any in-flight prediction without writing to the terminal. Used
+// when the cursor coordinates the predictions reference are about to
+// be invalidated (resize) or when the disconnect banner is taking over
+// the screen — writing rewindEcho() in those moments would either miss
+// the dim glyphs (resize-narrowing wraps the cursor past the prediction
+// row, and \b doesn't cross wraps) or paint over the freshly-written
+// banner.
+function clearEchoState(p) {
+  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
+  p.echoQueue = '';
+}
+
 function predictKey(p, ch) {
   if (!predictionsEnabled(p)) return;
   if (!ch || ch.length !== 1) return;
@@ -861,11 +875,19 @@ function closeStream(p) {
 // the session ended (auth_failed / alive=false / fatal session error)
 // so callers know to stop their read loop.
 function handleOutputPayload(p, r) {
+  // Idempotency guard. SSE often delivers the session-end signal as
+  // {alive:false} on data, then a tail-drain {alive:false}, then
+  // event:end{alive:false}. Each goes through one of the branches
+  // below, all of which null p.sid on the first call. Without this
+  // guard the disconnect / auth-failed banner, showReconnectBar, and
+  // saveSessions would fire 2–3× per disconnect.
+  if (!p.sid) return true;
   if (r.error) {
     // Session not found — stale restore or server restarted. Persistent
     // panes try to re-attach via tmux; short-lived panes just reconnect.
     console.log('output: session error:', r.error);
     closeStream(p);
+    clearEchoState(p);
     stopKeepalive(p); p.polling=false; p.sid=null; p.connecting=false;
     updatePaneBadge(p);
     if(p.host || p.connection) {
@@ -890,6 +912,10 @@ function handleOutputPayload(p, r) {
   // (reconnect placeholder). The login form never reopens on its own.
   if (r.auth_failed) {
     p.pendingSave = null;
+    // Clear predictions before writing the banner — a pending TTL
+    // timer would otherwise paint \b/space/\b over our freshly-drawn
+    // banner ~1 s later.
+    clearEchoState(p);
     p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
     closeStream(p);
     stopKeepalive(p); p.polling = false;
@@ -910,6 +936,7 @@ function handleOutputPayload(p, r) {
     commitPendingSave(p);
   }
   if(r.alive===false){
+    clearEchoState(p);
     p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
     closeStream(p);
     stopKeepalive(p); p.polling=false; p.sid=null;
@@ -957,6 +984,7 @@ function transportFatal(p, e) {
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
     ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
     : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
+  clearEchoState(p);
   p.term.write(msg);
   closeStream(p);
   stopKeepalive(p); p.polling=false; p.sid=null;

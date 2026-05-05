@@ -122,6 +122,13 @@ function proxy_get($url) {
 // regardless (mod_deflate, fastcgi_buffering on, etc.) the stream may
 // arrive in clumps — the frontend detects this via the first-message
 // timer and falls back to /api/output long-polling.
+//
+// Status forwarding: do NOT commit response headers up front. We delay
+// emitting Content-Type / status until the backend's response status
+// line arrives, so a 404 from /api/stream (invalid sid, server restart)
+// surfaces as 404 application/json — not as 200 text/event-stream with
+// a JSON error baked in, which EventSource sees as a healthy stream
+// with zero events.
 function proxy_stream($url) {
     @ini_set('zlib.output_compression', '0');
     @ini_set('output_buffering', '0');
@@ -129,17 +136,32 @@ function proxy_stream($url) {
     while (ob_get_level() > 0) { ob_end_clean(); }
     @ob_implicit_flush(true);
 
-    header('Content-Type: text/event-stream');
-    header('Cache-Control: no-cache, no-store');
-    header('X-Accel-Buffering: no');
-    header('Connection: keep-alive');
-
+    $sent_headers = false;
     $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
     curl_setopt($ch, CURLOPT_HEADER, false);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     curl_setopt($ch, CURLOPT_TIMEOUT, 0);
     curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: text/event-stream'));
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION,
+        function ($ch, $header) use (&$sent_headers) {
+            $len = strlen($header);
+            if (!$sent_headers
+                    && preg_match('#^HTTP/\S+\s+(\d+)\b#', trim($header), $m)) {
+                $code = intval($m[1]);
+                header('HTTP/1.1 ' . $code);
+                header('Cache-Control: no-cache, no-store');
+                if ($code === 200) {
+                    header('Content-Type: text/event-stream');
+                    header('X-Accel-Buffering: no');
+                    header('Connection: keep-alive');
+                } else {
+                    header('Content-Type: application/json');
+                }
+                $sent_headers = true;
+            }
+            return $len;
+        });
     curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
         echo $data;
         @flush();
@@ -147,8 +169,16 @@ function proxy_stream($url) {
         if (connection_aborted()) return 0;
         return strlen($data);
     });
-    curl_exec($ch);
+    $ok = curl_exec($ch);
+    $err = curl_error($ch);
     curl_close($ch);
+    if (!$sent_headers) {
+        // curl never received a response status line — treat as gateway
+        // failure rather than letting PHP emit its default text/html.
+        header('HTTP/1.1 502 Bad Gateway');
+        header('Content-Type: application/json');
+        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+    }
 }
 
 function ensure_backend($backend, $config_path) {

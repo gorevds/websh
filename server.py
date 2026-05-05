@@ -50,6 +50,7 @@ import pty
 import re
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -771,6 +772,19 @@ class SSHSession(object):
         if data:
             self.last_activity = time.time()
         return data
+
+    def unread(self, data):
+        """Push bytes back to the front of the output buffer.
+
+        Used when a reader (SSE _stream / long-poll) drained the buffer
+        but couldn't deliver the bytes to the client (BrokenPipe). The
+        next reader picks them up instead of losing them. Keeping order:
+        prepend, since unread bytes are older than anything that arrived
+        in the meantime."""
+        if not data:
+            return
+        with self.buf_lock:
+            self.output_buf = data + self.output_buf
 
     def write(self, data):
         """Send input to SSH process."""
@@ -1592,11 +1606,18 @@ class Handler(BaseHTTPRequestHandler):
         while time.time() < deadline:
             data = session.read()
             if data:
-                self._json({
-                    "data": base64.b64encode(data).decode("ascii"),
-                    "alive": session.alive,
-                    "auth_failed": session.auth_failed,
-                })
+                # If the client hung up between read() and write(), we
+                # would lose these bytes — read() is destructive. Push
+                # them back on failure so the next /api/output picks up.
+                try:
+                    self._json({
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "alive": session.alive,
+                        "auth_failed": session.auth_failed,
+                    })
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    session.unread(data)
+                    raise
                 return
             if not session.alive:
                 self._json({"data": "", "alive": False,
@@ -1650,8 +1671,32 @@ class Handler(BaseHTTPRequestHandler):
         last_send = time.time()
         KEEPALIVE = 15  # seconds between heartbeats when no real data
 
+        # Detect a half-closed connection (browser closed EventSource, or
+        # the PHP proxy aborted) before draining the session — otherwise
+        # session.read() destructively clears the buffer and the bytes
+        # are lost when wfile.write later raises BrokenPipe. Peek the
+        # raw socket non-blocking; recv()=='' means the peer sent FIN.
+        sock = self.connection
+        def client_gone():
+            try:
+                peek = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                return peek == b""
+            except (BlockingIOError, InterruptedError):
+                return False
+            except OSError:
+                return True
+
+        # If wfile.write fails after we've already drained bytes, push
+        # them back so the next reader (long-poll fallback or a fresh
+        # /api/stream) can deliver them. Without this, every transport
+        # switch silently loses whatever was in flight.
+        data = b""
         try:
             while True:
+                if client_gone():
+                    if data:
+                        session.unread(data)
+                    return
                 data = session.read()
                 if data:
                     payload = json.dumps({
@@ -1664,6 +1709,7 @@ class Handler(BaseHTTPRequestHandler):
                         .encode("utf-8"))
                     self.wfile.flush()
                     last_send = time.time()
+                    data = b""  # delivered — no need to push back on error
                 if not session.alive:
                     break
                 if not data:
@@ -1681,9 +1727,13 @@ class Handler(BaseHTTPRequestHandler):
                     "alive": False,
                     "auth_failed": session.auth_failed,
                 })
-                self.wfile.write(
-                    ("event: data\ndata: " + payload + "\n\n")
-                    .encode("utf-8"))
+                try:
+                    self.wfile.write(
+                        ("event: data\ndata: " + payload + "\n\n")
+                        .encode("utf-8"))
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    session.unread(tail)
+                    return
             end_payload = json.dumps({
                 "alive": False,
                 "auth_failed": session.auth_failed,
@@ -1693,7 +1743,10 @@ class Handler(BaseHTTPRequestHandler):
                 .encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
-            # Client went away — that's the normal exit path.
+            # Client went away — give back any bytes we drained but
+            # didn't manage to deliver.
+            if data:
+                session.unread(data)
             return
 
     def _resize(self):
