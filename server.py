@@ -62,6 +62,7 @@ import termios
 import time
 import urllib.parse
 import uuid
+import weakref
 from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
@@ -80,6 +81,19 @@ _HAVE_MSG_DONTWAIT = hasattr(socket, "MSG_DONTWAIT")
 # non-socket file descriptors. When this is False, Session falls back
 # to the legacy time.sleep(POLL_INTERVAL) busy-poll path everywhere.
 _HAVE_SELECTABLE_PIPES = (os.name == "posix")
+
+
+def _close_pipe_fds(r, w):
+    """weakref.finalize callable for Session's notification pipe. Defined
+    at module level (not as a method) so the closure captures only the
+    int fds, not Session — capturing self via a bound method would keep
+    the object alive forever and the finalizer would never fire."""
+    for fd in (r, w):
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 # ─── Configuration ───────────────────────────────────────────────────
 
@@ -534,6 +548,19 @@ class SSHSession(object):
         # non-blocking — a full pipe (consumer hasn't drained yet) just
         # means "wakeup already pending", and EBADF after teardown is
         # absorbed by the wait helper.
+        #
+        # Pipe fds are closed by a weakref.finalize callback when this
+        # Session is garbage-collected, NOT in close(). The reason is an
+        # fd-reuse race: between a reader thread reading
+        # `fd = self._notify_w` (one bytecode) and calling `os.write(fd, ...)`
+        # (later bytecodes) the GIL can yield, close() in another
+        # thread can free the fd, and the kernel can reuse the same fd
+        # number for a new socket — at which point the reader's stray
+        # `\x00` lands in someone else's stream. Tying pipe lifetime to
+        # GC closes that race: as long as any thread holds a Session
+        # reference, the fds are valid; once the last reference is gone
+        # (request handler returned, reader thread exited, registry
+        # popped), the finalizer runs and only then closes the fds.
         self._notify_r = None
         self._notify_w = None
         if _HAVE_SELECTABLE_PIPES:
@@ -541,6 +568,8 @@ class SSHSession(object):
                 self._notify_r, self._notify_w = os.pipe()
                 os.set_blocking(self._notify_r, False)
                 os.set_blocking(self._notify_w, False)
+                weakref.finalize(self, _close_pipe_fds,
+                                 self._notify_r, self._notify_w)
             except OSError:
                 self._notify_r = None
                 self._notify_w = None
@@ -854,7 +883,7 @@ class SSHSession(object):
         except (BlockingIOError, OSError):
             pass
 
-    def wait_for_data(self, client_socket, timeout):
+    def wait_for_data(self, client_socket, timeout, selector=None):
         """Block up to `timeout` seconds. Returns when:
           - new PTY data has been signaled into the pipe, OR
           - the client socket is readable (FIN, or peer-side bytes —
@@ -863,7 +892,15 @@ class SSHSession(object):
         Returns nothing; caller re-checks state via session.read() and
         Handler._client_gone(). Robust to torn-down pipes (close() may
         race with us): selector errors fall back to a brief sleep so
-        the caller's main loop progresses and observes alive=False."""
+        the caller's main loop progresses and observes alive=False.
+
+        Hot-loop optimization: if `selector` is provided, it's expected
+        to already have notify_r and (optionally) client_socket
+        registered, and the caller owns its lifecycle. This skips the
+        per-call epoll_create1+epoll_ctl+close churn — important for
+        chatty sessions where wait_for_data is called many times per
+        second. When `selector` is None we fall back to a one-shot
+        selector (slower; convenient for ad-hoc callers and tests)."""
         if timeout <= 0:
             return
         notify_r = self._notify_r
@@ -872,6 +909,28 @@ class SSHSession(object):
             # busy-poll cadence so callers still make progress.
             time.sleep(min(timeout, POLL_INTERVAL))
             return
+
+        def _drain():
+            try:
+                while True:
+                    chunk = os.read(notify_r, 4096)
+                    if not chunk:
+                        break
+            except (BlockingIOError, OSError):
+                pass
+
+        if selector is not None:
+            # Caller-owned selector path: just select+drain.
+            try:
+                events = selector.select(timeout)
+            except (OSError, ValueError, RuntimeError):
+                time.sleep(min(timeout, 0.05))
+                return
+            if events:
+                _drain()
+            return
+
+        # One-shot selector path (no caching).
         try:
             with selectors.DefaultSelector() as sel:
                 sel.register(notify_r, selectors.EVENT_READ)
@@ -885,13 +944,7 @@ class SSHSession(object):
                         pass
                 events = sel.select(timeout)
             if events:
-                try:
-                    while True:
-                        chunk = os.read(notify_r, 4096)
-                        if not chunk:
-                            break
-                except (BlockingIOError, OSError):
-                    pass
+                _drain()
         except (OSError, ValueError, RuntimeError):
             # Selector or fd died (session being torn down). Keep the
             # caller's loop ticking with a brief sleep instead of
@@ -1435,17 +1488,10 @@ class SSHSession(object):
             except OSError:
                 pass
             self._control_path = None
-        # Close the notification pipe last. Consumers may still be
-        # touching the read end here; their wait_for_data() catches
-        # OSError/ValueError and exits via the alive=False check.
-        for attr in ("_notify_r", "_notify_w"):
-            fd = getattr(self, attr, None)
-            if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
-                setattr(self, attr, None)
+        # NOTE: do NOT close the notification pipe here — see __init__
+        # for the full rationale. Pipe-fd lifetime is bound to Session
+        # GC via weakref.finalize, which closes the race between
+        # reader-thread _signal() and pipe-fd reuse during teardown.
 
     def is_expired(self):
         return time.time() - self.last_activity > SESSION_TIMEOUT
@@ -1484,6 +1530,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         pass
+
+    def _build_session_selector(self, session):
+        """Build a selectors.DefaultSelector with the session's notify
+        pipe and our client socket pre-registered, so a long-running
+        endpoint (_stream/_output) can call sel.select() many times
+        without paying epoll_create1+ctl+close on each iteration. The
+        caller owns the returned selector — close it (try/finally or
+        with-style). Errors during register are swallowed: a missing
+        notify pipe (Windows or pipe init failure) just falls through
+        to time.sleep in Session.wait_for_data; a torn-down client
+        socket means we can't watch for FIN, but the keepalive
+        cadence still drives the loop forward."""
+        sel = selectors.DefaultSelector()
+        if session._notify_r is not None:
+            try:
+                sel.register(session._notify_r, selectors.EVENT_READ)
+            except (ValueError, OSError):
+                pass
+        try:
+            sel.register(self.connection.fileno(),
+                         selectors.EVENT_READ)
+        except (ValueError, OSError):
+            pass
+        return sel
 
     def _client_gone(self):
         """Return True if the peer has half-closed (sent FIN) or the
@@ -1814,36 +1884,45 @@ class Handler(BaseHTTPRequestHandler):
         # every output_buf update; we park on that pipe + the client
         # socket here instead of the previous time.sleep(POLL_INTERVAL)
         # busy-poll, so latency is bounded by scheduler jitter rather
-        # than half of POLL_INTERVAL.
+        # than half of POLL_INTERVAL. The selector is built once and
+        # reused across iterations to avoid epoll_create1+close churn.
         deadline = time.time() + POLL_TIMEOUT
-        while True:
-            if self._client_gone():
-                return
-            data = session.read()
-            if data:
-                # If the client hung up between read() and write(), we
-                # would still lose these bytes — push them back on
-                # failure so the next /api/output picks them up.
-                try:
-                    self._json({
-                        "data": base64.b64encode(data).decode("ascii"),
-                        "alive": session.alive,
-                        "auth_failed": session.auth_failed,
-                        "echo_off": session.echo_off_hint(),
-                    })
-                except (BrokenPipeError, ConnectionResetError, OSError):
-                    session.unread(data)
-                    raise
-                return
-            if not session.alive:
-                self._json({"data": "", "alive": False,
+        sel = self._build_session_selector(session)
+        try:
+            while True:
+                if self._client_gone():
+                    return
+                data = session.read()
+                if data:
+                    # If the client hung up between read() and write(), we
+                    # would still lose these bytes — push them back on
+                    # failure so the next /api/output picks them up.
+                    try:
+                        self._json({
+                            "data": base64.b64encode(data).decode("ascii"),
+                            "alive": session.alive,
                             "auth_failed": session.auth_failed,
-                            "echo_off": session.echo_off_hint()})
-                return
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                break
-            session.wait_for_data(self.connection, remaining)
+                            "echo_off": session.echo_off_hint(),
+                        })
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        session.unread(data)
+                        raise
+                    return
+                if not session.alive:
+                    self._json({"data": "", "alive": False,
+                                "auth_failed": session.auth_failed,
+                                "echo_off": session.echo_off_hint()})
+                    return
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                session.wait_for_data(self.connection, remaining,
+                                      selector=sel)
+        finally:
+            try:
+                sel.close()
+            except Exception:
+                pass
 
         self._json({"data": "", "alive": session.alive,
                     "auth_failed": session.auth_failed,
@@ -1919,6 +1998,7 @@ class Handler(BaseHTTPRequestHandler):
         # which catches the case where the write side hasn't yet
         # noticed the peer's FIN.
         data = b""
+        sel = self._build_session_selector(session)
         try:
             while True:
                 if self._client_gone():
@@ -1946,11 +2026,11 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 # No data and session still alive: send keepalive if
                 # we've been silent for too long, then park on the
-                # notification pipe + client socket until either the
-                # PTY produces more bytes (signal), the peer closes
-                # (FIN -> client socket readable), or the keepalive
-                # deadline arrives. This replaces the previous
-                # 100 Hz time.sleep(POLL_INTERVAL) busy-poll.
+                # cached selector (notify pipe + client socket) until
+                # either the PTY produces more bytes (signal), the
+                # peer closes (FIN -> client socket readable), or the
+                # keepalive deadline arrives. This replaces the
+                # previous 100 Hz time.sleep(POLL_INTERVAL) busy-poll.
                 now = time.time()
                 if now - last_send > KEEPALIVE:
                     self.wfile.write(b": keepalive\n\n")
@@ -1958,7 +2038,8 @@ class Handler(BaseHTTPRequestHandler):
                     last_send = now
                 next_keepalive = last_send + KEEPALIVE
                 timeout = max(0.0, next_keepalive - time.time())
-                session.wait_for_data(self.connection, timeout)
+                session.wait_for_data(self.connection, timeout,
+                                      selector=sel)
 
             # Drain any remaining buffered output before sending 'end'.
             tail = session.read()
@@ -1995,6 +2076,11 @@ class Handler(BaseHTTPRequestHandler):
             if data:
                 session.unread(data)
             return
+        finally:
+            try:
+                sel.close()
+            except Exception:
+                pass
 
     def _resize(self):
         try:
