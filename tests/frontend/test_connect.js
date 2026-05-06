@@ -509,6 +509,65 @@ test('auto-connect failure → user dismiss popup → form appears', async () =>
 });
 
 // =====================================================================
+// Regression: handleOutputPayload must NOT drop tail-drain bytes
+// arriving after a frame that already flipped alive=false.
+// SSE _stream emits {data, alive:false} → tail-drain {data:"x",
+// alive:false} → event:end{alive:false}. The idempotency guard for
+// the disconnect/auth-failed branches must sit AFTER the r.data
+// handler, otherwise the tail bytes vanish.
+test('disconnect: tail-drain data after alive=false still rendered', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Capture every term.write into an array we can assert on.
+  const writes = [];
+  // Build a minimal pane object the way websh.js itself does, then
+  // hand it to handleOutputPayload directly (bypassing transports).
+  const p = {
+    id: 'p1', sid: 'abc', polling: true,
+    term: {
+      write(b) {
+        if (typeof b === 'string') { writes.push(b); return; }
+        // Uint8Array-like: array of byte values. instanceof Uint8Array
+        // doesn't cross the jsdom realm boundary, so feature-detect.
+        let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+        writes.push(s);
+      },
+      buffer: {active: {type: 'normal'}}
+    },
+    el: win.document.createElement('div'),
+    echoQueue: '', echoTimer: null,
+    persistent: false, host: '', connection: null,
+    connectedAt: 0, recentOutput: ''
+  };
+  // Inject the pane into websh.js' module-scope panes registry, and
+  // expose handleOutputPayload (a function declaration, so it's already
+  // on window).
+  win._tp = p;
+  win.eval(`panes['p1'] = window._tp; activeId = 'p1';`);
+  // Frame 1: final output + alive=false. Should write 'first' AND
+  // the closed banner, then null p.sid.
+  win.handleOutputPayload(p, {data: win.btoa('first\r\n'), alive: false});
+  ok(p.sid === null, 'p.sid nulled after alive=false; got ' + p.sid);
+  let bannerCount = writes.filter(s => s.indexOf('connection closed') !== -1).length;
+  ok(bannerCount === 1, 'banner written once; got ' + bannerCount);
+  ok(writes.some(s => s.indexOf('first') !== -1), 'first chunk rendered; writes=' + JSON.stringify(writes));
+  // Frame 2 (tail-drain): alive=false again, with new bytes. The
+  // bytes MUST land in the terminal — losing them silently would be
+  // a regression. The banner MUST NOT be re-written.
+  win.handleOutputPayload(p, {data: win.btoa('tail-bytes\r\n'), alive: false});
+  ok(writes.some(s => s.indexOf('tail-bytes') !== -1),
+     'tail bytes rendered; writes=' + JSON.stringify(writes));
+  bannerCount = writes.filter(s => s.indexOf('connection closed') !== -1).length;
+  ok(bannerCount === 1, 'banner still written only once; got ' + bannerCount);
+  // Frame 3: the bare event:end frame. No data, alive=false. Should
+  // be a complete no-op.
+  const wlen = writes.length;
+  win.handleOutputPayload(p, {alive: false});
+  ok(writes.length === wlen, 'event:end is no-op; new writes=' + (writes.length - wlen));
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');

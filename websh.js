@@ -875,16 +875,12 @@ function closeStream(p) {
 // the session ended (auth_failed / alive=false / fatal session error)
 // so callers know to stop their read loop.
 function handleOutputPayload(p, r) {
-  // Idempotency guard. SSE often delivers the session-end signal as
-  // {alive:false} on data, then a tail-drain {alive:false}, then
-  // event:end{alive:false}. Each goes through one of the branches
-  // below, all of which null p.sid on the first call. Without this
-  // guard the disconnect / auth-failed banner, showReconnectBar, and
-  // saveSessions would fire 2–3× per disconnect.
-  if (!p.sid) return true;
   if (r.error) {
     // Session not found — stale restore or server restarted. Persistent
     // panes try to re-attach via tmux; short-lived panes just reconnect.
+    // Idempotency: a second error frame after we already started a
+    // reconnect would re-enter connectPane and stomp the new attempt.
+    if (!p.sid && !p.connecting) return true;
     console.log('output: session error:', r.error);
     closeStream(p);
     clearEchoState(p);
@@ -897,6 +893,12 @@ function handleOutputPayload(p, r) {
   }
   p.connecting=false;
   if(r.data){
+    // Always render incoming bytes — even on a tail-drain frame that
+    // arrives after the disconnect banner, the bytes may be the last
+    // thing the shell wrote (final command output, exit message). We
+    // lose nothing by writing them after the banner; xterm renders
+    // them where the cursor is. Skipping them on p.sid=null would
+    // silently drop end-of-session output.
     updatePaneBadge(p);
     let chunk = atob(r.data);
     let processed = consumeEcho(p, chunk);
@@ -907,6 +909,12 @@ function handleOutputPayload(p, r) {
       p.recentOutput = ((p.recentOutput || '') + chunk).slice(-4096);
     }
   }
+  // Idempotency guard for the terminal-state branches below. SSE
+  // delivers session-end as {alive:false} on data, then a tail-drain
+  // {alive:false}, then event:end{alive:false}; each ends up here, and
+  // each branch below nulls p.sid on the first call. Without this we'd
+  // re-banner, re-stop-keepalive, re-saveSessions 2-3× per disconnect.
+  if (!p.sid) return true;
   // SSH auth rejected our password/key: stop the loop cleanly and
   // do NOT save the entry. Surface the failure on the pane itself
   // (reconnect placeholder). The login form never reopens on its own.

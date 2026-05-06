@@ -1312,6 +1312,21 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _client_gone(self):
+        """Return True if the peer has half-closed (sent FIN) or the
+        socket has otherwise died. Non-blocking peek; if there's nothing
+        readable yet, the OS raises EAGAIN/EWOULDBLOCK and we treat it
+        as 'still connected'. Used by long-running endpoints to bail
+        out before draining destructive state into a dead socket."""
+        try:
+            peek = self.connection.recv(
+                1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            return peek == b""
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
+
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
@@ -1601,14 +1616,19 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "session not found"}, 404)
             return
 
-        # Long-poll: wait up to POLL_TIMEOUT seconds for data
+        # Long-poll: wait up to POLL_TIMEOUT seconds for data. Bail
+        # early if the client hung up so we don't drain bytes into a
+        # closed socket (read() is destructive — those bytes would
+        # be lost) and don't spin a worker for the full timeout.
         deadline = time.time() + POLL_TIMEOUT
         while time.time() < deadline:
+            if self._client_gone():
+                return
             data = session.read()
             if data:
                 # If the client hung up between read() and write(), we
-                # would lose these bytes — read() is destructive. Push
-                # them back on failure so the next /api/output picks up.
+                # would still lose these bytes — push them back on
+                # failure so the next /api/output picks them up.
                 try:
                     self._json({
                         "data": base64.b64encode(data).decode("ascii"),
@@ -1671,29 +1691,18 @@ class Handler(BaseHTTPRequestHandler):
         last_send = time.time()
         KEEPALIVE = 15  # seconds between heartbeats when no real data
 
-        # Detect a half-closed connection (browser closed EventSource, or
-        # the PHP proxy aborted) before draining the session — otherwise
-        # session.read() destructively clears the buffer and the bytes
-        # are lost when wfile.write later raises BrokenPipe. Peek the
-        # raw socket non-blocking; recv()=='' means the peer sent FIN.
-        sock = self.connection
-        def client_gone():
-            try:
-                peek = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-                return peek == b""
-            except (BlockingIOError, InterruptedError):
-                return False
-            except OSError:
-                return True
-
         # If wfile.write fails after we've already drained bytes, push
         # them back so the next reader (long-poll fallback or a fresh
         # /api/stream) can deliver them. Without this, every transport
-        # switch silently loses whatever was in flight.
+        # switch silently loses whatever was in flight. Detection of a
+        # half-closed connection (browser closed EventSource, or the
+        # PHP proxy aborted) goes via _client_gone() before each read,
+        # which catches the case where the write side hasn't yet
+        # noticed the peer's FIN.
         data = b""
         try:
             while True:
-                if client_gone():
+                if self._client_gone():
                     if data:
                         session.unread(data)
                     return
