@@ -66,6 +66,12 @@ from threading import Thread, Lock
 
 __version__ = "0.2.0"
 
+# socket.MSG_DONTWAIT is Unix-only (Linux/BSD/macOS). On platforms that
+# don't define it (Windows, some embedded), Handler._client_gone() falls
+# back to setblocking() around a plain MSG_PEEK. Both yield the same
+# observable behaviour; the flag avoids an AttributeError at import time.
+_HAVE_MSG_DONTWAIT = hasattr(socket, "MSG_DONTWAIT")
+
 # ─── Configuration ───────────────────────────────────────────────────
 
 def _int_env(name, default):
@@ -780,11 +786,18 @@ class SSHSession(object):
         but couldn't deliver the bytes to the client (BrokenPipe). The
         next reader picks them up instead of losing them. Keeping order:
         prepend, since unread bytes are older than anything that arrived
-        in the meantime."""
+        in the meantime.
+
+        Same OUTPUT_BUF_MAX truncation as the PTY-reader path: if a
+        large unread combined with fresh PTY output would push us over
+        the cap, drop the oldest bytes. This matches the existing
+        'keep the recent terminal state' policy."""
         if not data:
             return
         with self.buf_lock:
             self.output_buf = data + self.output_buf
+            if len(self.output_buf) > OUTPUT_BUF_MAX:
+                self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
 
     def write(self, data):
         """Send input to SSH process."""
@@ -1317,10 +1330,27 @@ class Handler(BaseHTTPRequestHandler):
         socket has otherwise died. Non-blocking peek; if there's nothing
         readable yet, the OS raises EAGAIN/EWOULDBLOCK and we treat it
         as 'still connected'. Used by long-running endpoints to bail
-        out before draining destructive state into a dead socket."""
+        out before draining destructive state into a dead socket.
+
+        Portable form: MSG_DONTWAIT is Unix-only (Linux/BSD/macOS), so
+        on platforms that don't define it (Windows, some embedded) we
+        fall back to flipping the socket to non-blocking around a plain
+        MSG_PEEK. Both paths behave identically on the success/EAGAIN
+        edge."""
+        sock = self.connection
         try:
-            peek = self.connection.recv(
-                1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            if _HAVE_MSG_DONTWAIT:
+                peek = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            else:
+                old = sock.getblocking()
+                sock.setblocking(False)
+                try:
+                    peek = sock.recv(1, socket.MSG_PEEK)
+                finally:
+                    try:
+                        sock.setblocking(old)
+                    except OSError:
+                        pass
             return peek == b""
         except (BlockingIOError, InterruptedError):
             return False
@@ -1740,6 +1770,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.write(
                         ("event: data\ndata: " + payload + "\n\n")
                         .encode("utf-8"))
+                    # Flush before the closing 'end' so a write failure
+                    # on a buffered wfile (Python's default makefile in
+                    # some setups) is attributable to *this* payload —
+                    # we can unread() the right bytes.
+                    self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     session.unread(tail)
                     return

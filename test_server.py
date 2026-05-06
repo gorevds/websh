@@ -632,6 +632,42 @@ class TestHTTPApi(unittest.TestCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_client_gone_detects_fin(self):
+        """_client_gone() returns True after the peer half-closes (sends
+        FIN) and False while the connection is just idle. This is what
+        lets _stream and /api/output bail before draining the session
+        into a dead socket."""
+        import socket as _socket
+        a, b = _socket.socketpair()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            self.assertFalse(h._client_gone(),
+                             "fresh idle socket reported as gone")
+            b.shutdown(_socket.SHUT_WR)
+            # Tiny sleep to let the FIN propagate through the local
+            # socketpair; on Linux this is essentially instant.
+            time.sleep(0.05)
+            self.assertTrue(h._client_gone(),
+                            "FIN from peer not detected by peek")
+        finally:
+            a.close(); b.close()
+
+    def test_client_gone_false_with_pending_data(self):
+        """Peer wrote bytes but didn't close — peek returns those bytes,
+        not EOF, so _client_gone() must say False."""
+        import socket as _socket
+        a, b = _socket.socketpair()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            b.send(b"hello")
+            time.sleep(0.05)
+            self.assertFalse(h._client_gone(),
+                             "pending data should not be confused with FIN")
+        finally:
+            a.close(); b.close()
+
     def test_session_unread_prepends(self):
         """Session.unread() must push bytes back to the FRONT of the
         buffer so they're delivered in original order on the next read."""

@@ -878,9 +878,11 @@ function handleOutputPayload(p, r) {
   if (r.error) {
     // Session not found — stale restore or server restarted. Persistent
     // panes try to re-attach via tmux; short-lived panes just reconnect.
-    // Idempotency: a second error frame after we already started a
-    // reconnect would re-enter connectPane and stomp the new attempt.
-    if (!p.sid && !p.connecting) return true;
+    // Idempotency: only enter this branch on the first frame that
+    // signals it; later frames (event:end after data on SSE) find
+    // p.sid already nulled by us and bail. Without this guard we'd
+    // re-enter connectPane and stomp our own reconnect attempt.
+    if (!p.sid) return true;
     console.log('output: session error:', r.error);
     closeStream(p);
     clearEchoState(p);
