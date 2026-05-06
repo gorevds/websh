@@ -534,29 +534,96 @@ class TestHTTPApi(unittest.TestCase):
             self.assertIn(": ok", text)
             self.assertIn("event: data", text)
             self.assertIn("event: end", text)
-            # The data event carries our chunk base64-encoded. Parse the
-            # JSON line that follows the 'event: data' marker.
-            data_line = next(
-                line for line in text.splitlines()
+            # The handler emits a primer 'event: data' immediately (so
+            # the client's first-message timer disarms even on streams
+            # that have no PTY output yet). Skip past it to find the
+            # frame carrying our actual chunk.
+            data_payloads = [
+                json.loads(line[len("data: "):])
+                for line in text.splitlines()
                 if line.startswith("data: ") and '"data"' in line
+            ]
+            self.assertGreaterEqual(len(data_payloads), 2,
+                "expected primer + chunk, got: " + repr(data_payloads))
+            self.assertEqual(data_payloads[0]["data"], "",
+                "first data event must be the empty primer")
+            chunk_payload = next(
+                p for p in data_payloads if p["data"] != ""
             )
-            payload = json.loads(data_line[len("data: "):])
-            self.assertEqual(base64.b64decode(payload["data"]),
+            self.assertEqual(base64.b64decode(chunk_payload["data"]),
                              b"hello\r\n")
-            self.assertFalse(payload["auth_failed"])
+            self.assertFalse(chunk_payload["auth_failed"])
             # echo_off propagates from the session into every payload
-            # so the client can gate local-echo prediction at echo-
-            # disabled prompts (sudo / mysql -p / passwd / passphrase).
-            self.assertIn("echo_off", payload)
-            self.assertFalse(payload["echo_off"])
+            # (primer included) so the client can gate local-echo
+            # prediction at echo-disabled prompts.
+            self.assertIn("echo_off", data_payloads[0])
+            self.assertFalse(data_payloads[0]["echo_off"])
+            self.assertIn("echo_off", chunk_payload)
+            self.assertFalse(chunk_payload["echo_off"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_stream_primer_disarms_timer_on_idle_session(self):
+        """A session that produces no PTY output still gets a real
+        'event: data' frame right after the headers, so the client's
+        first-message buffer-detection timer disarms instead of falling
+        back to long-poll on an otherwise healthy SSE channel."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class IdleSession:
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self._calls = 0
+            def read(self):
+                # First few read()s return nothing; then we mark dead so
+                # the handler exits cleanly without ever emitting a
+                # non-primer data frame.
+                self._calls += 1
+                if self._calls > 3:
+                    self.alive = False
+                return b""
+            def echo_off_hint(self):
+                return False
+
+        with server.sessions_lock:
+            server.sessions[sid] = IdleSession()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            conn.request("GET", "/api/stream?session_id=" + sid)
+            resp = conn.getresponse()
+            buf = b""
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: end" not in buf:
+                chunk = resp.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.close()
+            text = buf.decode("utf-8")
+            # The primer is an 'event: data' carrying empty data — that's
+            # what disarms the client's timer on a quiet channel.
+            self.assertIn("event: data", text,
+                "primer 'event: data' must be sent even when idle")
+            primer = json.loads(next(
+                line[len("data: "):] for line in text.splitlines()
+                if line.startswith("data: ") and '"data"' in line))
+            self.assertEqual(primer["data"], "",
+                "primer carries empty data")
+            self.assertTrue(primer["alive"])
+            self.assertFalse(primer["echo_off"])
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
     def test_stream_propagates_echo_off_hint(self):
         """When the session reports echo_off_hint=True (recent output
-        looks like a password prompt), the SSE 'data' event must carry
-        echo_off=true so the client suppresses local-echo prediction."""
+        looks like a password prompt), every SSE 'data' frame — primer
+        included — must carry echo_off=true so the client suppresses
+        local-echo prediction from the very first event."""
         import http.client
         sid = str(uuid.uuid4())
 
@@ -589,13 +656,16 @@ class TestHTTPApi(unittest.TestCase):
                 buf += chunk
             conn.close()
             text = buf.decode("utf-8")
-            data_line = next(
-                line for line in text.splitlines()
+            data_payloads = [
+                json.loads(line[len("data: "):])
+                for line in text.splitlines()
                 if line.startswith("data: ") and '"data"' in line
-            )
-            payload = json.loads(data_line[len("data: "):])
-            self.assertTrue(payload["echo_off"],
-                "echo_off=True from session must propagate to wire")
+            ]
+            self.assertGreaterEqual(len(data_payloads), 1)
+            for p in data_payloads:
+                self.assertTrue(p["echo_off"],
+                    "echo_off=True from session must propagate "
+                    "to wire on every frame, got: " + repr(p))
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
@@ -1189,6 +1259,24 @@ class TestEchoOffHint(unittest.TestCase):
     def test_uppercase_prompt_matches(self):
         s = self._fake_session(b"PASSWORD: ")
         self.assertTrue(s.echo_off_hint())
+
+    def test_colored_prompt_with_sgr_reset_matches(self):
+        """Distros and PAM modules sometimes wrap the prompt in ANSI
+        SGR sequences (bold, color). The trailing class admits whitespace
+        and SGR runs after the colon so these still hit."""
+        s = self._fake_session(b"\x1b[1mPassword:\x1b[0m ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_colored_prompt_trailing_sgr_matches(self):
+        s = self._fake_session(b"Password: \x1b[0m")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_non_prompt_text_after_colon_does_not_match(self):
+        """ANSI CSI stripping must not turn non-prompt content into a
+        false match — the post-colon content still has to be whitespace
+        for the regex's `:\\s*$` anchor to fire."""
+        s = self._fake_session(b"Password:\x1b[Knot a prompt")
+        self.assertFalse(s.echo_off_hint())
 
     def test_only_last_line_considered(self):
         """Earlier lines containing the keyword must not trip detection

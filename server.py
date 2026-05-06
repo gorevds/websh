@@ -139,6 +139,12 @@ PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
 # the remote pty's termios bit directly.
 ECHO_OFF_PROMPT_RE = re.compile(
     rb"(?i)\b(password|passcode|passphrase)\b[^\n]*:\s*$")
+# ANSI CSI sequences end in an ASCII letter, which `\b` interprets as a
+# word char — `\b` between a CSI's terminator and the next keyword would
+# fail to match. echo_off_hint() strips CSI sequences from the tail
+# before applying ECHO_OFF_PROMPT_RE so colored prompts (`\x1b[1mPassword:
+# \x1b[0m `, common in distros that wrap PAM output) still hit.
+ANSI_CSI_RE = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
 # Bytes of recent PTY output kept on each Session for ECHO_OFF_PROMPT_RE.
 # 256 covers any single-line prompt; the regex only inspects the last line.
 RECENT_TAIL_MAX = 256
@@ -823,6 +829,11 @@ class SSHSession(object):
         nl = tail.rfind(b"\n")
         if nl >= 0:
             tail = tail[nl + 1:]
+        # Strip ANSI CSI sequences so `\b` boundaries work correctly on
+        # colored prompts (CSI sequences end in a letter, which `\b`
+        # treats as a word char and refuses to break against the
+        # following keyword).
+        tail = ANSI_CSI_RE.sub(b"", tail)
         return bool(ECHO_OFF_PROMPT_RE.search(tail))
 
     def unread(self, data):
@@ -1759,10 +1770,28 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("X-Accel-Buffering", "no")
             self.end_headers()
             self.wfile.flush()
-            # Send an initial comment immediately so the client's
-            # first-message timer fires fast — proves the channel isn't
-            # being held open by an upstream buffer.
+            # Two-part priming. First, a comment line — purely human-
+            # readable, useful when inspecting the stream with curl or
+            # in DevTools' network tab; EventSource itself doesn't fire
+            # any event for SSE comments, so this can't disarm the
+            # client's first-message timer on its own.
             self.wfile.write(b": ok\n\n")
+            # Second, a real (empty) 'data' event. THIS is the actual
+            # body-side proof of flushability the client's first-message
+            # timer waits for. Buffering proxies hold the body and never
+            # let it through (timer fires, fallback to long-poll); a
+            # healthy channel delivers it instantly even on a session
+            # that has nothing to print yet (idle reconnect, quiet tmux
+            # pane, long-running command with no output). Carries the
+            # current echo_off hint so the gate is correct from frame 1.
+            primer = json.dumps({
+                "data": "",
+                "alive": session.alive,
+                "auth_failed": session.auth_failed,
+                "echo_off": session.echo_off_hint(),
+            })
+            self.wfile.write(
+                ("event: data\ndata: " + primer + "\n\n").encode("utf-8"))
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             return

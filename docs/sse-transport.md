@@ -28,9 +28,17 @@ and the auth flag, then close. Comment heartbeats (`: keepalive\n\n`)
 go out every 15 s if no real data has flowed, so middleboxes don't
 idle the connection.
 
-The very first byte we send is a comment line (`: ok\n\n`). That's
-deliberate: it lets the frontend distinguish "channel is open and
-flushing" from "buffering proxy is holding the entire response".
+After the headers we emit two priming writes. First a comment line
+(`: ok\n\n`) — purely human-readable, useful when inspecting the
+stream with curl or in DevTools. Second, a real (empty) `event: data`
+frame. The frame is what actually disarms the frontend's first-message
+timer: EventSource doesn't fire any event for SSE comments, so the
+comment alone proves nothing client-side. Buffering proxies hold the
+body and never let the frame through (timer fires, fallback to
+long-poll). A healthy channel — including a session that has nothing
+to print yet — flushes it instantly. The primer carries the same
+shape as every other data frame, including the current `echo_off`
+hint, so the local-echo gate is correct from frame 1.
 
 ### Fallback: long-poll (`GET /api/output`)
 
@@ -45,14 +53,18 @@ it, and never re-tries SSE for that pane (no flapping).
 1. If `EventSource` isn't a thing (very old browser), go straight to
    long-poll.
 2. Open `EventSource('/api/stream?...')`. Start a 5-second timer.
-3. As soon as we see *anything* (an event, an error, `open`), we know
-   the channel is reactive. Cancel the timer.
-4. If the timer fires with no events, an upstream is buffering us.
-   Close the EventSource, set `p.sseDisabled = true`, fall back.
-5. If `onerror` fires *before* any event, treat as "this transport
-   doesn't work here" and fall back. Once SSE has worked at least
-   once, transient errors are left to EventSource's own auto-retry
-   plus our wall-clock budget (below).
+3. The server's primer `event: data` arrives almost immediately on a
+   healthy channel, fires the `'data'` listener, and disarms the timer.
+   `'open'` (HTTP headers) deliberately does **not** disarm it —
+   buffering proxies pass headers through but hold the body, which is
+   exactly the case we're guarding against.
+4. If the timer fires with no `'data'` / `'end'` event, an upstream is
+   buffering us. Close the EventSource, set `p.sseDisabled = true`,
+   fall back.
+5. If `onerror` fires *before* any body event, treat as "this transport
+   doesn't work here" and fall back. Once SSE has delivered at least
+   one body event, transient errors are left to EventSource's own
+   auto-retry plus our wall-clock budget (below).
 
 ### Wall-clock reconnect budget
 
