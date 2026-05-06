@@ -894,6 +894,15 @@ function handleOutputPayload(p, r) {
     return true;
   }
   p.connecting=false;
+  // Server-side hint that the recent visible output ends with a prompt
+  // that disables remote echo (sudo, mysql -p, passwd, ssh passphrase,
+  // read -s). predictionsEnabled() short-circuits on echoEnabled===false,
+  // so toggling here suppresses the dim-glyph prediction at exactly
+  // those prompts. Older servers omit the field — keep the previous
+  // value untouched in that case.
+  if (typeof r.echo_off === 'boolean') {
+    p.echoEnabled = !r.echo_off;
+  }
   if(r.data){
     // Always render incoming bytes — even on a tail-drain frame that
     // arrives after the disconnect banner, the bytes may be the last
@@ -1043,23 +1052,31 @@ function streamOutput(p) {
     }
   }, SSE_FIRST_MSG_TIMEOUT_MS);
 
-  let onAnyEvent = () => {
+  // 'open' fires when HTTP response headers arrive — *before* any body
+  // bytes traverse the upstream/proxy chain. A buffering proxy (nginx
+  // without X-Accel-Buffering: no, Cloudflare free tier, Apache mod_deflate,
+  // fastcgi_buffering on) flushes headers immediately and holds the body,
+  // which is exactly the case the first-message timer is designed to detect.
+  // So we DO NOT mark sseGotAnyMessage on 'open' — only body events
+  // ('data' / 'end') prove the channel actually flushes. We do clear the
+  // retry clock since the TCP connection itself succeeded.
+  let onBodyEvent = () => {
     p.sseGotAnyMessage = true;
     clearRetryClock(p);
   };
-  es.addEventListener('open', onAnyEvent);
+  es.addEventListener('open', () => clearRetryClock(p));
   // EventSource fires onmessage for unnamed events; the ': ok' comment
   // doesn't trigger it but still arrives on the wire. We rely on the
   // 'data' / 'end' named events here.
   es.addEventListener('data', e => {
-    onAnyEvent();
+    onBodyEvent();
     let r;
     try { r = JSON.parse(e.data); }
     catch (err) { console.error('SSE bad payload:', err); return; }
     handleOutputPayload(p, r);
   });
   es.addEventListener('end', e => {
-    onAnyEvent();
+    onBodyEvent();
     let r = {alive: false};
     try { r = JSON.parse(e.data); } catch (err) {}
     handleOutputPayload(p, r);

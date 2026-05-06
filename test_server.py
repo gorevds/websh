@@ -495,15 +495,18 @@ class TestHTTPApi(unittest.TestCase):
         sid = str(uuid.uuid4())
 
         class FakeSession:
-            def __init__(self):
+            def __init__(self, echo_off=False):
                 self.alive = True
                 self.auth_failed = False
                 self._chunks = [b"hello\r\n"]
+                self._echo_off = echo_off
             def read(self):
                 if self._chunks:
                     return self._chunks.pop(0)
                 self.alive = False
                 return b""
+            def echo_off_hint(self):
+                return self._echo_off
 
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
@@ -541,6 +544,58 @@ class TestHTTPApi(unittest.TestCase):
             self.assertEqual(base64.b64decode(payload["data"]),
                              b"hello\r\n")
             self.assertFalse(payload["auth_failed"])
+            # echo_off propagates from the session into every payload
+            # so the client can gate local-echo prediction at echo-
+            # disabled prompts (sudo / mysql -p / passwd / passphrase).
+            self.assertIn("echo_off", payload)
+            self.assertFalse(payload["echo_off"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_stream_propagates_echo_off_hint(self):
+        """When the session reports echo_off_hint=True (recent output
+        looks like a password prompt), the SSE 'data' event must carry
+        echo_off=true so the client suppresses local-echo prediction."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class FakeSession:
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self._chunks = [b"[sudo] password for alexey: "]
+            def read(self):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                self.alive = False
+                return b""
+            def echo_off_hint(self):
+                return True
+
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            conn.request("GET", "/api/stream?session_id=" + sid)
+            resp = conn.getresponse()
+            buf = b""
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: end" not in buf:
+                chunk = resp.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.close()
+            text = buf.decode("utf-8")
+            data_line = next(
+                line for line in text.splitlines()
+                if line.startswith("data: ") and '"data"' in line
+            )
+            payload = json.loads(data_line[len("data: "):])
+            self.assertTrue(payload["echo_off"],
+                "echo_off=True from session must propagate to wire")
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
@@ -577,6 +632,8 @@ class TestHTTPApi(unittest.TestCase):
             def feed(self, b):
                 with self.buf_lock:
                     self.output_buf += b
+            def echo_off_hint(self):
+                return False
 
         sess = Sess()
         with server.sessions_lock:
@@ -1095,6 +1152,92 @@ class TestIdleTimer(unittest.TestCase):
         s.output_buf = b"x"
         s.read()
         self.assertFalse(s.is_expired())
+
+
+# ── Echo-off prompt detection ──────────────────────────────────────────
+# Heuristic that hints the client to suppress local-echo prediction at
+# prompts where the remote pty disables ECHO (sudo / mysql -p / passwd /
+# ssh passphrase / read -s). The local pty between server.py and the ssh
+# client is in raw mode regardless of remote ECHO state, so a tail-of-
+# output regex is the next-best signal we can derive on the proxy side.
+
+class TestEchoOffHint(unittest.TestCase):
+
+    def _fake_session(self, recent_tail=b""):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = threading.Lock()
+        s._recent_tail = recent_tail
+        return s
+
+    def test_sudo_prompt_matches(self):
+        s = self._fake_session(b"[sudo] password for alexey: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_mysql_prompt_matches(self):
+        s = self._fake_session(b"Enter password: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_ssh_passphrase_matches(self):
+        s = self._fake_session(
+            b"Enter passphrase for key '/home/u/.ssh/id_rsa': ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_passcode_prompt_matches(self):
+        s = self._fake_session(b"Passcode: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_uppercase_prompt_matches(self):
+        s = self._fake_session(b"PASSWORD: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_only_last_line_considered(self):
+        """Earlier lines containing the keyword must not trip detection
+        — only the line the cursor is on can be a live prompt."""
+        s = self._fake_session(
+            b"changing password for alexey\nuser@host:~$ ")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_prompt_followed_by_newline_does_not_match(self):
+        """If the prompt has scrolled past with a trailing newline, the
+        cursor is on a fresh line and the user has already moved on."""
+        s = self._fake_session(b"[sudo] password for alexey: \n")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_word_inside_running_text_does_not_match(self):
+        s = self._fake_session(
+            b"i could tell you my password but i won't, $ ")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_empty_tail(self):
+        s = self._fake_session(b"")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_shell_prompt_does_not_match(self):
+        s = self._fake_session(b"alexey@hetzner-hel:~$ ")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_regex_anchored_to_recent_tail_only(self):
+        """RECENT_TAIL_MAX bounds prevent unbounded buffer growth and
+        keep the regex cheap regardless of session output volume."""
+        s = self._fake_session()
+        # Lots of preceding output, then a newline, then the prompt —
+        # the realistic shape after truncation.
+        big = b"some output\n" * 30
+        s._recent_tail = (big + b"Password: ")[-server.RECENT_TAIL_MAX:]
+        self.assertTrue(s.echo_off_hint())
+
+    def test_tail_grows_then_truncates(self):
+        """End-to-end: feeding bytes through the same path the read loop
+        uses keeps _recent_tail bounded and still detects a final prompt."""
+        s = self._fake_session()
+        cap = server.RECENT_TAIL_MAX
+        for _ in range(20):
+            chunk = b"some shell output line\n"
+            s._recent_tail = (s._recent_tail + chunk)[-cap:]
+        self.assertLessEqual(len(s._recent_tail), cap)
+        prompt = b"\n[sudo] password for alexey: "
+        s._recent_tail = (s._recent_tail + prompt)[-cap:]
+        self.assertTrue(s.echo_off_hint())
 
 
 # ── HTTP-level validation of slot_id + tmux_cmd ────────────────────────

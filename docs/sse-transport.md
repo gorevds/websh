@@ -225,6 +225,23 @@ There's no scenario where someone wants to permanently disable it,
 so a toggle would be UI noise. If it ever does need to be killed,
 `p.echoEnabled = false` in DevTools is the escape hatch.
 
+The one place we can't predict is at prompts that disable remote echo
+(`sudo`, `mysql -p`, `passwd`, `gpg`, `read -s`, ssh passphrase). If
+we predicted there, every typed char would render as a dim glyph at
+the cursor for up to `PREDICT_TTL_MS` (1 s) before the server's real
+(echo-suppressed) bytes arrived and the prediction was rewound — the
+typed chars would be visible on a screen share or recording. The
+local PTY between `server.py` and the ssh client is in raw mode
+regardless of remote ECHO state, so we can't read the bit through
+`tcgetattr()`. Instead the server runs a tail-of-output regex
+(`ECHO_OFF_PROMPT_RE` in `server.py`) over the last ~256 bytes the
+user saw, and forwards an `echo_off` boolean on each output payload.
+The client toggles `p.echoEnabled` from it; `predictionsEnabled()`
+short-circuits when it's `false`. Heuristic only — it matches the
+common English `password|passcode|passphrase` prompt shape; exotic
+prompts that ask for a secret without that word still leak the
+keystroke, which is a known limitation.
+
 ### Why a 60-second budget instead of N retries
 
 A retry count is a proxy for "how long should I wait before

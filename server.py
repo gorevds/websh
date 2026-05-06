@@ -129,6 +129,20 @@ TERM_RESET = b"\x1b[?1049l\x1b[?25h\x1b[0m\x1bc"
 # Password prompt patterns (lowercase, checked against lowered PTY output)
 PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
 
+# Tail-of-output detector for prompts that typically disable echo on the
+# remote side (sudo, su, mysql -p, passwd, ssh passphrase). When the recent
+# PTY output ends with a match, the server hints the client via the output
+# payload's `echo_off` field — used to suppress the local-echo prediction
+# so typed chars aren't briefly rendered as dim glyphs at exactly those
+# prompts. Heuristic only: the *local* PTY (between server.py and the ssh
+# client) is in raw mode regardless of remote ECHO state, so we can't read
+# the remote pty's termios bit directly.
+ECHO_OFF_PROMPT_RE = re.compile(
+    rb"(?i)\b(password|passcode|passphrase)\b[^\n]*:\s*$")
+# Bytes of recent PTY output kept on each Session for ECHO_OFF_PROMPT_RE.
+# 256 covers any single-line prompt; the regex only inspects the last line.
+RECENT_TAIL_MAX = 256
+
 # Auth-failure patterns — if we see any of these AFTER we auto-typed the
 # password, ssh rejected our attempt and we should not keep the session
 # limping in an endless retry loop.
@@ -496,6 +510,10 @@ class SSHSession(object):
         self.master_fd = None
         self.pid = None
         self.output_buf = b""
+        # Last RECENT_TAIL_MAX bytes of PTY output, kept independently of
+        # output_buf drain so echo_off_hint() can match against what the
+        # user actually sees on screen, not against what hasn't shipped.
+        self._recent_tail = b""
         self.buf_lock = Lock()
         self.alive = True
         self.last_activity = time.time()
@@ -702,6 +720,8 @@ class SSHSession(object):
                                 if len(self.output_buf) > OUTPUT_BUF_MAX:
                                     self.output_buf = (
                                         self.output_buf[-OUTPUT_BUF_KEEP:])
+                                self._recent_tail = (
+                                    self._recent_tail + data)[-RECENT_TAIL_MAX:]
                             self._auth_buf = b""
                             try:
                                 os.kill(self.pid, signal.SIGTERM)
@@ -713,6 +733,8 @@ class SSHSession(object):
                         self.output_buf += data
                         if len(self.output_buf) > OUTPUT_BUF_MAX:
                             self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
+                        self._recent_tail = (
+                            self._recent_tail + data)[-RECENT_TAIL_MAX:]
 
                 # Check if child exited
                 try:
@@ -735,6 +757,9 @@ class SSHSession(object):
                         if leftover:
                             with self.buf_lock:
                                 self.output_buf += leftover
+                                self._recent_tail = (
+                                    self._recent_tail
+                                    + leftover)[-RECENT_TAIL_MAX:]
                         else:
                             break
                     else:
@@ -780,6 +805,25 @@ class SSHSession(object):
         if data:
             self.last_activity = time.time()
         return data
+
+    def echo_off_hint(self):
+        """True iff the most recent PTY output ends with a prompt that
+        typically disables remote echo (sudo / mysql -p / passwd /
+        ssh passphrase / read -s). Forwarded to the client as the
+        `echo_off` field on output payloads so it can suppress the
+        local-echo prediction at exactly those prompts.
+
+        Stateless heuristic: re-evaluated on each call against the
+        last RECENT_TAIL_MAX bytes of output. We can't read the
+        remote pty's termios ECHO bit through the ssh tunnel, so
+        a tail-pattern match is the next-best signal."""
+        with self.buf_lock:
+            tail = self._recent_tail
+        # Only the last line matters — anything before \n is stale.
+        nl = tail.rfind(b"\n")
+        if nl >= 0:
+            tail = tail[nl + 1:]
+        return bool(ECHO_OFF_PROMPT_RE.search(tail))
 
     def unread(self, data):
         """Push bytes back to the front of the output buffer.
@@ -1666,6 +1710,7 @@ class Handler(BaseHTTPRequestHandler):
                         "data": base64.b64encode(data).decode("ascii"),
                         "alive": session.alive,
                         "auth_failed": session.auth_failed,
+                        "echo_off": session.echo_off_hint(),
                     })
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     session.unread(data)
@@ -1673,12 +1718,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if not session.alive:
                 self._json({"data": "", "alive": False,
-                            "auth_failed": session.auth_failed})
+                            "auth_failed": session.auth_failed,
+                            "echo_off": session.echo_off_hint()})
                 return
             time.sleep(POLL_INTERVAL)
 
         self._json({"data": "", "alive": session.alive,
-                    "auth_failed": session.auth_failed})
+                    "auth_failed": session.auth_failed,
+                    "echo_off": session.echo_off_hint()})
 
     def _stream(self):
         """SSE: stream output as 'data' events until session dies or client
@@ -1744,6 +1791,7 @@ class Handler(BaseHTTPRequestHandler):
                         "data": base64.b64encode(data).decode("ascii"),
                         "alive": session.alive,
                         "auth_failed": session.auth_failed,
+                        "echo_off": session.echo_off_hint(),
                     })
                     self.wfile.write(
                         ("event: data\ndata: " + payload + "\n\n")
@@ -1767,6 +1815,7 @@ class Handler(BaseHTTPRequestHandler):
                     "data": base64.b64encode(tail).decode("ascii"),
                     "alive": False,
                     "auth_failed": session.auth_failed,
+                    "echo_off": session.echo_off_hint(),
                 })
                 try:
                     self.wfile.write(
