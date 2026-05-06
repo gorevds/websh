@@ -29,6 +29,9 @@ API endpoints:
     POST /api/connect     — start SSH session
     POST /api/input       — send keystrokes
     GET  /api/output      — long-poll for terminal output
+    GET  /api/stream      — Server-Sent Events stream of terminal output
+                            (low-latency alternative to /api/output; falls
+                            back to long-poll if the proxy buffers it)
     POST /api/resize      — resize terminal
     POST /api/disconnect  — close session
     POST /api/upload      — stream a file body to $HOME/<path> on remote
@@ -49,6 +52,7 @@ import pty
 import re
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -63,6 +67,12 @@ from socketserver import ThreadingMixIn
 from threading import Thread, Lock
 
 __version__ = "0.2.0"
+
+# socket.MSG_DONTWAIT is Unix-only (Linux/BSD/macOS). On platforms that
+# don't define it (Windows, some embedded), Handler._client_gone() falls
+# back to setblocking() around a plain MSG_PEEK. Both yield the same
+# observable behaviour; the flag avoids an AttributeError at import time.
+_HAVE_MSG_DONTWAIT = hasattr(socket, "MSG_DONTWAIT")
 
 # ─── Configuration ───────────────────────────────────────────────────
 
@@ -118,6 +128,26 @@ TERM_RESET = b"\x1b[?1049l\x1b[?25h\x1b[0m\x1bc"
 
 # Password prompt patterns (lowercase, checked against lowered PTY output)
 PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
+
+# Tail-of-output detector for prompts that typically disable echo on the
+# remote side (sudo, su, mysql -p, passwd, ssh passphrase). When the recent
+# PTY output ends with a match, the server hints the client via the output
+# payload's `echo_off` field — used to suppress the local-echo prediction
+# so typed chars aren't briefly rendered as dim glyphs at exactly those
+# prompts. Heuristic only: the *local* PTY (between server.py and the ssh
+# client) is in raw mode regardless of remote ECHO state, so we can't read
+# the remote pty's termios bit directly.
+ECHO_OFF_PROMPT_RE = re.compile(
+    rb"(?i)\b(password|passcode|passphrase)\b[^\n]*:\s*$")
+# ANSI CSI sequences end in an ASCII letter, which `\b` interprets as a
+# word char — `\b` between a CSI's terminator and the next keyword would
+# fail to match. echo_off_hint() strips CSI sequences from the tail
+# before applying ECHO_OFF_PROMPT_RE so colored prompts (`\x1b[1mPassword:
+# \x1b[0m `, common in distros that wrap PAM output) still hit.
+ANSI_CSI_RE = re.compile(rb"\x1b\[[0-9;]*[A-Za-z]")
+# Bytes of recent PTY output kept on each Session for ECHO_OFF_PROMPT_RE.
+# 256 covers any single-line prompt; the regex only inspects the last line.
+RECENT_TAIL_MAX = 256
 
 # Auth-failure patterns — if we see any of these AFTER we auto-typed the
 # password, ssh rejected our attempt and we should not keep the session
@@ -486,6 +516,10 @@ class SSHSession(object):
         self.master_fd = None
         self.pid = None
         self.output_buf = b""
+        # Last RECENT_TAIL_MAX bytes of PTY output, kept independently of
+        # output_buf drain so echo_off_hint() can match against what the
+        # user actually sees on screen, not against what hasn't shipped.
+        self._recent_tail = b""
         self.buf_lock = Lock()
         self.alive = True
         self.last_activity = time.time()
@@ -692,6 +726,8 @@ class SSHSession(object):
                                 if len(self.output_buf) > OUTPUT_BUF_MAX:
                                     self.output_buf = (
                                         self.output_buf[-OUTPUT_BUF_KEEP:])
+                                self._recent_tail = (
+                                    self._recent_tail + data)[-RECENT_TAIL_MAX:]
                             self._auth_buf = b""
                             try:
                                 os.kill(self.pid, signal.SIGTERM)
@@ -703,6 +739,8 @@ class SSHSession(object):
                         self.output_buf += data
                         if len(self.output_buf) > OUTPUT_BUF_MAX:
                             self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
+                        self._recent_tail = (
+                            self._recent_tail + data)[-RECENT_TAIL_MAX:]
 
                 # Check if child exited
                 try:
@@ -725,6 +763,9 @@ class SSHSession(object):
                         if leftover:
                             with self.buf_lock:
                                 self.output_buf += leftover
+                                self._recent_tail = (
+                                    self._recent_tail
+                                    + leftover)[-RECENT_TAIL_MAX:]
                         else:
                             break
                     else:
@@ -770,6 +811,50 @@ class SSHSession(object):
         if data:
             self.last_activity = time.time()
         return data
+
+    def echo_off_hint(self):
+        """True iff the most recent PTY output ends with a prompt that
+        typically disables remote echo (sudo / mysql -p / passwd /
+        ssh passphrase / read -s). Forwarded to the client as the
+        `echo_off` field on output payloads so it can suppress the
+        local-echo prediction at exactly those prompts.
+
+        Stateless heuristic: re-evaluated on each call against the
+        last RECENT_TAIL_MAX bytes of output. We can't read the
+        remote pty's termios ECHO bit through the ssh tunnel, so
+        a tail-pattern match is the next-best signal."""
+        with self.buf_lock:
+            tail = self._recent_tail
+        # Only the last line matters — anything before \n is stale.
+        nl = tail.rfind(b"\n")
+        if nl >= 0:
+            tail = tail[nl + 1:]
+        # Strip ANSI CSI sequences so `\b` boundaries work correctly on
+        # colored prompts (CSI sequences end in a letter, which `\b`
+        # treats as a word char and refuses to break against the
+        # following keyword).
+        tail = ANSI_CSI_RE.sub(b"", tail)
+        return bool(ECHO_OFF_PROMPT_RE.search(tail))
+
+    def unread(self, data):
+        """Push bytes back to the front of the output buffer.
+
+        Used when a reader (SSE _stream / long-poll) drained the buffer
+        but couldn't deliver the bytes to the client (BrokenPipe). The
+        next reader picks them up instead of losing them. Keeping order:
+        prepend, since unread bytes are older than anything that arrived
+        in the meantime.
+
+        Same OUTPUT_BUF_MAX truncation as the PTY-reader path: if a
+        large unread combined with fresh PTY output would push us over
+        the cap, drop the oldest bytes. This matches the existing
+        'keep the recent terminal state' policy."""
+        if not data:
+            return
+        with self.buf_lock:
+            self.output_buf = data + self.output_buf
+            if len(self.output_buf) > OUTPUT_BUF_MAX:
+                self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
 
     def write(self, data):
         """Send input to SSH process."""
@@ -1297,6 +1382,38 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _client_gone(self):
+        """Return True if the peer has half-closed (sent FIN) or the
+        socket has otherwise died. Non-blocking peek; if there's nothing
+        readable yet, the OS raises EAGAIN/EWOULDBLOCK and we treat it
+        as 'still connected'. Used by long-running endpoints to bail
+        out before draining destructive state into a dead socket.
+
+        Portable form: MSG_DONTWAIT is Unix-only (Linux/BSD/macOS), so
+        on platforms that don't define it (Windows, some embedded) we
+        fall back to flipping the socket to non-blocking around a plain
+        MSG_PEEK. Both paths behave identically on the success/EAGAIN
+        edge."""
+        sock = self.connection
+        try:
+            if _HAVE_MSG_DONTWAIT:
+                peek = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+            else:
+                old = sock.getblocking()
+                sock.setblocking(False)
+                try:
+                    peek = sock.recv(1, socket.MSG_PEEK)
+                finally:
+                    try:
+                        sock.setblocking(old)
+                    except OSError:
+                        pass
+            return peek == b""
+        except (BlockingIOError, InterruptedError):
+            return False
+        except OSError:
+            return True
+
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
@@ -1373,6 +1490,8 @@ class Handler(BaseHTTPRequestHandler):
         action = self._resolve_action()
         if action == "output":
             self._output()
+        elif action == "stream":
+            self._stream()
         elif action == "config":
             self._json(config_public())
         elif action == "ping":
@@ -1584,25 +1703,175 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "session not found"}, 404)
             return
 
-        # Long-poll: wait up to POLL_TIMEOUT seconds for data
+        # Long-poll: wait up to POLL_TIMEOUT seconds for data. Bail
+        # early if the client hung up so we don't drain bytes into a
+        # closed socket (read() is destructive — those bytes would
+        # be lost) and don't spin a worker for the full timeout.
         deadline = time.time() + POLL_TIMEOUT
         while time.time() < deadline:
+            if self._client_gone():
+                return
             data = session.read()
             if data:
-                self._json({
-                    "data": base64.b64encode(data).decode("ascii"),
-                    "alive": session.alive,
-                    "auth_failed": session.auth_failed,
-                })
+                # If the client hung up between read() and write(), we
+                # would still lose these bytes — push them back on
+                # failure so the next /api/output picks them up.
+                try:
+                    self._json({
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "alive": session.alive,
+                        "auth_failed": session.auth_failed,
+                        "echo_off": session.echo_off_hint(),
+                    })
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    session.unread(data)
+                    raise
                 return
             if not session.alive:
                 self._json({"data": "", "alive": False,
-                            "auth_failed": session.auth_failed})
+                            "auth_failed": session.auth_failed,
+                            "echo_off": session.echo_off_hint()})
                 return
             time.sleep(POLL_INTERVAL)
 
         self._json({"data": "", "alive": session.alive,
-                    "auth_failed": session.auth_failed})
+                    "auth_failed": session.auth_failed,
+                    "echo_off": session.echo_off_hint()})
+
+    def _stream(self):
+        """SSE: stream output as 'data' events until session dies or client
+        disconnects. Each 'data' event carries the same JSON payload as
+        /api/output ({data, alive, auth_failed}). On clean termination an
+        'end' event is sent. Comment heartbeats keep proxies from idling
+        the connection out."""
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        sid = params.get("session_id", [""])[0]
+
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session:
+            self._json({"error": "session not found"}, 404)
+            return
+
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            # We deliberately don't send "Connection: keep-alive": this is
+            # HTTP/1.0 and we have no Content-Length. The client signals
+            # end-of-stream by seeing the connection close, which the
+            # server does naturally once the session dies.
+            self.send_header("Connection", "close")
+            # Tell nginx and similar proxies not to buffer the response.
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            self.wfile.flush()
+            # Two-part priming. First, a comment line — purely human-
+            # readable, useful when inspecting the stream with curl or
+            # in DevTools' network tab; EventSource itself doesn't fire
+            # any event for SSE comments, so this can't disarm the
+            # client's first-message timer on its own.
+            self.wfile.write(b": ok\n\n")
+            # Second, a real (empty) 'data' event. THIS is the actual
+            # body-side proof of flushability the client's first-message
+            # timer waits for. Buffering proxies hold the body and never
+            # let it through (timer fires, fallback to long-poll); a
+            # healthy channel delivers it instantly even on a session
+            # that has nothing to print yet (idle reconnect, quiet tmux
+            # pane, long-running command with no output). Carries the
+            # current echo_off hint so the gate is correct from frame 1.
+            primer = json.dumps({
+                "data": "",
+                "alive": session.alive,
+                "auth_failed": session.auth_failed,
+                "echo_off": session.echo_off_hint(),
+            })
+            self.wfile.write(
+                ("event: data\ndata: " + primer + "\n\n").encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+        last_send = time.time()
+        KEEPALIVE = 15  # seconds between heartbeats when no real data
+
+        # If wfile.write fails after we've already drained bytes, push
+        # them back so the next reader (long-poll fallback or a fresh
+        # /api/stream) can deliver them. Without this, every transport
+        # switch silently loses whatever was in flight. Detection of a
+        # half-closed connection (browser closed EventSource, or the
+        # PHP proxy aborted) goes via _client_gone() before each read,
+        # which catches the case where the write side hasn't yet
+        # noticed the peer's FIN.
+        data = b""
+        try:
+            while True:
+                if self._client_gone():
+                    if data:
+                        session.unread(data)
+                    return
+                data = session.read()
+                if data:
+                    payload = json.dumps({
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "alive": session.alive,
+                        "auth_failed": session.auth_failed,
+                        "echo_off": session.echo_off_hint(),
+                    })
+                    self.wfile.write(
+                        ("event: data\ndata: " + payload + "\n\n")
+                        .encode("utf-8"))
+                    self.wfile.flush()
+                    last_send = time.time()
+                    data = b""  # delivered — no need to push back on error
+                if not session.alive:
+                    break
+                if not data:
+                    if time.time() - last_send > KEEPALIVE:
+                        self.wfile.write(b": keepalive\n\n")
+                        self.wfile.flush()
+                        last_send = time.time()
+                    time.sleep(POLL_INTERVAL)
+
+            # Drain any remaining buffered output before sending 'end'.
+            tail = session.read()
+            if tail:
+                payload = json.dumps({
+                    "data": base64.b64encode(tail).decode("ascii"),
+                    "alive": False,
+                    "auth_failed": session.auth_failed,
+                    "echo_off": session.echo_off_hint(),
+                })
+                try:
+                    self.wfile.write(
+                        ("event: data\ndata: " + payload + "\n\n")
+                        .encode("utf-8"))
+                    # Flush before the closing 'end' so a write failure
+                    # on a buffered wfile (Python's default makefile in
+                    # some setups) is attributable to *this* payload —
+                    # we can unread() the right bytes.
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    session.unread(tail)
+                    return
+            end_payload = json.dumps({
+                "alive": False,
+                "auth_failed": session.auth_failed,
+            })
+            self.wfile.write(
+                ("event: end\ndata: " + end_payload + "\n\n")
+                .encode("utf-8"))
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Client went away — give back any bytes we drained but
+            # didn't manage to deliver.
+            if data:
+                session.unread(data)
+            return
 
     def _resize(self):
         try:

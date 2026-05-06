@@ -1,6 +1,10 @@
 # <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"></picture> websh
 
-Lightweight but powerful web-based SSH terminal. No build step, no server dependencies.
+Lightweight but powerful web-based SSH terminal.
+
+- 📦 **No build step, no server dependencies**
+- 🌐 **Plain HTTP, no WebSocket**
+- ⭐ **Persistent sessions — survive tab close, reboot, even backend restart (up to 72 h)**
 
 ![websh split panes](screenshot.png)
 
@@ -10,11 +14,11 @@ Browser (xterm.js) ──── server.py ──── ssh
 
 ## How it works
 
-The browser runs a full terminal emulator (xterm.js) and communicates with the Python backend via HTTP long-polling. The backend manages SSH sessions as PTY subprocesses and serves the frontend directly.
+The browser runs a full terminal emulator (xterm.js) and talks to the Python backend over plain HTTP. Output streams back via Server-Sent Events (`/api/stream`); keystrokes go up as short POSTs (`/api/input`). The backend manages SSH sessions as PTY subprocesses and serves the frontend directly.
 
 On shared hosting where you can't run a long-lived process, an optional PHP proxy (`api.php`) auto-starts the backend and forwards requests to it.
 
-**Why not WebSocket?** Most shared hosting PHP environments don't support WebSocket. HTTP long-polling works everywhere — no open ports, no special server configuration. The trade-off is slightly higher latency compared to a native SSH client, but it's negligible for interactive use.
+**Why not WebSocket?** Two reasons. First, many shared-hosting PHP environments don't support WebSocket — and we want websh to drop in there without a separate server. Second, we don't need it: SSE delivers the same low latency as a WebSocket but is plain HTTP, so it tunnels through any HTTPS proxy or PHP host without a protocol upgrade. If even SSE gets buffered by an aggressive upstream (some shared hosts compress every response and won't flush), the frontend silently falls back to HTTP long-polling on `/api/output` for that session. Slower, but works literally anywhere.
 
 ## Requirements
 
@@ -82,11 +86,11 @@ click-to-connect — pick the model that fits your team.
 ### 🚀 Deploy anywhere
 Made to fit where other web terminals can't.
 
-- **Shared hosting** — upload 4 files via FTP, `api.php` auto-starts
-  the backend. No SSH access to the host needed
+- **Shared hosting** — upload 4 files + the `assets/` folder via FTP,
+  `api.php` auto-starts the backend. No SSH access to the host needed
 - **Python-only mode** — backend serves the frontend directly, zero extras
 - Docker, systemd, reverse proxy examples included
-- HTTP long-polling — works through corporate HTTPS, no WebSocket required
+- Plain HTTP transport (SSE for output, POSTs for input) — works through corporate HTTPS, no WebSocket required, with automatic long-poll fallback for hosts that buffer SSE
 - Python 3.5+ stdlib only — no pip install, no npm, no build step
 
 ## Use cases
@@ -127,12 +131,13 @@ A typical shared hosting directory structure:
         websh.js            <- frontend logic
         api.php             <- PHP proxy
         server.py           <- backend (auto-started by api.php)
+        assets/             <- brand SVGs (logo, light/dark variants)
 ```
 
 **Steps:**
 
 1. Create a folder in your web root (e.g. `www/console/`)
-2. Upload `index.html`, `websh.js`, `api.php`, and `server.py` there
+2. Upload `index.html`, `websh.js`, `api.php`, `server.py`, and the `assets/` folder there
 3. Open `https://your-host/console/` in a browser
 
 That's it. `api.php` starts `server.py` automatically on the first request.
@@ -336,8 +341,9 @@ The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
 
 ### Shared hosting (PHP + Python)
 
-Upload the four files (`index.html`, `websh.js`, `api.php`, `server.py`) to your web
-directory. The backend starts automatically.
+Upload the four files (`index.html`, `websh.js`, `api.php`, `server.py`)
+and the `assets/` folder (brand SVGs) to your web directory. The backend
+starts automatically.
 
 For manual control (e.g. custom config path):
 
@@ -353,9 +359,10 @@ The backend can serve the frontend directly — no PHP or separate web server ne
 HOST=0.0.0.0 python3 server.py
 ```
 
-Open `http://your-host:8765/` in a browser. The backend serves `index.html` and
-`websh.js` from the same directory as `server.py`, and handles API requests on
-the same port. See [HTTPS via reverse proxy](#https-via-reverse-proxy) below.
+Open `http://your-host:8765/` in a browser. The backend serves the static
+files (`index.html`, `websh.js`, `assets/*.svg`) from the same directory as
+`server.py`, and handles API requests on the same port. See
+[HTTPS via reverse proxy](#https-via-reverse-proxy) below.
 
 ### Docker
 
@@ -395,9 +402,13 @@ server {
 }
 ```
 
-`proxy_read_timeout` must comfortably exceed the long-poll window (30 s). If
-the proxy runs on a different host, add its IP to `TRUSTED_PROXIES` so rate
-limiting uses the real client IP — see [Rate limiting & proxies](#rate-limiting--proxies).
+`proxy_read_timeout` must comfortably exceed both the long-poll window
+(10 s) and the SSE keep-alive interval (15 s) — 60 s leaves plenty of
+headroom. The backend sets `X-Accel-Buffering: no` on the SSE response,
+so nginx flushes each event immediately without further configuration.
+If the proxy runs on a different host, add its IP to `TRUSTED_PROXIES`
+so rate limiting uses the real client IP — see
+[Rate limiting & proxies](#rate-limiting--proxies).
 
 ## Authentication & security
 
@@ -464,10 +475,11 @@ index.html                Frontend — xterm.js terminal + connection UI
 websh.js                  Frontend logic — pane management, file transfer, themes
 api.php                   PHP proxy — forwards browser requests to backend (optional)
 server.py                 Python backend — manages SSH sessions via PTY, serves frontend
+assets/                   Brand SVGs (logo light/dark variants) loaded by index.html
 websh.json.example        Example server-side config
 test_server.py            Backend tests (unit + integration)
 tests/frontend/           jsdom-based frontend tests
-docs/                     Design notes (e.g. auth-fail-detection.md)
+docs/                     Design notes (e.g. auth-fail-detection.md, sse-transport.md)
 Dockerfile                Container deployment
 websh.service             systemd unit file
 LICENSE                   MIT license

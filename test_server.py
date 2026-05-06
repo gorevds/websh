@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Tests for websh server.py — config loading, restrict_hosts, API."""
 
+import base64
 import json
 import os
 import signal
@@ -473,6 +474,340 @@ class TestHTTPApi(unittest.TestCase):
         body, code = self._post("/api/input", {"session_id": "fake", "data": "x"})
         self.assertEqual(code, 404)
 
+    def test_stream_unknown_session(self):
+        # Well-formed UUID but no such session: SSE handler 404s as JSON
+        # (same shape as /api/output) before opening the event stream.
+        body, code = self._get(
+            "/api/stream?session_id=12345678-1234-1234-1234-123456789abc")
+        self.assertEqual(code, 404)
+        self.assertIn("error", body)
+
+    def test_stream_invalid_uuid(self):
+        body, code = self._get("/api/stream?session_id=not-a-uuid")
+        self.assertEqual(code, 404)
+        self.assertIn("error", body)
+
+    def test_stream_happy_path(self):
+        """Plant a fake session that emits one chunk then dies.
+        Verify SSE headers, the initial ': ok' comment, the encoded
+        'data' event, and the closing 'end' event, in that order."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class FakeSession:
+            def __init__(self, echo_off=False):
+                self.alive = True
+                self.auth_failed = False
+                self._chunks = [b"hello\r\n"]
+                self._echo_off = echo_off
+            def read(self):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                self.alive = False
+                return b""
+            def echo_off_hint(self):
+                return self._echo_off
+
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            conn.request("GET", "/api/stream?session_id=" + sid)
+            resp = conn.getresponse()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.getheader("Content-Type"),
+                             "text/event-stream")
+            self.assertEqual(resp.getheader("X-Accel-Buffering"), "no")
+            # Read until we see both events. The session emits one chunk
+            # then read() returns b"" + alive=False, which the handler
+            # turns into 'event: end'. ~1 KB is plenty.
+            buf = b""
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: end" not in buf:
+                chunk = resp.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.close()
+            text = buf.decode("utf-8")
+            self.assertIn(": ok", text)
+            self.assertIn("event: data", text)
+            self.assertIn("event: end", text)
+            # The handler emits a primer 'event: data' immediately (so
+            # the client's first-message timer disarms even on streams
+            # that have no PTY output yet). Skip past it to find the
+            # frame carrying our actual chunk.
+            data_payloads = [
+                json.loads(line[len("data: "):])
+                for line in text.splitlines()
+                if line.startswith("data: ") and '"data"' in line
+            ]
+            self.assertGreaterEqual(len(data_payloads), 2,
+                "expected primer + chunk, got: " + repr(data_payloads))
+            self.assertEqual(data_payloads[0]["data"], "",
+                "first data event must be the empty primer")
+            chunk_payload = next(
+                p for p in data_payloads if p["data"] != ""
+            )
+            self.assertEqual(base64.b64decode(chunk_payload["data"]),
+                             b"hello\r\n")
+            self.assertFalse(chunk_payload["auth_failed"])
+            # echo_off propagates from the session into every payload
+            # (primer included) so the client can gate local-echo
+            # prediction at echo-disabled prompts.
+            self.assertIn("echo_off", data_payloads[0])
+            self.assertFalse(data_payloads[0]["echo_off"])
+            self.assertIn("echo_off", chunk_payload)
+            self.assertFalse(chunk_payload["echo_off"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_stream_primer_disarms_timer_on_idle_session(self):
+        """A session that produces no PTY output still gets a real
+        'event: data' frame right after the headers, so the client's
+        first-message buffer-detection timer disarms instead of falling
+        back to long-poll on an otherwise healthy SSE channel."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class IdleSession:
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self._calls = 0
+            def read(self):
+                # First few read()s return nothing; then we mark dead so
+                # the handler exits cleanly without ever emitting a
+                # non-primer data frame.
+                self._calls += 1
+                if self._calls > 3:
+                    self.alive = False
+                return b""
+            def echo_off_hint(self):
+                return False
+
+        with server.sessions_lock:
+            server.sessions[sid] = IdleSession()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            conn.request("GET", "/api/stream?session_id=" + sid)
+            resp = conn.getresponse()
+            buf = b""
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: end" not in buf:
+                chunk = resp.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.close()
+            text = buf.decode("utf-8")
+            # The primer is an 'event: data' carrying empty data — that's
+            # what disarms the client's timer on a quiet channel.
+            self.assertIn("event: data", text,
+                "primer 'event: data' must be sent even when idle")
+            primer = json.loads(next(
+                line[len("data: "):] for line in text.splitlines()
+                if line.startswith("data: ") and '"data"' in line))
+            self.assertEqual(primer["data"], "",
+                "primer carries empty data")
+            self.assertTrue(primer["alive"])
+            self.assertFalse(primer["echo_off"])
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_stream_propagates_echo_off_hint(self):
+        """When the session reports echo_off_hint=True (recent output
+        looks like a password prompt), every SSE 'data' frame — primer
+        included — must carry echo_off=true so the client suppresses
+        local-echo prediction from the very first event."""
+        import http.client
+        sid = str(uuid.uuid4())
+
+        class FakeSession:
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self._chunks = [b"[sudo] password for alexey: "]
+            def read(self):
+                if self._chunks:
+                    return self._chunks.pop(0)
+                self.alive = False
+                return b""
+            def echo_off_hint(self):
+                return True
+
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", self.port,
+                                              timeout=5)
+            conn.request("GET", "/api/stream?session_id=" + sid)
+            resp = conn.getresponse()
+            buf = b""
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: end" not in buf:
+                chunk = resp.read(256)
+                if not chunk:
+                    break
+                buf += chunk
+            conn.close()
+            text = buf.decode("utf-8")
+            data_payloads = [
+                json.loads(line[len("data: "):])
+                for line in text.splitlines()
+                if line.startswith("data: ") and '"data"' in line
+            ]
+            self.assertGreaterEqual(len(data_payloads), 1)
+            for p in data_payloads:
+                self.assertTrue(p["echo_off"],
+                    "echo_off=True from session must propagate "
+                    "to wire on every frame, got: " + repr(p))
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_stream_returns_undelivered_bytes_to_buffer(self):
+        """Regression: when the client closes /api/stream mid-flight,
+        bytes the SSE handler had already drained from the session must
+        not vanish. The handler peeks the socket for FIN before each
+        read(); if it sees FIN after a read but before delivery, it
+        pushes the bytes back via session.unread(). Either way the next
+        consumer (e.g. long-poll fallback) can still pick them up."""
+        import socket as _socket
+        sid = str(uuid.uuid4())
+
+        # Real-ish session: holds bytes in output_buf under buf_lock and
+        # supports the same read()/unread() contract as SSHSession.
+        class Sess:
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self.buf_lock = __import__("threading").Lock()
+                self.output_buf = b""
+                self.last_activity = 0
+            def read(self):
+                with self.buf_lock:
+                    d = self.output_buf
+                    self.output_buf = b""
+                return d
+            def unread(self, data):
+                if not data:
+                    return
+                with self.buf_lock:
+                    self.output_buf = data + self.output_buf
+            def feed(self, b):
+                with self.buf_lock:
+                    self.output_buf += b
+            def echo_off_hint(self):
+                return False
+
+        sess = Sess()
+        with server.sessions_lock:
+            server.sessions[sid] = sess
+        try:
+            # Raw socket so we can read what's actually arrived without
+            # blocking on http.client buffering. We just need to confirm
+            # the handler reached its main loop (the ': ok' priming
+            # comment was sent).
+            s = _socket.create_connection(("127.0.0.1", self.port),
+                                          timeout=5)
+            req = ("GET /api/stream?session_id=" + sid + " HTTP/1.1\r\n"
+                   "Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+            s.sendall(req.encode("ascii"))
+            buf = b""
+            deadline = time.time() + 2
+            s.settimeout(0.2)
+            while time.time() < deadline and b": ok" not in buf:
+                try:
+                    chunk = s.recv(256)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except _socket.timeout:
+                    pass
+            self.assertIn(b": ok", buf,
+                "handler did not reach its main loop")
+
+            # Plant bytes, then tear down the client. The handler may
+            # either (a) peek FIN first and leave the buffer untouched,
+            # or (b) read the bytes, hit a write failure, and unread()
+            # them. Both paths must end with the bytes still in the
+            # session for the next reader.
+            sess.feed(b"do-not-lose-me\r\n")
+            try:
+                s.shutdown(_socket.SHUT_RDWR)
+            except OSError:
+                pass
+            s.close()
+
+            deadline = time.time() + 3
+            recovered = False
+            while time.time() < deadline:
+                with sess.buf_lock:
+                    if b"do-not-lose-me" in sess.output_buf:
+                        recovered = True
+                        break
+                time.sleep(0.05)
+            self.assertTrue(recovered,
+                "bytes drained by SSE handler were lost when client "
+                "disconnected; peek/unread did not preserve them")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_client_gone_detects_fin(self):
+        """_client_gone() returns True after the peer half-closes (sends
+        FIN) and False while the connection is just idle. This is what
+        lets _stream and /api/output bail before draining the session
+        into a dead socket."""
+        import socket as _socket
+        a, b = _socket.socketpair()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            self.assertFalse(h._client_gone(),
+                             "fresh idle socket reported as gone")
+            b.shutdown(_socket.SHUT_WR)
+            # Tiny sleep to let the FIN propagate through the local
+            # socketpair; on Linux this is essentially instant.
+            time.sleep(0.05)
+            self.assertTrue(h._client_gone(),
+                            "FIN from peer not detected by peek")
+        finally:
+            a.close(); b.close()
+
+    def test_client_gone_false_with_pending_data(self):
+        """Peer wrote bytes but didn't close — peek returns those bytes,
+        not EOF, so _client_gone() must say False."""
+        import socket as _socket
+        a, b = _socket.socketpair()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            b.send(b"hello")
+            time.sleep(0.05)
+            self.assertFalse(h._client_gone(),
+                             "pending data should not be confused with FIN")
+        finally:
+            a.close(); b.close()
+
+    def test_session_unread_prepends(self):
+        """Session.unread() must push bytes back to the FRONT of the
+        buffer so they're delivered in original order on the next read."""
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.output_buf = b"world"
+        s.buf_lock = __import__("threading").Lock()
+        s.last_activity = 0
+        s.unread(b"hello ")
+        self.assertEqual(s.read(), b"hello world")
+        # Idempotent on empty input
+        s.unread(b"")
+        self.assertEqual(s.output_buf, b"")
+
     def test_resize_missing_session(self):
         body, code = self._post("/api/resize", {
             "session_id": "fake", "cols": 80, "rows": 24
@@ -887,6 +1222,110 @@ class TestIdleTimer(unittest.TestCase):
         s.output_buf = b"x"
         s.read()
         self.assertFalse(s.is_expired())
+
+
+# ── Echo-off prompt detection ──────────────────────────────────────────
+# Heuristic that hints the client to suppress local-echo prediction at
+# prompts where the remote pty disables ECHO (sudo / mysql -p / passwd /
+# ssh passphrase / read -s). The local pty between server.py and the ssh
+# client is in raw mode regardless of remote ECHO state, so a tail-of-
+# output regex is the next-best signal we can derive on the proxy side.
+
+class TestEchoOffHint(unittest.TestCase):
+
+    def _fake_session(self, recent_tail=b""):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = threading.Lock()
+        s._recent_tail = recent_tail
+        return s
+
+    def test_sudo_prompt_matches(self):
+        s = self._fake_session(b"[sudo] password for alexey: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_mysql_prompt_matches(self):
+        s = self._fake_session(b"Enter password: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_ssh_passphrase_matches(self):
+        s = self._fake_session(
+            b"Enter passphrase for key '/home/u/.ssh/id_rsa': ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_passcode_prompt_matches(self):
+        s = self._fake_session(b"Passcode: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_uppercase_prompt_matches(self):
+        s = self._fake_session(b"PASSWORD: ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_colored_prompt_with_sgr_reset_matches(self):
+        """Distros and PAM modules sometimes wrap the prompt in ANSI
+        SGR sequences (bold, color). The trailing class admits whitespace
+        and SGR runs after the colon so these still hit."""
+        s = self._fake_session(b"\x1b[1mPassword:\x1b[0m ")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_colored_prompt_trailing_sgr_matches(self):
+        s = self._fake_session(b"Password: \x1b[0m")
+        self.assertTrue(s.echo_off_hint())
+
+    def test_non_prompt_text_after_colon_does_not_match(self):
+        """ANSI CSI stripping must not turn non-prompt content into a
+        false match — the post-colon content still has to be whitespace
+        for the regex's `:\\s*$` anchor to fire."""
+        s = self._fake_session(b"Password:\x1b[Knot a prompt")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_only_last_line_considered(self):
+        """Earlier lines containing the keyword must not trip detection
+        — only the line the cursor is on can be a live prompt."""
+        s = self._fake_session(
+            b"changing password for alexey\nuser@host:~$ ")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_prompt_followed_by_newline_does_not_match(self):
+        """If the prompt has scrolled past with a trailing newline, the
+        cursor is on a fresh line and the user has already moved on."""
+        s = self._fake_session(b"[sudo] password for alexey: \n")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_word_inside_running_text_does_not_match(self):
+        s = self._fake_session(
+            b"i could tell you my password but i won't, $ ")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_empty_tail(self):
+        s = self._fake_session(b"")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_shell_prompt_does_not_match(self):
+        s = self._fake_session(b"alexey@hetzner-hel:~$ ")
+        self.assertFalse(s.echo_off_hint())
+
+    def test_regex_anchored_to_recent_tail_only(self):
+        """RECENT_TAIL_MAX bounds prevent unbounded buffer growth and
+        keep the regex cheap regardless of session output volume."""
+        s = self._fake_session()
+        # Lots of preceding output, then a newline, then the prompt —
+        # the realistic shape after truncation.
+        big = b"some output\n" * 30
+        s._recent_tail = (big + b"Password: ")[-server.RECENT_TAIL_MAX:]
+        self.assertTrue(s.echo_off_hint())
+
+    def test_tail_grows_then_truncates(self):
+        """End-to-end: feeding bytes through the same path the read loop
+        uses keeps _recent_tail bounded and still detects a final prompt."""
+        s = self._fake_session()
+        cap = server.RECENT_TAIL_MAX
+        for _ in range(20):
+            chunk = b"some shell output line\n"
+            s._recent_tail = (s._recent_tail + chunk)[-cap:]
+        self.assertLessEqual(len(s._recent_tail), cap)
+        prompt = b"\n[sudo] password for alexey: "
+        s._recent_tail = (s._recent_tail + prompt)[-cap:]
+        self.assertTrue(s.echo_off_hint())
 
 
 # ── HTTP-level validation of slot_id + tmux_cmd ────────────────────────

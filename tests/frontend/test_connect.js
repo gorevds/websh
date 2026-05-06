@@ -509,6 +509,180 @@ test('auto-connect failure → user dismiss popup → form appears', async () =>
 });
 
 // =====================================================================
+// Regression: handleOutputPayload must NOT drop tail-drain bytes
+// arriving after a frame that already flipped alive=false.
+// SSE _stream emits {data, alive:false} → tail-drain {data:"x",
+// alive:false} → event:end{alive:false}. The idempotency guard for
+// the disconnect/auth-failed branches must sit AFTER the r.data
+// handler, otherwise the tail bytes vanish.
+test('disconnect: tail-drain data after alive=false still rendered', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // Capture every term.write into an array we can assert on.
+  const writes = [];
+  // Build a minimal pane object the way websh.js itself does, then
+  // hand it to handleOutputPayload directly (bypassing transports).
+  const p = {
+    id: 'p1', sid: 'abc', polling: true,
+    term: {
+      write(b) {
+        if (typeof b === 'string') { writes.push(b); return; }
+        // Uint8Array-like: array of byte values. instanceof Uint8Array
+        // doesn't cross the jsdom realm boundary, so feature-detect.
+        let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+        writes.push(s);
+      },
+      buffer: {active: {type: 'normal'}}
+    },
+    el: win.document.createElement('div'),
+    echoQueue: '', echoTimer: null,
+    persistent: false, host: '', connection: null,
+    connectedAt: 0, recentOutput: ''
+  };
+  // Inject the pane into websh.js' module-scope panes registry, and
+  // expose handleOutputPayload (a function declaration, so it's already
+  // on window).
+  win._tp = p;
+  win.eval(`panes['p1'] = window._tp; activeId = 'p1';`);
+  // Frame 1: final output + alive=false. Should write 'first' AND
+  // the closed banner, then null p.sid.
+  win.handleOutputPayload(p, {data: win.btoa('first\r\n'), alive: false});
+  ok(p.sid === null, 'p.sid nulled after alive=false; got ' + p.sid);
+  let bannerCount = writes.filter(s => s.indexOf('connection closed') !== -1).length;
+  ok(bannerCount === 1, 'banner written once; got ' + bannerCount);
+  ok(writes.some(s => s.indexOf('first') !== -1), 'first chunk rendered; writes=' + JSON.stringify(writes));
+  // Frame 2 (tail-drain): alive=false again, with new bytes. The
+  // bytes MUST land in the terminal — losing them silently would be
+  // a regression. The banner MUST NOT be re-written.
+  win.handleOutputPayload(p, {data: win.btoa('tail-bytes\r\n'), alive: false});
+  ok(writes.some(s => s.indexOf('tail-bytes') !== -1),
+     'tail bytes rendered; writes=' + JSON.stringify(writes));
+  bannerCount = writes.filter(s => s.indexOf('connection closed') !== -1).length;
+  ok(bannerCount === 1, 'banner still written only once; got ' + bannerCount);
+  // Frame 3: the bare event:end frame. No data, alive=false. Should
+  // be a complete no-op.
+  const wlen = writes.length;
+  win.handleOutputPayload(p, {alive: false});
+  ok(writes.length === wlen, 'event:end is no-op; new writes=' + (writes.length - wlen));
+  cleanup(env);
+});
+
+// =====================================================================
+// Fix A regression: SSE 'open' event MUST NOT disarm the first-message
+// buffer-detection timer. 'open' fires when HTTP response headers arrive
+// — before any body byte traverses an upstream proxy. A buffering proxy
+// flushes headers immediately and holds the body, which is exactly the
+// case the timer is meant to detect. Only body events ('data' / 'end')
+// prove the channel actually flushes.
+test("SSE 'open' event does not mark body as arrived", async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+
+  // Capture the listeners streamOutput attaches to its EventSource.
+  const captured = {listeners: {}};
+  win.EventSource = class {
+    constructor(url) { captured.url = url; }
+    addEventListener(event, fn) { captured.listeners[event] = fn; }
+    set onerror(fn) { captured.onerror = fn; }
+    close() { captured.closed = true; }
+  };
+
+  const p = {
+    id: 'p1', sid: 'abc', polling: true,
+    term: {write: () => {}, buffer: {active: {type: 'normal'}}},
+    el: win.document.createElement('div'),
+    echoQueue: '', echoTimer: null,
+    persistent: false, host: '', connection: null,
+    connectedAt: 0, recentOutput: '',
+    firstFailureAt: 0, retryCount: 0, pollRetries: 0,
+  };
+  win._tp = p;
+  win.eval(`panes['p1'] = window._tp; activeId = 'p1';`);
+
+  win.streamOutput(p);
+  ok(p.sseFirstMsgTimer != null,
+     'first-message timer armed; got ' + p.sseFirstMsgTimer);
+  ok(p.sseGotAnyMessage === false,
+     'sseGotAnyMessage=false before any event; got ' + p.sseGotAnyMessage);
+
+  // Fire 'open': must NOT flip sseGotAnyMessage. (The fix.)
+  ok(typeof captured.listeners.open === 'function',
+     "'open' listener registered");
+  captured.listeners.open();
+  ok(p.sseGotAnyMessage === false,
+     "'open' must not mark body arrived; got " + p.sseGotAnyMessage);
+  ok(p.sseFirstMsgTimer != null,
+     "'open' must not clear first-message timer; got " + p.sseFirstMsgTimer);
+
+  // Fire 'data' with a benign payload: NOW the body has arrived.
+  captured.listeners.data({data: JSON.stringify({data: '', alive: true})});
+  ok(p.sseGotAnyMessage === true,
+     "'data' marks body arrived; got " + p.sseGotAnyMessage);
+  cleanup(env);
+});
+
+// =====================================================================
+// echo_off hint: server tells the client when the recent visible output
+// ends with a prompt that disables remote echo (sudo, mysql -p, passwd,
+// ssh passphrase, read -s). The client toggles p.echoEnabled so
+// predictionsEnabled() short-circuits on the next predictKey call —
+// nothing is rendered as a dim glyph. Backward-compat: undefined in the
+// payload must NOT clobber the previous value.
+test('echo_off=true disables predictions; absent field leaves state alone', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const writes = [];
+  const p = {
+    id: 'p1', sid: 'abc', polling: true,
+    term: {
+      write(b) {
+        if (typeof b === 'string') { writes.push(b); return; }
+        let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+        writes.push(s);
+      },
+      buffer: {active: {type: 'normal'}},
+    },
+    el: win.document.createElement('div'),
+    echoQueue: '', echoTimer: null,
+    persistent: false, host: '', connection: null,
+    connectedAt: 0, recentOutput: '',
+  };
+  win._tp = p;
+  win.eval(`panes['p1'] = window._tp; activeId = 'p1';`);
+
+  // Frame with the prompt and echo_off=true: predictions must be off.
+  win.handleOutputPayload(p, {
+    data: win.btoa('[sudo] password for alexey: '),
+    alive: true, echo_off: true,
+  });
+  ok(p.echoEnabled === false,
+     'echoEnabled flipped false on echo_off=true; got ' + p.echoEnabled);
+  ok(win.predictionsEnabled(p) === false,
+     'predictionsEnabled() short-circuits on echoEnabled===false');
+  // predictKey must not write a dim glyph at the prompt.
+  const before = writes.length;
+  win.predictKey(p, 'a');
+  ok(writes.length === before,
+     'predictKey wrote nothing while echoEnabled=false; new writes=' +
+     (writes.length - before));
+
+  // Frame with no echo_off field: echoEnabled must be unchanged
+  // (back-compat with older servers).
+  win.handleOutputPayload(p, {data: win.btoa('x'), alive: true});
+  ok(p.echoEnabled === false,
+     'absent echo_off must not flip the gate; got ' + p.echoEnabled);
+
+  // Frame with echo_off=false: predictions back on.
+  win.handleOutputPayload(p, {data: win.btoa('alexey@host:~$ '),
+                              alive: true, echo_off: false});
+  ok(p.echoEnabled === true,
+     'echoEnabled flipped true on echo_off=false; got ' + p.echoEnabled);
+  ok(win.predictionsEnabled(p) === true,
+     'predictionsEnabled() truthy again');
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
