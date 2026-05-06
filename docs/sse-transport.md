@@ -100,6 +100,83 @@ Predictions are wiped on:
 - Pane close.
 - The 1-second TTL.
 
+## Lost-byte handling on disconnect
+
+`SSHSession.read()` is destructive: it returns the contents of
+`output_buf` and clears it under `buf_lock`. That means once a reader
+has drained the buffer, the bytes only exist in that reader's local
+variable. If the reader can't deliver them — the client closed the
+socket, the PHP proxy aborted, the network blipped — those bytes are
+gone unless we put them back.
+
+Two protections, either of which is sufficient on its own:
+
+1. **Peek for FIN before `read()`.** `Handler._client_gone()` does a
+   non-blocking `recv(1, MSG_PEEK)` on the request socket each loop
+   iteration. If the peer has half-closed (`recv == b""`), we bail
+   *without* draining the buffer. The next reader (long-poll fallback
+   or a fresh `/api/stream`) sees the unchanged buffer and delivers
+   normally. Linux/macOS uses `MSG_DONTWAIT`; platforms without it
+   fall back to `setblocking(False)` around the peek.
+
+2. **`Session.unread()` after a write failure.** If `read()` already
+   drained the buffer and the subsequent `wfile.write` / `wfile.flush`
+   raises `BrokenPipeError`, we push the bytes back to the front of
+   `output_buf`. Order is preserved (the unread bytes are older than
+   anything `_reader_loop` has appended in the meantime). The next
+   reader picks them up.
+
+Trade-off: when the unread bytes plus fresh PTY output exceed
+`OUTPUT_BUF_MAX`, the truncation rule (keep the last
+`OUTPUT_BUF_KEEP` bytes) drops the oldest data — possibly the
+unread part. We chose this over the alternative ("keep the unread,
+drop the new") because the user-visible value of the buffer is
+the *current* terminal state, not historical context. Buffer
+overflow at the moment of disconnect is rare in practice.
+
+There is still a thin race window: peek says "alive" → `read()`
+takes the bytes → client sends FIN → `wfile.write` succeeds into
+the TCP send buffer (kernel doesn't reject it) → bytes never
+reach the application on the other side because the socket is
+closed. Fully closing this window requires an application-level
+ACK from the client, which is overkill — the practical result is
+~1 µs of exposure on each pass through the loop.
+
+## Disconnect idempotency
+
+SSE delivers the session-end signal as up to three frames:
+`{data, alive:false}` (last shell output), `{data:"tail", alive:false}`
+(any bytes added between the previous read and the close), and
+`event:end{alive:false}`. The browser's `EventSource` may dispatch
+all three before our `close()` takes effect — the spec lets the
+implementation queue events that arrive over the wire ahead of
+close. Each frame would otherwise re-run the disconnect path:
+banner, `showReconnectBar`, `saveSessions`, all duplicated.
+
+`handleOutputPayload` enforces idempotency by structure:
+
+```js
+if (r.error) { if (!p.sid) return true; ...handle... }
+p.connecting = false;
+if (r.data) { ...always render... }
+if (!p.sid) return true;       // guard for terminal-state branches
+if (r.auth_failed) { ...handle..., p.sid = null }
+if (r.alive === false) { ...handle..., p.sid = null }
+```
+
+The guard sits **after** the `r.data` handler, not before — a
+tail-drain frame still has bytes that need to land in the terminal,
+even if we already wrote the closed-banner. The terminal-state
+branches all null `p.sid` on the first call, so subsequent frames
+hit the guard and exit cleanly.
+
+Predictions (`echoQueue`/`echoTimer`) are wiped on every disconnect
+path *before* the banner is written, so a pending TTL timer can't
+fire `\b`/space/`\b` on top of the freshly-rendered banner. Resize
+also wipes them silently — `\b`/space/`\b` after `xterm.js` reflow
+isn't actually silent (column-only backspace doesn't cross line
+wraps) and would clobber legitimate content on narrowing.
+
 ## Known limitations
 
 - **Local echo can desync after exotic escape sequences** that move
@@ -171,8 +248,16 @@ Net unchanged surface:
 - `/api/input`, `/api/connect`, `/api/disconnect`, `/api/resize`,
   `/api/upload*`, `/api/tmux_*`, `/api/ls`, `/api/download`, `/api/ping`,
   `/api/config` — untouched.
-- All existing tests still pass; two new tests cover `/api/stream`
-  validation paths.
+- All existing tests still pass. New tests cover `/api/stream`
+  validation paths, the peek-FIN semantics
+  (`test_client_gone_detects_fin` /
+  `_false_with_pending_data`), the unread push-back contract
+  (`test_session_unread_prepends`), an integration check that
+  bytes survive a mid-stream client close
+  (`test_stream_returns_undelivered_bytes_to_buffer`), and a
+  frontend regression that drives `handleOutputPayload` directly
+  with a three-frame disconnect sequence to confirm both
+  tail-byte rendering and single banner emission.
 
 Sessions that the SSE branch interacts with go through the same
 `SSHSession.read()` as long-poll does — there's no separate buffer,
