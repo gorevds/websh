@@ -372,6 +372,8 @@ Environment variables for `server.py`:
 | `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
 | `RATE_LIMIT_MAX` | `50` | Max `/api/connect` attempts per IP per window |
 | `RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds |
+| `SCAN_PATTERN_THRESHOLD` | `0` | One IP that probes at least N distinct deny-listed targets in `SCAN_PATTERN_WINDOW` seconds gets `result=scan_pattern` events emitted starting on the Nth probe; `0` disables. ANY successful connect from the same IP clears state, so legitimate users never accumulate. |
+| `SCAN_PATTERN_WINDOW` | `300` | Sliding window for scan-pattern detection, in seconds |
 | `WEBSH_TMUX_IDLE_TTL` | `259200` | Seconds a detached persistent tmux session may idle on the target before it's reaped (default 72h, `0` disables) |
 | `WEBSH_TMUX_WATCHDOG_POLL` | `300` | Seconds between idle-TTL watchdog checks on the target |
 | `WEBSH_ACCESS_LOG` | *(unset)* | Path to a JSON-line access log; when unset, no access log is written. See [Access log](#access-log) below. |
@@ -554,6 +556,7 @@ Common `result` values on `connect` events:
 | `deny_blocked` | Target host (or its resolved IP) is on `denied_hosts`. |
 | `session_cap_per_ip` | The per-source-IP active session cap (`MAX_SESSIONS_PER_IP`) was at the limit. |
 | `session_cap_global` | Global cap (`MAX_SESSIONS` for `foreground`, `MAX_BG_SESSIONS` for `background`) was at the limit. The `classification` field tells which. |
+| `scan_pattern` | The IP has reached `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets inside the window. Emitted in addition to the original `deny_blocked` record, starting on the Nth probe and on every probe after. ANY successful connect from the same IP clears state, so a power user touching many real servers never accumulates here. |
 | `error` | Internal failure during session creation. The `error` field carries up to 200 Unicode characters of the exception (~800 UTF-8 bytes for non-ASCII text). |
 
 Common `result` values on `disconnect` events:
@@ -568,9 +571,26 @@ Common `result` values on `disconnect` events:
 
 ```ini
 [Definition]
-failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|deny_blocked|session_cap_per_ip)".*$
+failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|session_cap_per_ip|scan_pattern)".*$
 ignoreregex =
 ```
+
+Note that `deny_blocked` is deliberately **not** in the recommended
+filter. A one-off `deny_blocked` is just as likely a fat-fingered
+hostname or a stale UI link as it is an attacker — banning on a single
+event would burn legitimate users. The `scan_pattern` event is the
+curated signal for "this IP is probing the deny-list": it only fires
+once `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets are reached
+inside the window, and any successful connect from the same IP
+forgives the accumulation. So `deny_blocked` records stay in the log
+for operator visibility (you want to see misconfigured clients) but
+fail2ban acts only on the `scan_pattern` aggregate.
+
+If `SCAN_PATTERN_THRESHOLD=0` (the default — disabled), `deny_blocked`
+events are still recorded but no `scan_pattern` events are ever
+emitted — the operator hasn't opted in to automatic banning, so
+nothing in this filter triggers on a typo. Set a positive
+`SCAN_PATTERN_THRESHOLD` to enable the curated signal.
 
 The file is opened-and-closed per write, so `logrotate(8)` works without
 any signal-based reopen plumbing — `copytruncate` is fine. Each record

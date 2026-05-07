@@ -1640,6 +1640,219 @@ class TestRateLimit(unittest.TestCase):
         self.assertTrue(server._check_rate_limit("10.0.0.4"))
 
 
+class TestScanPatternDetection(unittest.TestCase):
+    """Unit tests for the scan-pattern detector.
+
+    Two safety properties matter as much as the positive detection:
+      1. A legitimate user with one or two typos does NOT trip.
+      2. ANY successful connect from an IP clears its accumulated
+         deny-list state, so a power user with many real targets is
+         immune.
+    """
+
+    def setUp(self):
+        # Detector is module-state; snapshot+clear so tests can't leak.
+        with server._scan_pattern_lock:
+            self._snapshot = dict(server._scan_pattern)
+            server._scan_pattern.clear()
+        self._orig_threshold = server.SCAN_PATTERN_THRESHOLD
+        self._orig_window = server.SCAN_PATTERN_WINDOW
+
+    def tearDown(self):
+        with server._scan_pattern_lock:
+            server._scan_pattern.clear()
+            server._scan_pattern.update(self._snapshot)
+        server.SCAN_PATTERN_THRESHOLD = self._orig_threshold
+        server.SCAN_PATTERN_WINDOW = self._orig_window
+
+    # ── safety: detector disabled by default ──
+
+    def test_disabled_by_default(self):
+        """SCAN_PATTERN_THRESHOLD=0 means the detector is a no-op no
+        matter what an IP does. Default config must NOT ban anyone."""
+        server.SCAN_PATTERN_THRESHOLD = 0
+        for i in range(100):
+            self.assertFalse(server._record_deny_for_scan(
+                "1.2.3.4", "host{}.example".format(i)))
+
+    # ── positive detection ──
+
+    def test_triggers_past_threshold(self):
+        server.SCAN_PATTERN_THRESHOLD = 3
+        # Convention matches _check_rate_limit: fire on the threshold
+        # itself (>=), not threshold+1. SCAN_PATTERN_THRESHOLD=3 means
+        # "the 3rd distinct host trips the ban".
+        self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h1"))
+        self.assertFalse(server._record_deny_for_scan("1.2.3.4", "h2"))
+        self.assertTrue(server._record_deny_for_scan("1.2.3.4", "h3"))
+        # And every probe AFTER fires too (so fail2ban keeps seeing
+        # the signal — single line is easy to miss in log rotation).
+        self.assertTrue(server._record_deny_for_scan("1.2.3.4", "h4"))
+
+    def test_repeats_to_same_host_do_not_count(self):
+        """An IP retrying the SAME blocked host (e.g. a script with a
+        config error pinning to one bad target) is annoying but it is
+        not a scan — no broad probing. Threshold counts DISTINCT hosts."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        for _ in range(20):
+            self.assertFalse(server._record_deny_for_scan(
+                "1.2.3.4", "stuck.example"))
+
+    def test_other_ips_independent(self):
+        server.SCAN_PATTERN_THRESHOLD = 2
+        for h in ("a", "b", "c"):
+            server._record_deny_for_scan("attacker", h)
+        # Innocent IP not affected
+        self.assertFalse(server._record_deny_for_scan(
+            "innocent.10.0.0.5", "real.example"))
+
+    # ── safety: success forgives ──
+
+    def test_successful_connect_clears_state(self):
+        """The asymmetry: only deny_blocked accumulates, only ok forgives.
+        A power user who legitimately connects to many servers always
+        forgives themselves, so they never accumulate to a ban."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        # IP gets close to the threshold via a string of typoed denies
+        for h in ("rfc1918-typo-a", "rfc1918-typo-b", "rfc1918-typo-c"):
+            server._record_deny_for_scan("power-user", h)
+        # Then they successfully connect to a real server
+        server._forgive_scan_for_ip("power-user")
+        # Their state is gone; one more deny doesn't trigger
+        self.assertFalse(server._record_deny_for_scan(
+            "power-user", "another-typo"))
+        # Another distinct host: still under threshold (count=2)
+        self.assertFalse(server._record_deny_for_scan("power-user", "d"))
+        # Third distinct host since the forgive: hits threshold (>=3)
+        self.assertTrue(server._record_deny_for_scan("power-user", "e"))
+
+    def test_window_expires_old_events(self):
+        """Old deny events fall out of the window — slow-and-low
+        scanners stretching their probes across hours never accumulate
+        enough inside the 5-minute (default) window. Use a clock mock
+        so the test runs in milliseconds rather than burning real time
+        on a CI runner."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server.SCAN_PATTERN_WINDOW = 60
+        # Plant three denies at virtual time t=1000.
+        with unittest.mock.patch("server.time.time", return_value=1000.0):
+            for h in ("a", "b", "c"):
+                server._record_deny_for_scan("slow-scanner", h)
+        # Fast-forward past the window: the next probe is the first
+        # event inside the (new) window — count drops to 1 — no fire.
+        with unittest.mock.patch("server.time.time", return_value=1100.0):
+            self.assertFalse(server._record_deny_for_scan(
+                "slow-scanner", "d"))
+
+    # ── safety: realistic devops user does NOT trigger ──
+
+    def test_devops_with_50_servers_never_triggers(self):
+        """Simulate a power user touching 50 real servers, with one
+        typo'd RFC1918 attempt. Must never trigger."""
+        server.SCAN_PATTERN_THRESHOLD = 5
+        for i in range(50):
+            # Each successful connect clears any accumulated state
+            server._forgive_scan_for_ip("devops")
+            # And imagine they had a typo somewhere
+            if i % 7 == 3:
+                triggered = server._record_deny_for_scan(
+                    "devops", "10.0.0.{}".format(i))
+                self.assertFalse(
+                    triggered,
+                    "devops user must not trigger after iter {}".format(i))
+
+    def test_empty_ip_returns_false(self):
+        server.SCAN_PATTERN_THRESHOLD = 1
+        self.assertFalse(server._record_deny_for_scan("", "h"))
+        self.assertFalse(server._record_deny_for_scan(None, "h"))
+
+    def test_forgive_no_op_on_empty_ip(self):
+        # Should not raise
+        server._forgive_scan_for_ip("")
+        server._forgive_scan_for_ip(None)
+
+    # ── safety: stored host string is capped and normalised ──
+
+    def test_long_target_host_is_capped(self):
+        """Per-IP buffer must not let a 100KB host inflate memory.
+        Stored entries must be truncated to _DEFAULT_FIELD_CAP chars."""
+        server.SCAN_PATTERN_THRESHOLD = 1
+        server._record_deny_for_scan("1.2.3.4", "x" * 100000)
+        with server._scan_pattern_lock:
+            events = list(server._scan_pattern.get("1.2.3.4", []))
+        self.assertEqual(len(events), 1)
+        _, stored = events[0]
+        self.assertLessEqual(len(stored), server._DEFAULT_FIELD_CAP)
+
+    def test_case_variants_collapse_to_one_distinct_host(self):
+        """An attacker probing one host with 10 case variants must not
+        clear the distinct-host threshold — same host = one bucket."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        # 10 case variants of the same host — all should normalise
+        # to a single distinct entry, no fire.
+        variants = [
+            "Host.Example", "HOST.EXAMPLE", "host.example",
+            "hOsT.ExAmPlE", "HOST.example", "host.EXAMPLE",
+            "Host.example", "host.Example", "HoSt.eXaMpLe",
+            "HOST.Example",
+        ]
+        for h in variants:
+            self.assertFalse(server._record_deny_for_scan("1.2.3.4", h))
+        with server._scan_pattern_lock:
+            unique = set(h for _, h in server._scan_pattern.get("1.2.3.4", []))
+        self.assertEqual(unique, {"host.example"})
+
+    def test_trailing_dot_collapses_to_one_distinct_host(self):
+        """FQDN with trailing dot ('host.example.') and same host
+        without ('HOST.example') must both count as the same bucket."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server._record_deny_for_scan("1.2.3.4", "host.example")
+        server._record_deny_for_scan("1.2.3.4", "HOST.example.")
+        server._record_deny_for_scan("1.2.3.4", "  Host.Example.  ")
+        with server._scan_pattern_lock:
+            unique = set(h for _, h in server._scan_pattern.get("1.2.3.4", []))
+        self.assertEqual(unique, {"host.example"})
+
+    # ── memory bound: cleanup() prunes expired IPs ──
+
+    def test_cleanup_prunes_expired_scan_pattern_entries(self):
+        """`cleanup()` must drop any IP whose entire event list has
+        aged out of the window — otherwise the dict grows for every
+        unique attacker IP and never shrinks (slow leak proportional
+        to attacker activity, the worst scaling profile)."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server.SCAN_PATTERN_WINDOW = 60
+        # Plant events from two IPs at virtual time t=1000.
+        with unittest.mock.patch("server.time.time", return_value=1000.0):
+            server._record_deny_for_scan("scanner-a", "h1")
+            server._record_deny_for_scan("scanner-a", "h2")
+            server._record_deny_for_scan("scanner-b", "h3")
+        # Sanity: both IPs are present.
+        with server._scan_pattern_lock:
+            self.assertIn("scanner-a", server._scan_pattern)
+            self.assertIn("scanner-b", server._scan_pattern)
+        # Fast-forward past the window, then run cleanup. Both IPs'
+        # events are now stale and the entries should disappear.
+        with unittest.mock.patch("server.time.time", return_value=1100.0):
+            server.cleanup()
+        with server._scan_pattern_lock:
+            self.assertNotIn("scanner-a", server._scan_pattern)
+            self.assertNotIn("scanner-b", server._scan_pattern)
+
+    def test_cleanup_keeps_fresh_scan_pattern_entries(self):
+        """An IP with at least one in-window event must NOT be evicted
+        by cleanup() — otherwise we lose live state mid-attack."""
+        server.SCAN_PATTERN_THRESHOLD = 3
+        server.SCAN_PATTERN_WINDOW = 60
+        with unittest.mock.patch("server.time.time", return_value=1000.0):
+            server._record_deny_for_scan("active", "h1")
+        # Run cleanup at t=1030 — still inside the 60s window.
+        with unittest.mock.patch("server.time.time", return_value=1030.0):
+            server.cleanup()
+        with server._scan_pattern_lock:
+            self.assertIn("active", server._scan_pattern)
+
+
 class TestPerIpSessionCount(unittest.TestCase):
     """Unit tests for the per-IP session-count helper."""
 
@@ -5342,6 +5555,120 @@ class TestAccessLogConnectEvents(unittest.TestCase):
             self.assertTrue(all(ch == "X" for ch in err[0]["error"]))
         finally:
             server.SSHSession = orig
+
+
+class TestRestrictHostsDoesNotFeedScanPattern(unittest.TestCase):
+    """Integration: under restrict_hosts: true, a manual /api/connect
+    is rejected because the policy disallows free-form connects (use a
+    named connection), NOT because the target was on the deny-list. So
+    the scan-pattern detector must NOT count those rejections — a
+    buggy or stale UI POSTing `host` instead of `connection` from one
+    legitimate IP could otherwise rapidly accumulate to a ban."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18786
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({
+                "restrict_hosts": True,
+                "denied_hosts": [],
+                "connections": [],
+            }, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        # Generous rate-limit budget so 100 POSTs all reach the
+        # is_host_allowed gate (the bit we actually want to test).
+        server._rate_limits.clear()
+        with server._scan_pattern_lock:
+            self._snap = dict(server._scan_pattern)
+            server._scan_pattern.clear()
+        self._orig_threshold = server.SCAN_PATTERN_THRESHOLD
+        self._orig_window = server.SCAN_PATTERN_WINDOW
+        self._orig_rate_max = server.RATE_LIMIT_MAX
+        # Threshold low enough that the test would fire if the bug
+        # were present (probing 100 distinct hosts > 5).
+        server.SCAN_PATTERN_THRESHOLD = 5
+        server.SCAN_PATTERN_WINDOW = 300
+        server.RATE_LIMIT_MAX = 1000
+        self.logfile = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".log", delete=False)
+        self.logfile.close()
+        self._orig_path = server.ACCESS_LOG_PATH
+        server.ACCESS_LOG_PATH = self.logfile.name
+
+    def tearDown(self):
+        server.ACCESS_LOG_PATH = self._orig_path
+        os.unlink(self.logfile.name)
+        with server._scan_pattern_lock:
+            server._scan_pattern.clear()
+            server._scan_pattern.update(self._snap)
+        server.SCAN_PATTERN_THRESHOLD = self._orig_threshold
+        server.SCAN_PATTERN_WINDOW = self._orig_window
+        server.RATE_LIMIT_MAX = self._orig_rate_max
+        server._rate_limits.clear()
+
+    def _read_records(self):
+        with open(self.logfile.name, "r", encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def _post_connect(self, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/connect".format(self.port)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    def test_restrict_hosts_does_not_feed_scan_pattern(self):
+        """100 raw manual /api/connect POSTs from one IP, each to a
+        different host, must all reject as deny_blocked but must NOT
+        produce any scan_pattern records — restrict_hosts: true is a
+        policy mismatch, not a deny-list hit."""
+        for i in range(100):
+            _, code = self._post_connect({
+                "host": "host{}.example".format(i),
+                "username": "u", "password": "p",
+                "cols": 80, "rows": 24,
+            })
+            self.assertEqual(code, 403)
+        recs = self._read_records()
+        # All 100 deny_blocked records present (operator visibility):
+        deny = [r for r in recs
+                if r["event"] == "connect" and r["result"] == "deny_blocked"]
+        self.assertEqual(len(deny), 100)
+        # But zero scan_pattern records — that's the whole point.
+        scan = [r for r in recs
+                if r["event"] == "connect" and r["result"] == "scan_pattern"]
+        self.assertEqual(scan, [],
+                         "restrict_hosts must not feed scan-pattern: {}"
+                         .format(scan))
 
 
 class TestAccessLogDisconnectEvents(unittest.TestCase):
