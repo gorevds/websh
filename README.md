@@ -2,7 +2,7 @@
 
 **English** | [Русский](README.ru.md)
 
-Light but powerful web-based SSH terminal.
+Lite but powerful web-based SSH terminal.
 
 - 📦 **No build step, no server dependencies**
 - 🌐 **Plain HTTP, no WebSocket**
