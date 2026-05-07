@@ -1522,6 +1522,104 @@ class TestPromptConnectHTTP(unittest.TestCase):
         self.assertEqual(code, 403)
 
 
+class TestClientIp(unittest.TestCase):
+    """Unit tests for Handler._client_ip — XFF parsing and validation.
+
+    Covers Issue 2 (must reject non-IP-literal first XFF token, NOT
+    silently use it as the rate-limit / per-IP-cap key) and Issue 6
+    (attacker-controlled bytes must not end up as the registry
+    comparison key for `client_ip`).
+    """
+
+    class _FakeHeaders(object):
+        """Minimal stand-in for http.client.HTTPMessage. _client_ip only
+        calls `.get(name, default)`; we do not need the rest."""
+
+        def __init__(self, mapping):
+            self._m = dict(mapping or {})
+
+        def get(self, name, default=""):
+            return self._m.get(name, default)
+
+    def _make_handler(self, peer, headers=None):
+        h = server.Handler.__new__(server.Handler)
+        h.client_address = (peer, 12345)
+        h.headers = self._FakeHeaders(headers or {})
+        return h
+
+    def setUp(self):
+        # Pin TRUSTED_PROXIES to a known value so other tests that
+        # mutate it cannot bleed in.
+        self._orig_trusted = server._TRUSTED_PROXIES
+        server._TRUSTED_PROXIES = {"127.0.0.1", "10.0.0.5"}
+
+    def tearDown(self):
+        server._TRUSTED_PROXIES = self._orig_trusted
+
+    def test_no_xff_returns_peer(self):
+        h = self._make_handler("127.0.0.1")
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_untrusted_peer_ignores_xff(self):
+        h = self._make_handler("8.8.8.8",
+                               {"X-Forwarded-For": "1.2.3.4"})
+        self.assertEqual(h._client_ip(), "8.8.8.8")
+
+    def test_trusted_peer_uses_first_xff_token(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "1.2.3.4, 5.6.7.8"})
+        self.assertEqual(h._client_ip(), "1.2.3.4")
+
+    def test_trusted_peer_ipv6_token_is_accepted(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "2001:db8::1"})
+        self.assertEqual(h._client_ip(), "2001:db8::1")
+
+    def test_garbage_first_xff_token_falls_back_to_peer(self):
+        # The crucial regression: pre-fix, "garbage" would be the
+        # returned IP and end up in the rate-limit dict and as
+        # SSHSession.client_ip.
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "garbage,1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+        # Sanity: the *peer* never silently picks up the garbage as a
+        # substring or prefix.
+        self.assertNotIn("garbage", h._client_ip())
+
+    def test_oversized_non_ip_token_falls_back_to_peer(self):
+        # Issue 6: attacker-controlled bytes must not propagate as the
+        # registry key. 1 KiB of binary garbage is well past anything
+        # ipaddress.ip_address would accept.
+        blob = "A" * 1024
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": blob + ",1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_empty_first_token_falls_back_to_peer(self):
+        # ", 1.2.3.4" — first token is the empty string. Validation is
+        # gated on truthiness so we still hit the peer fallback.
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": ", 1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_whitespace_only_token_falls_back_to_peer(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "   ,1.2.3.4"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+    def test_token_is_stripped_before_validation(self):
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "  1.2.3.4  ,5.6.7.8"})
+        self.assertEqual(h._client_ip(), "1.2.3.4")
+
+    def test_invalid_ip_with_extra_chars_falls_back(self):
+        # "1.2.3.4abc" is not a valid IP literal even though it starts
+        # with a valid IP — strict ip_address() parsing.
+        h = self._make_handler("127.0.0.1",
+                               {"X-Forwarded-For": "1.2.3.4abc"})
+        self.assertEqual(h._client_ip(), "127.0.0.1")
+
+
 class TestRateLimit(unittest.TestCase):
 
     def setUp(self):
@@ -1540,6 +1638,379 @@ class TestRateLimit(unittest.TestCase):
         for _ in range(server.RATE_LIMIT_MAX):
             server._check_rate_limit("10.0.0.3")
         self.assertTrue(server._check_rate_limit("10.0.0.4"))
+
+
+class TestPerIpSessionCount(unittest.TestCase):
+    """Unit tests for the per-IP session-count helper."""
+
+    def setUp(self):
+        self._snapshot = dict(server.sessions)
+        server.sessions.clear()
+
+    def tearDown(self):
+        server.sessions.clear()
+        server.sessions.update(self._snapshot)
+
+    def _fake(self, client_ip, is_background=False):
+        s = type("_FakeS", (), {})()
+        s.client_ip = client_ip
+        s.is_background = is_background
+        return s
+
+    def test_empty_registry(self):
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 0)
+
+    def test_counts_matching_ips(self):
+        server.sessions["a"] = self._fake("1.2.3.4")
+        server.sessions["b"] = self._fake("1.2.3.4")
+        server.sessions["c"] = self._fake("9.9.9.9")
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 2)
+        self.assertEqual(server._per_ip_session_count("9.9.9.9"), 1)
+        self.assertEqual(server._per_ip_session_count("0.0.0.0"), 0)
+
+    def test_counts_bg_and_fg_together(self):
+        # The cap is anti-abuse, not anti-resource-class — count everything.
+        server.sessions["a"] = self._fake("1.2.3.4", is_background=False)
+        server.sessions["b"] = self._fake("1.2.3.4", is_background=True)
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 2)
+
+    def test_session_without_client_ip_not_counted(self):
+        s = type("_FakeS", (), {})()
+        s.is_background = False
+        # intentionally missing client_ip — getattr default None never matches
+        server.sessions["a"] = s
+        self.assertEqual(server._per_ip_session_count("1.2.3.4"), 0)
+
+    def test_empty_or_none_ip_returns_zero(self):
+        server.sessions["a"] = self._fake("1.2.3.4")
+        self.assertEqual(server._per_ip_session_count(""), 0)
+        self.assertEqual(server._per_ip_session_count(None), 0)
+
+
+def _make_stub_session_cls(spawn_delay=0.0):
+    """Build a fake SSHSession class for `server.SSHSession` patches.
+
+    Real SSHSession `pty.fork()`s ssh and is the source of the
+    `forkpty() may lead to deadlocks` DeprecationWarning when the
+    HTTP test harness drives /api/connect from a multi-threaded
+    server. Tests that exercise `_connect`'s success path don't care
+    about the ssh side at all — they care about session-registry
+    bookkeeping. This stub gives the success path the attributes it
+    serializes (`alive`, `auth_failed`, `tmux_cmd`) plus the ones the
+    cleanup/cap iteration reads (`client_ip`, `is_background`,
+    `persistent`, `slot_id`, `is_expired`, `close`) and nothing else.
+
+    `spawn_delay` lets the concurrency test widen the race window the
+    cap is meant to close (the real spawn is wall-clock-slow; that's
+    the reason the placeholder swap exists).
+    """
+
+    class _StubSession(object):
+
+        def __init__(self, session_id, host, port, username, password,
+                     cols, rows, key=None, ssh_options=None,
+                     is_background=False, persistent=False, slot_id=None,
+                     tmux_cmd="tmux", tmux_options=None, client_ip=None):
+            if spawn_delay:
+                time.sleep(spawn_delay)
+            self.id = session_id
+            self.client_ip = client_ip
+            self.is_background = is_background
+            # Mirror the real SSHSession: persistent only sticks if a
+            # slot_id was provided. _connect's response reads the local
+            # `persistent`/`slot_id` rather than ours, but be symmetric.
+            self.persistent = bool(persistent and slot_id)
+            self.slot_id = slot_id if self.persistent else None
+            self.tmux_cmd = tmux_cmd
+            self.alive = True
+            self.auth_failed = False
+            self.last_activity = time.time()
+
+        def is_expired(self):
+            return False
+
+        def close(self):
+            pass
+
+    return _StubSession
+
+
+class TestPerIpSessionCapHTTP(unittest.TestCase):
+    """Integration: per-IP cap returns 429 before reaching the SSH spawn.
+
+    Plants fake session objects in the live registry and posts to
+    /api/connect — the handler runs the gate inside `with sessions_lock:`
+    so the count is observed atomically. The real SSHSession is replaced
+    with a stub for the duration of the class so the success path
+    doesn't pty.fork() ssh against `ignored.example` (which leaks file
+    descriptors and emits a DeprecationWarning under multi-threaded
+    test servers).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18768
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._rate_limits.clear()
+        self._sessions_snapshot = dict(server.sessions)
+        server.sessions.clear()
+        self._orig_cap = server.MAX_SESSIONS_PER_IP
+        # Stub SSHSession so the success path doesn't pty.fork() ssh
+        # against `ignored.example` (slow, leaks fds, fires the
+        # forkpty() DeprecationWarning under a multi-threaded server).
+        self._orig_session_cls = server.SSHSession
+        server.SSHSession = _make_stub_session_cls()
+        # CONNECT_SETTLE_TIME is a 0.5 s post-spawn sleep that
+        # serializes the response. It exists to give real ssh a moment
+        # before the client tries to read; with a stubbed Session it's
+        # pure dead weight.
+        self._orig_settle = server.CONNECT_SETTLE_TIME
+        server.CONNECT_SETTLE_TIME = 0
+
+    def tearDown(self):
+        server.sessions.clear()
+        server.sessions.update(self._sessions_snapshot)
+        server.MAX_SESSIONS_PER_IP = self._orig_cap
+        server.SSHSession = self._orig_session_cls
+        server.CONNECT_SETTLE_TIME = self._orig_settle
+
+    def _fake(self, client_ip):
+        s = type("_FakeS", (), {})()
+        s.client_ip = client_ip
+        s.is_background = False
+        s.persistent = False
+        return s
+
+    def _post(self, body):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/connect".format(self.port)
+        data = json.dumps(body).encode("utf-8")
+        req = Request(url, data=data,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return json.loads(resp.read().decode("utf-8")), resp.getcode()
+        except Exception as e:
+            if hasattr(e, "read"):
+                return json.loads(e.read().decode("utf-8")), e.code
+            raise
+
+    _PAYLOAD = {"host": "ignored.example", "username": "u",
+                "password": "p", "cols": 80, "rows": 24}
+
+    def _assert_connect_ok(self, body, code):
+        """Success-path assertion: 200 + a real session_id we can lookup.
+
+        Replaces the old one-sided `if code == 429: assertNotIn(...)`
+        pattern, which silently passed when the gate dropped entirely
+        or always passed.
+        """
+        self.assertEqual(
+            code, 200,
+            "expected 200 from connect, got {} body={}".format(code, body))
+        sid = body.get("session_id", "")
+        self.assertTrue(server._UUID_RE.match(sid),
+                        "expected uuid session_id, got {!r}".format(sid))
+        # Real (stubbed) Session was swapped in for the placeholder —
+        # if the swap had been skipped, sessions[sid] would still be
+        # the _SessionPlaceholder.
+        self.assertIn(sid, server.sessions)
+        self.assertNotIsInstance(server.sessions[sid],
+                                 server._SessionPlaceholder)
+
+    def test_cap_blocks_when_exceeded(self):
+        server.MAX_SESSIONS_PER_IP = 2
+        for i in range(2):
+            server.sessions["fake-{}".format(i)] = self._fake("127.0.0.1")
+        body, code = self._post(self._PAYLOAD)
+        self.assertEqual(code, 429)
+        self.assertIn("from your IP", body["error"])
+
+    def test_cap_allows_at_or_below_limit(self):
+        # 1 active session, cap is 2 → next connect must succeed (200)
+        # and register a real session.
+        server.MAX_SESSIONS_PER_IP = 2
+        server.sessions["one"] = self._fake("127.0.0.1")
+        body, code = self._post(self._PAYLOAD)
+        self._assert_connect_ok(body, code)
+
+    def test_cap_does_not_block_other_ips(self):
+        # Two sessions from a different IP at cap=2 must NOT block
+        # 127.0.0.1's connect.
+        server.MAX_SESSIONS_PER_IP = 2
+        for i in range(2):
+            server.sessions["fake-{}".format(i)] = self._fake("9.9.9.9")
+        body, code = self._post(self._PAYLOAD)
+        self._assert_connect_ok(body, code)
+
+    def test_cap_zero_disables_gate(self):
+        # Cap 0 = disabled: even with 5 active sessions from this IP
+        # the connect must succeed.
+        server.MAX_SESSIONS_PER_IP = 0
+        for i in range(5):
+            server.sessions["fake-{}".format(i)] = self._fake("127.0.0.1")
+        body, code = self._post(self._PAYLOAD)
+        self._assert_connect_ok(body, code)
+
+    def test_cap_at_exact_limit_blocks_one_more(self):
+        # Boundary: with cap-1 fakes preloaded, the first request must
+        # pass (count == cap-1 < cap, registers, count becomes cap) and
+        # the second must hit the per-IP 429 (count == cap >= cap).
+        # Verifies the gate's inequality direction is `>=` and not `>`.
+        cap = 3
+        server.MAX_SESSIONS_PER_IP = cap
+        for i in range(cap - 1):
+            server.sessions["fake-{}".format(i)] = self._fake("127.0.0.1")
+
+        body1, code1 = self._post(self._PAYLOAD)
+        self._assert_connect_ok(body1, code1)
+
+        body2, code2 = self._post(self._PAYLOAD)
+        self.assertEqual(
+            code2, 429,
+            "expected per-IP 429 on the second request, got {} body={}".format(
+                code2, body2))
+        self.assertIn("from your IP", body2.get("error", ""))
+
+
+class TestPerIpSessionCapConcurrency(unittest.TestCase):
+    """Regression: per-IP cap must not be racy under concurrent connects.
+
+    The original implementation released sessions_lock between the gate
+    check and the registry insert, with the SSH spawn (wall-clock-slow)
+    in the middle. N concurrent POSTs from the same IP all observed
+    `count == cap-1`, all passed the gate, all spawned ssh, all
+    inserted — final count = cap + N - 1.
+
+    The fix reserves a counted slot (a `_SessionPlaceholder`) under the
+    gate lock before spawning. Concurrent connects from the same IP
+    observe the in-flight slots and trip the cap. We widen the spawn
+    window via a stubbed SSHSession that sleeps 50 ms in __init__, then
+    fire cap+5 concurrent POSTs and assert exactly `cap` succeed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18785
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.tmpdir = tempfile.mkdtemp()
+        path = os.path.join(cls.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            json.dump({"connections": []}, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+        os.environ.pop("WEBSH_CONFIG", None)
+        import shutil
+        shutil.rmtree(cls.tmpdir)
+
+    def setUp(self):
+        server._rate_limits.clear()
+        self._sessions_snapshot = dict(server.sessions)
+        server.sessions.clear()
+        self._orig_cap = server.MAX_SESSIONS_PER_IP
+        self._orig_settle = server.CONNECT_SETTLE_TIME
+        # The settle sleep is post-spawn and serializes the response;
+        # zero it so we don't wait 0.5s per request needlessly.
+        server.CONNECT_SETTLE_TIME = 0
+        # Allow plenty of rate-limit budget — we fire cap+5 in one
+        # window. Default RATE_LIMIT_MAX is 50 which is fine, but be
+        # explicit.
+        self._orig_rate_max = server.RATE_LIMIT_MAX
+        server.RATE_LIMIT_MAX = 100
+        self._orig_session_cls = server.SSHSession
+        # Reuse the HTTP-tests stub but with a 50 ms spawn_delay to
+        # widen the race window the gate is meant to close.
+        server.SSHSession = _make_stub_session_cls(spawn_delay=0.05)
+
+    def tearDown(self):
+        server.sessions.clear()
+        server.sessions.update(self._sessions_snapshot)
+        server.MAX_SESSIONS_PER_IP = self._orig_cap
+        server.CONNECT_SETTLE_TIME = self._orig_settle
+        server.RATE_LIMIT_MAX = self._orig_rate_max
+        server.SSHSession = self._orig_session_cls
+
+    def _post(self):
+        from urllib.request import urlopen, Request
+        url = "http://127.0.0.1:{}/api/connect".format(self.port)
+        body = json.dumps({"host": "ignored.example", "username": "u",
+                           "password": "p", "cols": 80, "rows": 24}).encode("utf-8")
+        req = Request(url, data=body,
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=10)
+            return resp.getcode(), json.loads(resp.read().decode("utf-8"))
+        except Exception as e:
+            if hasattr(e, "read") and hasattr(e, "code"):
+                try:
+                    return e.code, json.loads(e.read().decode("utf-8"))
+                except Exception:
+                    return e.code, {}
+            raise
+
+    def test_concurrent_connects_respect_cap(self):
+        from concurrent.futures import ThreadPoolExecutor
+        cap = 3
+        burst = cap + 5
+        server.MAX_SESSIONS_PER_IP = cap
+
+        with ThreadPoolExecutor(max_workers=burst) as pool:
+            futures = [pool.submit(self._post) for _ in range(burst)]
+            results = [f.result() for f in futures]
+
+        codes = [code for code, _ in results]
+        ok = [r for r in results if 200 <= r[0] < 300]
+        rate_limited = [r for r in results
+                        if r[0] == 429
+                        and "from your IP" in r[1].get("error", "")]
+
+        self.assertEqual(
+            len(ok), cap,
+            "expected exactly cap={} successful connects, got {} (codes: {})".format(
+                cap, len(ok), codes))
+        self.assertEqual(
+            len(rate_limited), burst - cap,
+            "expected exactly {} per-IP 429s, got {} (codes: {})".format(
+                burst - cap, len(rate_limited), codes))
+        # And no other failure modes — every response must have been
+        # accounted for above.
+        self.assertEqual(len(ok) + len(rate_limited), burst,
+                         "unexpected response codes: {}".format(codes))
 
 
 class TestUUIDValidation(unittest.TestCase):
@@ -1567,6 +2038,79 @@ class TestIntEnv(unittest.TestCase):
 
     def test_missing(self):
         self.assertEqual(server._int_env("_TEST_MISSING_XYZ", "99"), 99)
+
+
+class TestPerIpMisconfigWarn(unittest.TestCase):
+    """Issue 7: warn when MAX_SESSIONS_PER_IP is set so high it can
+    never trip — the operator is paying the per-session inventory cost
+    for a gate that's effectively dead code."""
+
+    def setUp(self):
+        self._orig_per_ip = server.MAX_SESSIONS_PER_IP
+        self._orig_max = server.MAX_SESSIONS
+        self._orig_bg = server.MAX_BG_SESSIONS
+
+    def tearDown(self):
+        server.MAX_SESSIONS_PER_IP = self._orig_per_ip
+        server.MAX_SESSIONS = self._orig_max
+        server.MAX_BG_SESSIONS = self._orig_bg
+
+    def test_warns_when_at_or_above_global_max(self):
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_SESSIONS_PER_IP = 50  # exactly at the threshold
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertTrue(mock_log.called)
+        level, msg = mock_log.call_args[0][0], mock_log.call_args[0][1]
+        self.assertEqual(level, "WARN")
+        self.assertIn("MAX_SESSIONS_PER_IP=50", msg)
+        self.assertIn("never", msg.lower())
+
+    def test_warns_when_above_global_max(self):
+        server.MAX_SESSIONS = 30
+        server.MAX_BG_SESSIONS = 20
+        server.MAX_SESSIONS_PER_IP = 100
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertTrue(mock_log.called)
+        self.assertEqual(mock_log.call_args[0][0], "WARN")
+
+    def test_silent_when_strictly_below_global_max(self):
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_SESSIONS_PER_IP = 5
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertFalse(
+            mock_log.called,
+            "no WARN expected for a normally-configured per-IP cap")
+
+    def test_silent_when_disabled(self):
+        # 0 is the documented "off" sentinel — must not warn.
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_SESSIONS_PER_IP = 0
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertFalse(mock_log.called)
+
+    def test_threshold_uses_max_of_global_caps(self):
+        # If MAX_SESSIONS is small but MAX_BG_SESSIONS is large, the
+        # threshold is the larger of the two — only above that does
+        # the per-IP cap become dead.
+        server.MAX_SESSIONS = 10
+        server.MAX_BG_SESSIONS = 100
+        # Below the larger cap → no warn.
+        server.MAX_SESSIONS_PER_IP = 50
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertFalse(mock_log.called)
+        # At the larger cap → warn.
+        server.MAX_SESSIONS_PER_IP = 100
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_per_ip_misconfig()
+        self.assertTrue(mock_log.called)
 
 
 # ── Input validation regexes (slot_id, tmux_cmd) ───────────────────────

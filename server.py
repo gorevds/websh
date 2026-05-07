@@ -108,6 +108,10 @@ PORT = _int_env("PORT", "8765")
 HOST = os.environ.get("HOST", "127.0.0.1")
 SESSION_TIMEOUT = _int_env("SESSION_TIMEOUT", "300")
 MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
+# Per-source-IP active session cap. 0 disables the check (preserve legacy
+# behaviour). Counts foreground and background sessions together, since
+# an abuser holding N sessions does not care about the classification.
+MAX_SESSIONS_PER_IP = _int_env("MAX_SESSIONS_PER_IP", "0")
 MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "50")
 # Hard cap on a single binary upload via /api/upload (bytes).
 MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
@@ -399,6 +403,63 @@ def _check_rate_limit(ip):
         times.append(now)
         _rate_limits[ip] = times
         return True
+
+
+def _per_ip_session_count(ip):
+    """Count active sessions opened from `ip`. Caller MUST hold sessions_lock.
+
+    Counts both foreground and background sessions together — for the
+    purposes of the MAX_SESSIONS_PER_IP gate, an abuser holding N total
+    sessions is the threat we're guarding against, regardless of how
+    they're tagged internally. Placeholders (slots reserved for an
+    in-flight `_connect` whose ssh has not yet been spawned) are counted
+    too — the whole point of the placeholder is to make the gate
+    race-free against concurrent connects from the same IP.
+    """
+    if not ip:
+        return 0
+    return sum(1 for s in sessions.values()
+               if getattr(s, "client_ip", None) == ip)
+
+
+class _SessionPlaceholder(object):
+    """Reserved slot in the `sessions` registry while `_connect` spawns ssh.
+
+    `_connect` runs the per-IP / global session-count gates inside
+    sessions_lock, then releases the lock to spawn ssh (pty.fork is
+    wall-clock-slow), then re-acquires the lock to insert the real
+    Session. Without a placeholder, N concurrent connects from the same
+    IP all see `count == cap-1`, all pass the gate, and all spawn ssh —
+    blowing past the cap by N-1. Inserting a placeholder under the gate
+    lock gives later connects a count that includes the in-flight ones.
+
+    Stubs `is_expired()` / `close()` so the cleanup loop and shutdown
+    handler can iterate `sessions.values()` without special-casing
+    placeholders. They live for at most a connect's worth of time —
+    longer-lived consumers will only ever see real Sessions.
+    """
+
+    __slots__ = ("client_ip", "is_background", "persistent")
+
+    def __init__(self, client_ip, is_background):
+        self.client_ip = client_ip
+        self.is_background = is_background
+        # cleanup() and other paths may inspect `.persistent`; placeholders
+        # are never persistent regardless of the caller's intent — the
+        # real Session takes over before the user sees the slot_id.
+        self.persistent = False
+
+    def is_expired(self):
+        # A placeholder never expires on its own — _connect's swap-or-pop
+        # is what removes it. SESSION_TIMEOUT is in the minute range
+        # while a connect lasts at most a few seconds, so this is moot in
+        # practice but lets cleanup() iterate without an isinstance check.
+        return False
+
+    def close(self):
+        # Shutdown handler iterates and calls close() on every session.
+        # A placeholder owns no fds or subprocesses — nothing to release.
+        pass
 
 
 # ─── Config file ────────────────────────────────────────────────────
@@ -702,8 +763,12 @@ class SSHSession(object):
     def __init__(self, session_id, host, port, username, password, cols, rows,
                  key=None, ssh_options=None, is_background=False,
                  persistent=False, slot_id=None, tmux_cmd="tmux",
-                 tmux_options=None):
+                 tmux_options=None, client_ip=None):
         self.id = session_id
+        # Source IP that opened this session — kept here only so the
+        # MAX_SESSIONS_PER_IP gate can iterate the registry and count.
+        # Not used for any auth or routing decision.
+        self.client_ip = client_ip
         self.master_fd = None
         self.pid = None
         self.output_buf = b""
@@ -1881,11 +1946,34 @@ class Handler(BaseHTTPRequestHandler):
     # ── Handlers ──
 
     def _client_ip(self):
+        """Return the IP we treat as the request's source for rate-limit
+        and per-IP-cap purposes.
+
+        Uses the TCP peer by default. When the peer is in TRUSTED_PROXIES
+        we read the FIRST X-Forwarded-For token — but only if it parses
+        as a valid IP literal. Anything else (typo, intentional garbage,
+        an injected oversized blob) falls back to the peer.
+
+        Important: when running behind a reverse proxy, the proxy MUST
+        OVERWRITE this header (`proxy_set_header X-Forwarded-For $remote_addr;`
+        on nginx, or use X-Real-IP), not append to it. A proxy that
+        appends lets a client put any IP they like in the first token,
+        bypassing per-IP rate-limiting and the per-IP session cap. The
+        ip_address() validation here only stops obvious garbage and
+        attacker-controlled non-IP bytes from ending up as the registry
+        comparison key — it does NOT compensate for an appending proxy.
+        """
         peer = self.client_address[0]
         if peer in _TRUSTED_PROXIES:
             xff = self.headers.get("X-Forwarded-For", "")
             if xff:
-                return xff.split(",")[0].strip()
+                token = xff.split(",", 1)[0].strip()
+                if token:
+                    try:
+                        ipaddress.ip_address(token)
+                    except ValueError:
+                        return peer
+                    return token
         return peer
 
     def _valid_sid(self, sid):
@@ -1983,8 +2071,31 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "connections to this host are not allowed"}, 403)
             return
 
-        # Check session limit (foreground and background counted separately)
+        # Check session limits and reserve a counted slot atomically.
+        # Per-IP cap (if enabled) runs first so a single abuser cannot
+        # starve everyone else by holding all the global slots. fg/bg
+        # are counted separately for the global caps (a file-transfer
+        # side channel should not push a user out of an interactive
+        # session and vice versa) but they share the per-IP bucket —
+        # abuse is abuse regardless of classification.
+        #
+        # We insert a _SessionPlaceholder under the gate lock and only
+        # then drop it to spawn ssh (which is wall-clock-slow). The next
+        # connect from the same IP / class observes a count that
+        # includes this in-flight slot, closing the TOCTOU window where
+        # N concurrent connects all observed `count == cap-1` and all
+        # passed the gate. Either we swap the placeholder for the real
+        # Session on success, or pop it on failure.
+        sid = str(uuid.uuid4())
         with sessions_lock:
+            if MAX_SESSIONS_PER_IP > 0:
+                per_ip = _per_ip_session_count(ip)
+                if per_ip >= MAX_SESSIONS_PER_IP:
+                    _log("WARN", "per-IP session cap hit: ip={} count={}".format(
+                        ip, per_ip))
+                    self._json({"error": "too many active sessions from your IP"},
+                               429)
+                    return
             if is_bg:
                 count = sum(1 for s in sessions.values() if s.is_background)
                 if count >= MAX_BG_SESSIONS:
@@ -1996,8 +2107,9 @@ class Handler(BaseHTTPRequestHandler):
                 if count >= MAX_SESSIONS:
                     self._json({"error": "too many active sessions"}, 429)
                     return
+            sessions[sid] = _SessionPlaceholder(client_ip=ip,
+                                                is_background=is_bg)
 
-        sid = str(uuid.uuid4())
         session = None
         try:
             session = SSHSession(
@@ -2015,8 +2127,12 @@ class Handler(BaseHTTPRequestHandler):
                 slot_id=slot_id,
                 tmux_cmd=tmux_cmd,
                 tmux_options=tmux_options,
+                client_ip=ip,
             )
             with sessions_lock:
+                # Swap placeholder for the real Session. The slot was
+                # already counted under the gate lock, so this never
+                # bumps any cap.
                 sessions[sid] = session
 
             time.sleep(CONNECT_SETTLE_TIME)
@@ -2033,8 +2149,20 @@ class Handler(BaseHTTPRequestHandler):
                 "tmux_cmd": session.tmux_cmd,
             })
         except Exception as e:
-            if session:
+            # Spawn failed before the swap. Pop the placeholder so it
+            # does not occupy a counted slot forever, and (if the real
+            # Session was constructed but registry insert raised) close
+            # it. The pop is best-effort: if the swap above already ran
+            # and a later step raised, we'd be popping the real Session
+            # — that's fine, close() below releases its resources.
+            with sessions_lock:
+                stale = sessions.pop(sid, None)
+            if session is not None:
                 session.close()
+            elif stale is not None and hasattr(stale, "close"):
+                # Placeholder pop — no-op close() but keep the call
+                # symmetric with the real-session branch.
+                stale.close()
             self._json({"error": str(e)}, 500)
 
     def _input(self):
@@ -2683,7 +2811,36 @@ class Server(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
+def _warn_per_ip_misconfig():
+    """Emit a WARN when MAX_SESSIONS_PER_IP cannot ever trip.
+
+    The per-IP cap only matters when it is strictly tighter than the
+    global caps. If it is set to (or above) max(MAX_SESSIONS,
+    MAX_BG_SESSIONS), a single IP exhausting the global pool already
+    hits the global 429 first — the per-IP gate becomes dead code and
+    the operator is paying the inventory cost (the iteration in
+    _per_ip_session_count, the per-session client_ip attribute) for
+    no benefit. Most likely they intended a smaller value and should
+    lower it.
+
+    Module-level WARN lets a one-time misconfiguration surface at
+    startup; we deliberately avoid raising or refusing to start since
+    the existing default (0 = disabled) and any positive value short of
+    the threshold are valid configurations.
+    """
+    if MAX_SESSIONS_PER_IP <= 0:
+        return
+    threshold = max(MAX_SESSIONS, MAX_BG_SESSIONS)
+    if MAX_SESSIONS_PER_IP >= threshold:
+        _log("WARN", ("MAX_SESSIONS_PER_IP={} is >= max(MAX_SESSIONS={}, "
+                      "MAX_BG_SESSIONS={}); the per-IP cap will never "
+                      "trip — a single client hits the global cap first. "
+                      "Lower MAX_SESSIONS_PER_IP to take effect.").format(
+            MAX_SESSIONS_PER_IP, MAX_SESSIONS, MAX_BG_SESSIONS))
+
+
 def main():
+    _warn_per_ip_misconfig()
     # Start background cleanup thread
     t = Thread(target=_cleanup_loop, daemon=True)
     t.start()
