@@ -1,6 +1,8 @@
 # <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"></picture> websh
 
-Lightweight but powerful web-based SSH terminal.
+**English** | [Русский](README.ru.md)
+
+Lite but powerful web-based SSH terminal.
 
 - 📦 **No build step, no server dependencies**
 - 🌐 **Plain HTTP, no WebSocket**
