@@ -4,6 +4,7 @@
 import base64
 import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
@@ -13,10 +14,30 @@ import time
 import unittest
 import unittest.mock
 import uuid
+import weakref
 
 # Import server module
 sys.path.insert(0, os.path.dirname(__file__))
 import server
+
+
+class _FakeNotifyMixin(object):
+    """Mixin for in-test fake sessions: provides the surface that the
+    real Session.wait_for_data + _signal contract expects, but as a
+    cheap no-op. Tests that need to exercise the real signal-then-wake
+    path use Session itself (see TestSessionNotify); fakes here are
+    for higher-level protocol tests where the wait helper just needs
+    to not blow up and let the loop tick forward."""
+    _notify_r = None
+    _notify_w = None
+
+    def _signal(self):
+        pass
+
+    def wait_for_data(self, client_socket, timeout, selector=None):
+        # Mirror Session.wait_for_data's notify_r=None fallback so
+        # the protocol-level loop progresses without busy-spinning.
+        time.sleep(min(timeout, 0.01))
 
 
 class TestClamp(unittest.TestCase):
@@ -494,7 +515,7 @@ class TestHTTPApi(unittest.TestCase):
         import http.client
         sid = str(uuid.uuid4())
 
-        class FakeSession:
+        class FakeSession(_FakeNotifyMixin):
             def __init__(self, echo_off=False):
                 self.alive = True
                 self.auth_failed = False
@@ -572,7 +593,7 @@ class TestHTTPApi(unittest.TestCase):
         import http.client
         sid = str(uuid.uuid4())
 
-        class IdleSession:
+        class IdleSession(_FakeNotifyMixin):
             def __init__(self):
                 self.alive = True
                 self.auth_failed = False
@@ -627,7 +648,7 @@ class TestHTTPApi(unittest.TestCase):
         import http.client
         sid = str(uuid.uuid4())
 
-        class FakeSession:
+        class FakeSession(_FakeNotifyMixin):
             def __init__(self):
                 self.alive = True
                 self.auth_failed = False
@@ -682,7 +703,7 @@ class TestHTTPApi(unittest.TestCase):
 
         # Real-ish session: holds bytes in output_buf under buf_lock and
         # supports the same read()/unread() contract as SSHSession.
-        class Sess:
+        class Sess(_FakeNotifyMixin):
             def __init__(self):
                 self.alive = True
                 self.auth_failed = False
@@ -1326,6 +1347,246 @@ class TestEchoOffHint(unittest.TestCase):
         prompt = b"\n[sudo] password for alexey: "
         s._recent_tail = (s._recent_tail + prompt)[-cap:]
         self.assertTrue(s.echo_off_hint())
+
+
+# ── Notification-pipe wait machinery ───────────────────────────────────
+# _stream and _output used to busy-poll session.read() at 100 Hz via
+# time.sleep(POLL_INTERVAL). They now park in Session.wait_for_data(),
+# which selectors-blocks on (notify_pipe, client_socket) until the PTY
+# reader signals new data, the client closes, or a deadline elapses.
+# Latency drops from ~5 ms median (POLL_INTERVAL/2) to scheduler jitter,
+# and idle sessions stop spinning a 100 Hz wakeup loop.
+
+@unittest.skipUnless(server._HAVE_SELECTABLE_PIPES,
+                     "notification pipe requires POSIX selectors")
+class TestSessionNotify(unittest.TestCase):
+
+    def _fake(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = threading.Lock()
+        s.alive = True
+        s.output_buf = b""
+        s._recent_tail = b""
+        s.last_activity = time.time()
+        s.master_fd = None
+        s.pid = None
+        s._key_file = None
+        s._control_path = None
+        s._notify_r, s._notify_w = os.pipe()
+        os.set_blocking(s._notify_r, False)
+        os.set_blocking(s._notify_w, False)
+        return s
+
+    def _close_pipe(self, s):
+        for attr in ("_notify_r", "_notify_w"):
+            fd = getattr(s, attr, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(s, attr, None)
+
+    def test_signal_then_wait_returns_immediately(self):
+        s = self._fake()
+        try:
+            s._signal()
+            t0 = time.time()
+            s.wait_for_data(None, timeout=2.0)
+            elapsed = time.time() - t0
+            self.assertLess(elapsed, 0.05,
+                "wait should return immediately on pre-existing signal; "
+                "took {:.1f} ms".format(elapsed * 1000))
+        finally:
+            self._close_pipe(s)
+
+    def test_wait_blocks_full_timeout_when_unsignaled(self):
+        s = self._fake()
+        try:
+            t0 = time.time()
+            s.wait_for_data(None, timeout=0.1)
+            elapsed = time.time() - t0
+            self.assertGreaterEqual(elapsed, 0.05,
+                "wait must actually block, not spin; elapsed {:.1f} ms"
+                .format(elapsed * 1000))
+            self.assertLess(elapsed, 0.30,
+                "wait shouldn't overshoot; elapsed {:.1f} ms"
+                .format(elapsed * 1000))
+        finally:
+            self._close_pipe(s)
+
+    def test_cross_thread_signal_wakes_within_milliseconds(self):
+        """Producer thread signals after a short delay; consumer parked
+        in wait_for_data() must wake within tens of ms — this is the
+        whole point of the refactor (replaces ~5 ms busy-poll latency)."""
+        s = self._fake()
+        try:
+            feed_time = []
+
+            def producer():
+                time.sleep(0.05)
+                feed_time.append(time.time())
+                s._signal()
+
+            threading.Thread(target=producer, daemon=True).start()
+            t0 = time.time()
+            s.wait_for_data(None, timeout=2.0)
+            wakeup = time.time()
+            self.assertEqual(len(feed_time), 1)
+            latency_ms = (wakeup - feed_time[0]) * 1000
+            self.assertLess(latency_ms, 30,
+                "signal->wakeup latency too high: {:.1f} ms (target <5 ms, "
+                "30 ms is the CI-flake margin)".format(latency_ms))
+            self.assertGreaterEqual(wakeup - t0, 0.04,
+                "consumer woke before producer signaled — false wakeup?")
+        finally:
+            self._close_pipe(s)
+
+    def test_repeated_signals_coalesce(self):
+        """100 K signals on an undrained pipe must not block, raise, or
+        leave the pipe in a state where wait_for_data spuriously fires."""
+        s = self._fake()
+        try:
+            for _ in range(100000):
+                s._signal()
+            # First wait sees the existing signals — should drain them.
+            t0 = time.time()
+            s.wait_for_data(None, timeout=2.0)
+            self.assertLess(time.time() - t0, 0.10)
+            # Second wait must actually block (drain emptied the pipe).
+            t0 = time.time()
+            s.wait_for_data(None, timeout=0.1)
+            self.assertGreaterEqual(time.time() - t0, 0.05)
+        finally:
+            self._close_pipe(s)
+
+    def test_wait_returns_when_client_socket_has_fin(self):
+        """The selector also watches the client socket so a peer FIN
+        wakes the consumer immediately instead of waiting on the
+        keepalive deadline. We simulate FIN by half-closing one end of
+        a socketpair and passing the other to wait_for_data."""
+        import socket
+        a, b = socket.socketpair()
+        s = self._fake()
+        try:
+            b.shutdown(socket.SHUT_WR)
+            t0 = time.time()
+            s.wait_for_data(a, timeout=2.0)
+            elapsed = time.time() - t0
+            self.assertLess(elapsed, 0.10,
+                "FIN must wake wait_for_data; took {:.1f} ms"
+                .format(elapsed * 1000))
+        finally:
+            a.close()
+            b.close()
+            self._close_pipe(s)
+
+    def test_signal_after_pipe_torn_down_is_noop(self):
+        """close() may race with another thread calling _signal — the
+        signal must absorb EBADF rather than crashing the reader."""
+        s = self._fake()
+        self._close_pipe(s)
+        s._signal()
+        s._signal()  # idempotent
+
+    def test_wait_after_pipe_torn_down_falls_back(self):
+        """After teardown, wait_for_data falls back to a brief sleep
+        instead of spinning at selector-error rate."""
+        s = self._fake()
+        self._close_pipe(s)
+        t0 = time.time()
+        s.wait_for_data(None, timeout=0.5)
+        elapsed = time.time() - t0
+        self.assertLess(elapsed, 0.10,
+            "torn-down pipe must short-circuit the wait; elapsed {:.1f} ms"
+            .format(elapsed * 1000))
+
+    def test_zero_timeout_returns_immediately(self):
+        s = self._fake()
+        try:
+            t0 = time.time()
+            s.wait_for_data(None, timeout=0)
+            self.assertLess(time.time() - t0, 0.01)
+        finally:
+            self._close_pipe(s)
+
+    def test_pipe_fds_closed_by_finalizer(self):
+        """Pipe fds are NOT closed in Session.close() — they're tied to
+        Session GC via weakref.finalize. This closes the fd-reuse race
+        where a reader thread's _signal() could land in a freshly-
+        allocated unrelated fd. The price is a brief leak between
+        close() and the next GC pass; verify here that GC actually
+        does close them."""
+        import gc
+        # Build a real Session (skipping __init__'s ssh-spawn) so the
+        # finalizer is registered. _fake() doesn't register one because
+        # it bypasses __init__.
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = threading.Lock()
+        s.alive = True
+        s.output_buf = b""
+        s._recent_tail = b""
+        s.last_activity = time.time()
+        s.master_fd = None
+        s.pid = None
+        s._key_file = None
+        s._control_path = None
+        s._notify_r, s._notify_w = os.pipe()
+        os.set_blocking(s._notify_r, False)
+        os.set_blocking(s._notify_w, False)
+        weakref.finalize(s, server._close_pipe_fds,
+                         s._notify_r, s._notify_w)
+        r, w = s._notify_r, s._notify_w
+        # Both fds should be open right now.
+        os.fstat(r); os.fstat(w)
+        # Drop the only reference and force collection.
+        del s
+        gc.collect()
+        # Finalizer should have closed both fds.
+        with self.assertRaises(OSError):
+            os.fstat(r)
+        with self.assertRaises(OSError):
+            os.fstat(w)
+
+    def test_wait_with_cached_selector_fast_path(self):
+        """Hot-loop scenario: caller pre-builds a selector with notify_r
+        registered and reuses it across many wait_for_data calls. This
+        avoids per-call epoll_create1+ctl+close overhead. Verify the
+        wakeup contract still holds when this path is exercised."""
+        s = self._fake()
+        try:
+            with selectors.DefaultSelector() as sel:
+                sel.register(s._notify_r, selectors.EVENT_READ)
+                # Pre-existing signal: cached selector path drains the
+                # pipe and returns immediately, just like the one-shot
+                # path.
+                s._signal()
+                t0 = time.time()
+                s.wait_for_data(None, timeout=2.0, selector=sel)
+                self.assertLess(time.time() - t0, 0.05)
+                # Drained by previous wait → next wait must block.
+                t0 = time.time()
+                s.wait_for_data(None, timeout=0.1, selector=sel)
+                self.assertGreaterEqual(time.time() - t0, 0.05)
+                # And cross-thread signal still wakes it up via the
+                # cached selector.
+                feed_time = []
+
+                def producer():
+                    time.sleep(0.05)
+                    feed_time.append(time.time())
+                    s._signal()
+
+                threading.Thread(target=producer, daemon=True).start()
+                t0 = time.time()
+                s.wait_for_data(None, timeout=2.0, selector=sel)
+                self.assertEqual(len(feed_time), 1)
+                latency_ms = (time.time() - feed_time[0]) * 1000
+                self.assertLess(latency_ms, 30,
+                    "cached-selector signal->wakeup: {:.1f} ms"
+                    .format(latency_ms))
+        finally:
+            self._close_pipe(s)
 
 
 # ── HTTP-level validation of slot_id + tmux_cmd ────────────────────────
