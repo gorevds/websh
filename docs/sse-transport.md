@@ -262,6 +262,41 @@ anything from 5 s to 5 minutes of elapsed time. A wall-clock budget
 maps directly to "how long do I expect this network blip to last",
 which is the actual question.
 
+### How `_stream` and `_output` wait for new bytes
+
+Both endpoints are long-running, blocking calls that must wake up the
+moment the PTY produces output. They used to do this with a
+`time.sleep(POLL_INTERVAL=0.01)` busy-poll inside the loop, which is
+simple but wastes CPU on idle sessions and adds a fixed ~5 ms median
+latency to every byte (half of `POLL_INTERVAL`).
+
+The current shape: each `Session` owns a non-blocking `os.pipe()`. The
+PTY reader writes one byte to the write end after every `output_buf`
+update. Consumers (`_stream`, `_output`) park in
+`Session.wait_for_data()`, which drives a `selectors.DefaultSelector`
+on `(notify_pipe, client_socket)` with a timeout = next-keepalive
+deadline. Wakeups happen exactly when something interesting does:
+new bytes from the PTY (signal arrived), client closed the connection
+(socket readable + FIN), or the keepalive cadence fires.
+
+`Handler` builds the selector once per request via
+`_build_session_selector` and reuses it across every loop iteration —
+that avoids paying `epoll_create1` + `epoll_ctl` + `close` on each
+wakeup.
+
+Two pieces stay subtle. (a) Pipe fds are released by
+`weakref.finalize`, NOT in `Session.close()`. Closing them on
+teardown opens a real fd-reuse race where a reader thread's signal
+between snapshot of `self._notify_w` and the `os.write()` syscall
+could land a stray byte in a freshly-allocated unrelated fd. Tying
+fd lifetime to garbage collection means the pipe stays valid as long
+as anyone holds a Session reference, and is closed only after the
+last consumer and the reader thread have released it. (b) Windows
+`DefaultSelector` won't accept non-socket fds, so on POSIX-only the
+machinery is active; on Windows `_HAVE_SELECTABLE_PIPES` is False
+and `wait_for_data` falls back to the legacy `time.sleep` cadence
+verbatim.
+
 ## What this means for the PR
 
 Net new code paths:
