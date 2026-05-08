@@ -235,13 +235,21 @@ function createPane(container) {
     p.resizeTimer = setTimeout(() => {
       p.resizeTimer=null;
       if(!p.sid) return;
-      // Skip if the dimensions match the last POST we made — saves a
-      // round-trip when several refit triggers converge on the same
-      // size (held-key zoom past the cap, ResizeObserver echo, etc.).
+      // Skip if the dimensions match what the server has already
+      // confirmed receiving — saves a round-trip when several refit
+      // triggers converge on the same size (held-key zoom past the
+      // cap, ResizeObserver echo, etc.). Commit-on-success: the
+      // lastSent fields are only updated after the POST resolves,
+      // so a failed POST naturally retries on the next refit. See
+      // flushPaneResize for the rationale.
       if(p.lastSentCols === size.cols && p.lastSentRows === size.rows) return;
-      p.lastSentCols = size.cols;
-      p.lastSentRows = size.rows;
-      api('resize',{body:{session_id:p.sid,cols:size.cols,rows:size.rows}}).catch(() => {});
+      api('resize',{body:{session_id:p.sid,cols:size.cols,rows:size.rows}})
+        .then(r => {
+          if (r && r.error) return;
+          p.lastSentCols = size.cols;
+          p.lastSentRows = size.rows;
+        })
+        .catch(() => { /* leave lastSent alone so the next refit retries */ });
     }, 150);
   });
   term.onSelectionChange(() => {
@@ -2602,22 +2610,34 @@ function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=
 // 150ms debounce window in term.onResize.
 //
 // Dedup guard: skip the POST when (cols,rows) matches the last value
-// we sent. Two real cases hit this:
+// the server has confirmed receiving. Two real cases hit this:
 //   - applySettings schedules its own RAF AND waitForFontThenRefresh
 //     schedules an inner RAF. Both call this. The second is a no-op
 //     because dims have settled.
 //   - held Ctrl+= autorepeat past the fontSize cap (32) — fontSize
 //     stops changing, dims stop changing, every additional keystroke
 //     would otherwise re-POST the same value 30 times/sec.
+//
+// Commit-on-success: lastSentCols/Rows are updated only after the POST
+// resolves cleanly. Network failure (rejection), business error (e.g.
+// 404 session not found), or any non-JSON response leaves lastSent
+// untouched, so the next refit will retry against the actual server
+// state. Without this discipline, a swallowed POST failure silently
+// desynced client and server until the user happened to resize to a
+// DIFFERENT value — exactly the right-edge-overflow class of bug
+// commit 7738ed1 was meant to eliminate.
 function flushPaneResize(p) {
   if (!p || !p.sid) return;
   let cols = p.term.cols, rows = p.term.rows;
   if (p.lastSentCols === cols && p.lastSentRows === rows) return;
   if (p.resizeTimer) { clearTimeout(p.resizeTimer); p.resizeTimer = null; }
-  p.lastSentCols = cols;
-  p.lastSentRows = rows;
-  api('resize', {body: {session_id: p.sid,
-                          cols: cols, rows: rows}}).catch(() => {});
+  api('resize', {body: {session_id: p.sid, cols: cols, rows: rows}})
+    .then(r => {
+      if (r && r.error) return;
+      p.lastSentCols = cols;
+      p.lastSentRows = rows;
+    })
+    .catch(() => { /* leave lastSent alone so the next refit retries */ });
 }
 
 // applySettings(opts):
