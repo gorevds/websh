@@ -187,7 +187,6 @@ function createPane(container) {
   term.unicode.activeVersion = '11';
   term.loadAddon(search);
   term.open(termEl);
-  waitForFontThenRefresh(term, fit);
 
   let p = {
     id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
@@ -201,6 +200,9 @@ function createPane(container) {
     connectedAt:0 // ms timestamp of last successful /api/connect resolve
   };
   panes[id] = p;
+  // Schedule a font-load-aware refit after registration so the helper
+  // can guard its RAF against pane teardown via panes[id] lookup.
+  waitForFontThenRefresh(term, fit, p);
 
   // Focus tracking
   el.addEventListener('mousedown', () => { activatePane(id) });
@@ -912,24 +914,28 @@ document.addEventListener('visibilitychange', () => {
   if (hiddenFor < VISIBILITY_PROBE_THRESHOLD_MS) return;
   Object.values(panes).forEach(p => {
     if (!p || !p.sid || !p.polling) return;
-    // Refit before touching transports — the window may have been
-    // resized while the tab was hidden (external monitor plugged in,
-    // user dragged the window) and ResizeObserver is allowed by spec
-    // to skip notifications for off-screen elements. A reconnect on
-    // stale cols/rows lets the shell format lines for the wrong width
-    // until the next layout event. Fit is cheap and idempotent when
-    // the size hasn't actually changed.
-    try { p.fitAddon.fit(); } catch(e){}
-    // Long-poll panes don't need the SSE kick: fetch isn't frozen the
+    // Defer everything to the next frame so:
+    //   1) the refit reads fresh cell metrics — same RAF rationale as
+    //      applySettings (background tabs don't run layout, so xterm
+    //      and the webfont rasteriser may need a fresh paint pass);
+    //   2) the post-fit /api/resize lands BEFORE the new SSE stream
+    //      opens, so the server's PTY is the right size when the
+    //      shell next prints.
+    // Long-poll panes don't need the SSE kick (fetch isn't frozen the
     // way EventSource is in a backgrounded tab, the existing pollOutput
-    // recursion keeps running across the freeze. Worse, kicking it
-    // would stack a second pollOutput chain on top of the in-flight
-    // one — both call session.read() server-side (destructive) and
-    // bytes get split between responses, garbling output.
-    if (p.sseDisabled) return;
-    closeStream(p);
-    clearRetryClock(p);
-    startOutput(p);
+    // recursion keeps running across the freeze; double-firing would
+    // stack a second poll chain and garble output via destructive
+    // session.read() races). They DO benefit from the refit, though,
+    // since the window may have changed size while we were hidden.
+    requestAnimationFrame(() => {
+      if (panes[p.id] !== p) return;
+      try { p.fitAddon.fit(); } catch(e){}
+      flushPaneResize(p);
+      if (p.sseDisabled) return;
+      closeStream(p);
+      clearRetryClock(p);
+      startOutput(p);
+    });
   });
 });
 
@@ -2555,7 +2561,40 @@ document.addEventListener('keydown', e => {
 // ── Zoom ────────────────────────────────────────────────────────────
 function zoomIn(){ settings.fontSize=Math.min(settings.fontSize+2,32); fontSize=settings.fontSize; saveSettings(); applySettings(); }
 function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=settings.fontSize; saveSettings(); applySettings(); }
-function applySettings(){
+// Cancel any pending /api/resize debounce and post the current xterm
+// dimensions to the server immediately. Used after a programmatic
+// refit when we want the server to learn the new geometry without the
+// 150ms debounce window in term.onResize. No-op when the pane has no
+// session id yet (initial-fit path during pane creation).
+function flushPaneResize(p) {
+  if (!p || !p.sid) return;
+  if (p.resizeTimer) { clearTimeout(p.resizeTimer); p.resizeTimer = null; }
+  api('resize', {body: {session_id: p.sid,
+                          cols: p.term.cols, rows: p.term.rows}}).catch(() => {});
+}
+
+// applySettings(opts):
+//   forceFlush=true  (default — discrete user intent: zoom hotkey,
+//                     reset, font select)  → bypass term.onResize
+//                     150ms debounce, post /api/resize immediately.
+//   forceFlush=false (continuous input: slider drag in Options)
+//                     → let the existing term.onResize debounce
+//                     coalesce a burst of mutations into one POST.
+//
+// Why the RAF: xterm v5's CharSizeService measures cell width
+// synchronously when fontSize changes (offsetWidth forces a layout),
+// so xterm itself is not the cause of stale cols. The bug we fix is
+// (a) webfont rasterisation lag — for a webfont not yet rendered at
+// the new size, the glyph metric the browser hands to xterm can lag
+// the visible glyph by one frame; and (b) applySettings mutates five
+// options back-to-back (fontSize, fontWeight, fontWeightBold,
+// lineHeight, fontFamily) and each one re-fires the measure cascade.
+// One animation frame after the last mutation, layout has settled and
+// the webfont is laid out at its new size, so fit() reads stable
+// metrics and proposeDimensions returns the correct cols.
+function applySettings(opts){
+  opts = opts || {};
+  let forceFlush = opts.forceFlush !== false;
   let stack = fontStack(settings.font);
   Object.keys(panes).forEach(k => {
     let p = panes[k];
@@ -2565,45 +2604,41 @@ function applySettings(){
     t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
     t.options.lineHeight = settings.lineHeight;
     if (t.options.fontFamily !== stack) t.options.fontFamily = stack;
-    waitForFontThenRefresh(t, p.fitAddon);
-    // Defer fit to the next animation frame: xterm.js re-measures cell
-    // width/height asynchronously after fontSize / fontFamily changes,
-    // so a synchronous fit here uses the previous cell metrics. The
-    // resulting cols overshoots reality, /api/resize tells the server
-    // the wrong width, and the shell formats lines past the right edge
-    // until the next layout-trigger event.
+    waitForFontThenRefresh(t, p.fitAddon, forceFlush ? p : null);
     requestAnimationFrame(() => {
+      // closePane / disconnect can run between scheduling and firing;
+      // bail if the pane object was replaced or removed so we don't
+      // touch a disposed terminal or post to a freed sid.
+      if (panes[k] !== p) return;
       try { p.fitAddon.fit(); } catch(e){}
-      // Force-flush any pending /api/resize debounce so the server sees
-      // the post-zoom size immediately. Without this, fast Ctrl+=/Ctrl+-
-      // sequences leave the server holding a stale cols for up to 150ms,
-      // which is exactly long enough for the shell to print a misaligned
-      // line and nothing is repainted afterwards because the dimensions
-      // didn't change a second time.
-      if (p.resizeTimer) { clearTimeout(p.resizeTimer); p.resizeTimer = null; }
-      if (p.sid) {
-        api('resize', {body: {session_id: p.sid,
-                                cols: t.cols, rows: t.rows}}).catch(() => {});
-      }
+      if (forceFlush) flushPaneResize(p);
     });
   });
 }
-function waitForFontThenRefresh(term, fit){
+// Schedule a refit once the current settings.font's webfont is loaded.
+// Pass `p` (optional) to also force-flush /api/resize after the refit
+// — pass null when the caller doesn't want to bypass the debounce
+// (slider drag) or doesn't have a pane object yet (initial createPane).
+function waitForFontThenRefresh(term, fit, p){
   let f = FONTS[settings.font];
   let webfont = f && f[1];
   if (!webfont || !document.fonts || !document.fonts.load) return;
   document.fonts.load(`${settings.fontWeight} ${settings.fontSize}px '${webfont}'`)
     .then(() => {
-      // xterm caches glyph metrics — bump fontFamily through a throwaway value
-      // to force a re-measure once the webfont has arrived.
+      // xterm caches glyph metrics — bump fontFamily through a throwaway
+      // value so CharSizeService.measure re-runs once the webfont face
+      // is actually available at the requested size.
       let ff = term.options.fontFamily;
       term.options.fontFamily = 'monospace';
       term.options.fontFamily = ff;
-      // Same RAF rationale as applySettings(): xterm re-measures cell
-      // metrics asynchronously, so fit() must run after the next layout
-      // pass to read fresh cellWidth/cellHeight.
+      // Same RAF rationale as applySettings: defer fit one frame so
+      // layout settles after the fontFamily round-trip and the webfont
+      // is rasterised at the new size before fit reads cell metrics.
       requestAnimationFrame(() => {
+        // Pane teardown guard for the force-flush path.
+        if (p && panes[p.id] !== p) return;
         try { fit && fit.fit(); } catch(e){}
+        if (p) flushPaneResize(p);
       });
     }).catch(()=>{});
 }
@@ -2670,7 +2705,10 @@ function onOptInput(key, el, valEl, fmt){
   if (key === 'fontSize') fontSize = v;
   valEl.textContent = fmt(v);
   saveSettings();
-  applySettings();
+  // Slider 'input' fires per pixel of mouse movement — let the existing
+  // 150ms term.onResize debounce coalesce the burst into a single
+  // /api/resize POST instead of force-flushing on every step.
+  applySettings({forceFlush: false});
   renderOptPreview();
 }
 document.addEventListener('DOMContentLoaded', () => {
