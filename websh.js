@@ -187,13 +187,18 @@ function createPane(container) {
   term.unicode.activeVersion = '11';
   term.loadAddon(search);
   term.open(termEl);
-  waitForFontThenRefresh(term, fit);
 
   let p = {
     id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
     sid:null, connecting:false, polling:false, pollRetries:0,
     inputQueue:[], flushTimer:null, keepaliveTimer:null,
     label:'', resizeTimer:null, upload:null, download:null,
+    // Last (cols,rows) we POSTed to the server — used to skip duplicate
+    // /api/resize calls when several refit triggers fire in the same
+    // tick (applySettings RAF + waitForFontThenRefresh inner RAF;
+    // visibility recovery + ResizeObserver; held-key zoom autorepeat
+    // landing on the cap value).
+    lastSentCols:0, lastSentRows:0,
     // Connection identity — set once per connect, used for save/restore/reconnect.
     host:'', port:22, user:'', connection:null,
     auth:'pw', password:'', key:'', keyPass:'',
@@ -201,6 +206,9 @@ function createPane(container) {
     connectedAt:0 // ms timestamp of last successful /api/connect resolve
   };
   panes[id] = p;
+  // Schedule a font-load-aware refit after registration so the helper
+  // can guard its RAF against pane teardown via panes[id] lookup.
+  waitForFontThenRefresh(term, fit, p);
 
   // Focus tracking
   el.addEventListener('mousedown', () => { activatePane(id) });
@@ -226,7 +234,22 @@ function createPane(container) {
     if(p.resizeTimer) clearTimeout(p.resizeTimer);
     p.resizeTimer = setTimeout(() => {
       p.resizeTimer=null;
-      if(p.sid) api('resize',{body:{session_id:p.sid,cols:size.cols,rows:size.rows}}).catch(() => {});
+      if(!p.sid) return;
+      // Skip if the dimensions match what the server has already
+      // confirmed receiving — saves a round-trip when several refit
+      // triggers converge on the same size (held-key zoom past the
+      // cap, ResizeObserver echo, etc.). Commit-on-success: the
+      // lastSent fields are only updated after the POST resolves,
+      // so a failed POST naturally retries on the next refit. See
+      // flushPaneResize for the rationale.
+      if(p.lastSentCols === size.cols && p.lastSentRows === size.rows) return;
+      api('resize',{body:{session_id:p.sid,cols:size.cols,rows:size.rows}})
+        .then(r => {
+          if (r && r.error) return;
+          p.lastSentCols = size.cols;
+          p.lastSentRows = size.rows;
+        })
+        .catch(() => { /* leave lastSent alone so the next refit retries */ });
     }, 150);
   });
   term.onSelectionChange(() => {
@@ -266,9 +289,12 @@ function createPane(container) {
     }
   });
 
-  // Resize observer
+  // Resize observer fires immediately on observe() with the current
+  // container size, so the initial fit happens automatically. The
+  // older setTimeout(fit, 50) fallback is now redundant: ResizeObserver
+  // covers the cold-layout case and waitForFontThenRefresh covers the
+  // webfont-load case.
   new ResizeObserver(() => { fit.fit() }).observe(termEl);
-  setTimeout(() => { fit.fit() }, 50);
 
   return p;
 }
@@ -884,6 +910,74 @@ function closeStream(p) {
   }
 }
 
+// ── Recovery after a long absence ────────────────────────────────────
+// Background tabs get frozen by the browser (Chrome's memory saver /
+// page lifecycle freeze) after ~5 min hidden: timers stop, EventSource
+// pauses, our 30s empty-input keepalive stops going out. The server
+// reaps the PTY after SESSION_TIMEOUT idle, the SSE socket rots, but
+// EventSource doesn't always fire onerror on resume — the tab looks
+// frozen until F5. Persistent panes survive because the real shell
+// lives in tmux on the remote host; a fresh connect re-attaches by
+// slot_id. bfcache restore (Firefox/Safari Back navigation, sometimes
+// Chrome) is a sibling case: pageshow with persisted=true means the
+// page was un-bfcached; timers and EventSource state are stale.
+//
+// Strategy: on either signal — visibility return after >10s hidden,
+// or bfcache restore — refit every active pane and reopen its output
+// stream. If the server-side session is still alive, the SSE primer
+// arrives in one frame and nothing visible happens. If it was reaped,
+// the reconnect path fires and tmux brings the shell back.
+//
+// Long-poll panes don't need the SSE kick (fetch isn't frozen the way
+// EventSource is in a backgrounded tab, the existing pollOutput
+// recursion keeps running across the freeze; double-firing would
+// stack a second poll chain and garble output via destructive
+// session.read() races). They DO benefit from the refit, though,
+// since the window may have changed size while we were hidden.
+function kickPanesAfterAbsence() {
+  Object.values(panes).forEach(p => {
+    if (!p || !p.sid || !p.polling) return;
+    // Defer to the next frame so:
+    //   1) the refit reads fresh cell metrics (background tabs don't
+    //      run layout, so xterm and the webfont rasteriser may need a
+    //      fresh paint pass);
+    //   2) the post-fit /api/resize lands BEFORE the new SSE stream
+    //      opens, so the server's PTY is the right size when the
+    //      shell next prints.
+    requestAnimationFrame(() => {
+      if (panes[p.id] !== p) return;
+      try { p.fitAddon.fit(); } catch(e){}
+      flushPaneResize(p);
+      if (p.sseDisabled) return;
+      closeStream(p);
+      clearRetryClock(p);
+      startOutput(p);
+    });
+  });
+}
+
+let _lastHiddenAt = 0;
+const VISIBILITY_PROBE_THRESHOLD_MS = 10000;
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    _lastHiddenAt = Date.now();
+    return;
+  }
+  let hiddenFor = _lastHiddenAt ? (Date.now() - _lastHiddenAt) : 0;
+  _lastHiddenAt = 0;
+  if (hiddenFor < VISIBILITY_PROBE_THRESHOLD_MS) return;
+  kickPanesAfterAbsence();
+});
+
+// bfcache restore: Firefox / Safari (and Chrome since 96) cache the
+// whole page across navigations and restore it on Back. visibilitychange
+// is unreliable on this path; pageshow with event.persisted=true is
+// the canonical signal per the WICG Page Lifecycle spec.
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) kickPanesAfterAbsence();
+});
+
 // Apply one decoded JSON payload from either transport. Returns true if
 // the session ended (auth_failed / alive=false / fatal session error)
 // so callers know to stop their read loop.
@@ -978,7 +1072,16 @@ function handleOutputPayload(p, r) {
     // missing tmux binary on the target. Offer re-probe / short-lived.
     let quick = p.connectedAt && (Date.now() - p.connectedAt) < 5000;
     let tail = p.recentOutput || '';
-    let hit = /tmux: not found|tmux: command not found|No such file|command not found/i.test(tail);
+    // Cover the common shells' wordings for "tmux not installed":
+    //   bash/dash/sh:  "bash: tmux: command not found", "/bin/sh: tmux: not found"
+    //   zsh:           "zsh: command not found: tmux"
+    //   ksh:           "ksh: tmux: not found"
+    //   fish:          "Unknown command: tmux"  (literal, case-sensitive in fish)
+    //   csh/tcsh:      "tmux: Command not found." (capitalised, with period)
+    // Plus the ENOENT path: "tmux: No such file or directory" (when invoked
+    // with an explicit path that doesn't exist). Avoid matching a bare
+    // "not found" without tmux context to stay clear of unrelated errors.
+    let hit = /tmux: (?:command )?not found|command not found:?\s*tmux|tmux:\s*Command not found|Unknown command:?\s*tmux|tmux:\s*No such file/i.test(tail);
     if (p.persistent && quick && hit) {
       showTmuxBar(p, 'tmux seems missing on ' + (p.host || 'target') + '.');
     } else if (p.host || p.connection) {
@@ -1233,11 +1336,10 @@ function connectPane(p, opts) {
       p.polling = true;
       p.pollRetries = 0;
       // Force a resize so resumed tmux sessions redraw at the real size.
+      // flushPaneResize uses p.term.cols/rows post-fit and updates
+      // p.lastSent* so subsequent refit triggers can dedup.
       p.fitAddon.fit();
-      let dims = p.fitAddon.proposeDimensions();
-      let cols = (dims && dims.cols) || p.term.cols;
-      let rows = (dims && dims.rows) || p.term.rows;
-      api('resize', {body:{session_id:p.sid, cols:cols, rows:rows}}).catch(() => {});
+      flushPaneResize(p);
       startKeepalive(p);
       saveSessions();
       startOutput(p);
@@ -1317,113 +1419,6 @@ function tmuxSwitchToShortLived(id) {
   connectPane(p, {label: p.label, persistent: false});
 }
 
-// ── tmux probe ─────────────────────────────────────────────────────
-// On a manual connect with Persistent checked, we open a background
-// SSH session (same mechanism as file upload/download), ask the remote
-// shell whether tmux is installed, and report back its path. If the
-// user has already said "connect short-lived" for this target, we
-// skip the probe next time — they've opted out.
-
-const TMUX_MARKER = '__WEBSH_TMUX__';
-
-function probeScript() {
-  // One-liner that prints a marker line our parser can find. Checks
-  // both $PATH and ~/.local/bin — a common user-space install location.
-  // The marker is assembled from two halves so the typed command itself
-  // (which the remote shell echoes back to our buffer) does not contain
-  // the full marker string — only the expanded output does.
-  return (
-    'PATH="$HOME/.local/bin:$PATH"; ' +
-    'CMD=""; ' +
-    'if command -v tmux >/dev/null 2>&1; then CMD="$(command -v tmux)"; ' +
-    'elif [ -x "$HOME/.local/bin/tmux" ]; then CMD="$HOME/.local/bin/tmux"; fi; ' +
-    'WTA=__WEBSH; WTB=_TMUX__; ' +
-    'printf "%s%s:installed=%s:cmd=%s\\n" "$WTA" "$WTB" "${CMD:+yes}${CMD:-no}" "$CMD"'
-  );
-}
-
-function parseProbeOutput(text) {
-  let m = text.match(new RegExp(TMUX_MARKER + ':installed=(\\S+?):cmd=(\\S*)'));
-  if (!m) return null;
-  return {
-    installed: m[1].indexOf('yes') === 0,
-    tmux_cmd: m[2] || ''
-  };
-}
-
-function openBgSession(rec) {
-  // Spins up a non-persistent, background-tagged SSH session that
-  // borrows the caller's creds. Used only for the probe.
-  let body = buildConnectBody(rec, 80, 24);
-  delete body.persistent; delete body.slot_id; delete body.tmux_cmd;
-  body.background = true;
-  return api('connect', {body: body}).then(r => {
-    if (r.auth_failed) {
-      let err = new Error('authentication failed');
-      err.authFailed = true;
-      throw err;
-    }
-    if (r.error || r.alive === false) throw new Error(r.error || 'bg connect failed');
-    return r.session_id;
-  });
-}
-
-function drainOutput(sid, shouldStop) {
-  // Long-poll /api/output until shouldStop(buf) returns truthy or
-  // the session dies. Returns the accumulated decoded output.
-  let buf = '';
-  function step() {
-    return api('output', {query: '&session_id=' + sid}).then(r => {
-      if (r.error) return {buf: buf, reason: 'error', error: r.error};
-      if (r.data) buf += atob(r.data);
-      if (r.auth_failed) return {buf: buf, reason: 'auth_failed'};
-      let stop = shouldStop ? shouldStop(buf) : null;
-      if (stop) return {buf: buf, reason: stop};
-      if (r.alive === false) return {buf: buf, reason: 'closed'};
-      return step();
-    });
-  }
-  return step();
-}
-
-// Classify a chunk of PTY output as an auth failure. Mirrors the server's
-// AUTH_FAIL_PATTERNS so we don't depend solely on session.auth_failed
-// flag propagation (a poll can race ahead of the read loop's flag set).
-function looksLikeAuthFail(text) {
-  if (!text) return false;
-  return /permission denied|authentication failed|access denied|too many authentication failures/i.test(text);
-}
-
-function probeTmux(rec) {
-  // Returns a Promise<{installed, tmux_cmd} | null>. Opens a bg
-  // session, runs the probe one-liner, reads until the marker,
-  // disconnects. Caps at 20 s total.
-  let bgSid = null;
-  let timeoutId = null;
-  let timed = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error('probe timeout')), 20000);
-  });
-  let work = openBgSession(rec).then(sid => {
-    bgSid = sid;
-    return delay(2500); // let MOTD / login banner drain
-  }).then(() => {
-    return api('input', {body: {session_id: bgSid, data: probeScript() + '\n'}});
-  }).then(() => {
-    return drainOutput(bgSid, buf => buf.indexOf(TMUX_MARKER + ':') !== -1 ? 'marker' : null);
-  }).then(res => {
-    if (res.reason === 'auth_failed' || looksLikeAuthFail(res.buf)) {
-      let err = new Error('authentication failed');
-      err.authFailed = true;
-      throw err;
-    }
-    return parseProbeOutput(res.buf);
-  });
-  return Promise.race([work, timed]).finally(() => {
-    clearTimeout(timeoutId);
-    if (bgSid) api('disconnect', {body: {session_id: bgSid}}).catch(() => {});
-  });
-}
-
 // ── Terminate-session confirm modal ────────────────────────────────
 // Shown only when [x] is clicked on a successful tmux-backed pane.
 // Three outcomes: cancel, terminate once, terminate + suppress prompt
@@ -1465,29 +1460,7 @@ function confirmTerminate(neverAgain) {
 //      the form; the form remains the single "close me" control.
 //
 // The popup's DOM is #tmuxOv (kept for backwards-compat; the visible
-// title is "Connecting" by default). The probeTmux / openBgSession /
-// drainOutput helpers below stay as building blocks.
-
-// Synthesize a paneRecord-shaped object from opts so probeTmux can run
-// before any pane exists. Probe is always non-persistent and uses a
-// fixed 80x24 PTY, so cols/rows/persistent fields don't matter.
-function recForProbe(opts) {
-  return {
-    label: opts.label || '',
-    host: opts.host || '',
-    port: opts.port || 22,
-    user: opts.user || '',
-    connection: opts.connection || null,
-    auth: opts.auth || (opts.key ? 'key' : 'pw'),
-    password: opts.password || '',
-    key: opts.key || '',
-    key_pass: opts.keyPass || '',
-    persistent: false,
-    slot_id: null,
-    tmux_cmd: opts.tmuxCmd || 'tmux',
-    cols: 80, rows: 24
-  };
-}
+// title is "Connecting" by default).
 
 // Tracks the active attempt so the popup's Cancel / form's × can abort
 // it and so we don't leak bg or half-connected sessions.
@@ -1505,20 +1478,14 @@ function runConnect(opts) {
   hideErr();
   showConnectStatus('connecting', {host: opts.host, persistent: !!opts.persistent});
 
-  let step = opts.persistent
-    ? probeTmux(recForProbe(opts)).then(res => {
-        if (run.cancelled) return null;
-        if (!res) throw { kind: 'probe_unparseable' };
-        if (!res.installed) throw { kind: 'no_tmux' };
-        opts.tmuxCmd = res.tmux_cmd || 'tmux';
-        return true;
-      })
-    : Promise.resolve(true);
-
-  step.then(ok => {
-    if (run.cancelled || ok === null) return null;
-    return realConnect(opts, run);
-  }).then(result => {
+  // Persistent panes used to run a tmux-presence probe here (separate
+  // bg SSH session + MOTD-drain wait). It added ~2.5 s of latency and
+  // duplicated work the reactive showTmuxBar fallback already does
+  // post-connect when a "tmux not found" message arrives. Removed.
+  // Users with non-default tmux locations need to either symlink to
+  // PATH on the target or configure the connection via server-side
+  // websh.json.
+  realConnect(opts, run).then(result => {
     if (run.cancelled || !result) return;
     finalizeSuccess(opts, result, run);
   }).catch(err => {
@@ -1627,10 +1594,7 @@ function finalizeSuccess(opts, result, run) {
   p.polling = true;
   p.pollRetries = 0;
   p.fitAddon.fit();
-  let dims = p.fitAddon.proposeDimensions();
-  let cols = (dims && dims.cols) || p.term.cols;
-  let rows = (dims && dims.rows) || p.term.rows;
-  api('resize', {body: {session_id: p.sid, cols: cols, rows: rows}}).catch(() => {});
+  flushPaneResize(p);
   startKeepalive(p);
   saveSessions();
   startOutput(p);
@@ -1674,27 +1638,13 @@ function showConnectStatus(kind, ctx) {
 
   if (kind === 'connecting') {
     title.textContent = 'Connecting';
-    sub.textContent = ctx.persistent
-      ? 'Connecting to ' + host + ' and checking for tmux…'
-      : 'Connecting to ' + host + '…';
+    sub.textContent = 'Connecting to ' + host + '…';
     btn.textContent = 'Cancel';
   } else if (kind === 'auth_failed') {
     title.textContent = 'Authentication failed';
     sub.textContent = 'Could not log in to ' + host + '.';
     status.textContent = 'Check your password or key and try again.';
     status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'no_tmux') {
-    title.textContent = 'tmux not found on ' + host;
-    sub.textContent =
-      'Uncheck "Persistent session" to connect short-lived, then ' +
-      'install tmux on the remote and try again with Persistent on.';
-    btn.textContent = 'OK';
-  } else if (kind === 'probe_unparseable') {
-    title.textContent = 'tmux check failed';
-    sub.textContent =
-      'The tmux probe on ' + host + ' returned no recognisable answer. ' +
-      'Uncheck "Persistent session" to connect short-lived.';
     btn.textContent = 'OK';
   } else if (kind === 'policy_deny') {
     title.textContent = 'Connection not allowed';
@@ -1872,9 +1822,10 @@ function doConnect() {
   let label = $('iName').value.trim() || (username+'@'+host);
   let wantPersistent = $('iPersistent') ? $('iPersistent').checked : true;
   // Build the save-intent but defer writing: we only commit after the
-  // connect is confirmed stable (no auth failure, still alive). If the
-  // user downgrades persistent→short-lived via the tmux modal, the
-  // saved entry records the actual outcome (persistent=false).
+  // connect is confirmed stable (no auth failure, still alive). Note:
+  // saved entries from earlier versions may carry tmux_cmd from the
+  // probe era; that field still flows through buildConnectBody for
+  // backward compatibility, but new entries don't capture it.
   let saveEntry = null;
   if ($('iSave').checked) {
     saveEntry = {name: label, host: host, port: port, user: username,
@@ -1889,6 +1840,7 @@ function doConnect() {
     auth: authMode,
     persistent: wantPersistent,
     slotId: null,
+    tmuxCmd: 'tmux',
     saveEntry: saveEntry
   };
   if (authMode === 'pw') opts.password = password;
@@ -2504,33 +2456,125 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Zoom ────────────────────────────────────────────────────────────
-function zoomIn(){ settings.fontSize=Math.min(settings.fontSize+2,32); fontSize=settings.fontSize; saveSettings(); applySettings(); }
-function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=settings.fontSize; saveSettings(); applySettings(); }
-function applySettings(){
+// Hotkey zoom uses forceFlush:false so a held-key autorepeat (~30Hz)
+// doesn't fire one /api/resize POST per tick. The 150ms term.onResize
+// debounce coalesces the burst — 30 keystrokes → 1 POST 150ms after
+// release. Trade-off: the server learns the new size 150ms late, so
+// any shell output during that window may be wrapped at the old cols.
+// On a quiet terminal this is invisible; on a streaming command (top,
+// tail -f) the user sees one stale row. Acceptable for a hotkey burst
+// that, by definition, the user is mid-tweaking anyway.
+function zoomIn(){ settings.fontSize=Math.min(settings.fontSize+2,32); fontSize=settings.fontSize; saveSettings(); applySettings({forceFlush:false}); }
+function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=settings.fontSize; saveSettings(); applySettings({forceFlush:false}); }
+// Cancel any pending /api/resize debounce and post the current xterm
+// dimensions to the server immediately. Used after a programmatic
+// refit when we want the server to learn the new geometry without the
+// 150ms debounce window in term.onResize.
+//
+// Dedup guard: skip the POST when (cols,rows) matches the last value
+// the server has confirmed receiving. Two real cases hit this:
+//   - applySettings schedules its own RAF AND waitForFontThenRefresh
+//     schedules an inner RAF. Both call this. The second is a no-op
+//     because dims have settled.
+//   - held Ctrl+= autorepeat past the fontSize cap (32) — fontSize
+//     stops changing, dims stop changing, every additional keystroke
+//     would otherwise re-POST the same value 30 times/sec.
+//
+// Commit-on-success: lastSentCols/Rows are updated only after the POST
+// resolves cleanly. Network failure (rejection), business error (e.g.
+// 404 session not found), or any non-JSON response leaves lastSent
+// untouched, so the next refit will retry against the actual server
+// state. Without this discipline, a swallowed POST failure silently
+// desynced client and server until the user happened to resize to a
+// DIFFERENT value — exactly the right-edge-overflow class of bug
+// commit 7738ed1 was meant to eliminate.
+function flushPaneResize(p) {
+  if (!p || !p.sid) return;
+  let cols = p.term.cols, rows = p.term.rows;
+  if (p.lastSentCols === cols && p.lastSentRows === rows) return;
+  if (p.resizeTimer) { clearTimeout(p.resizeTimer); p.resizeTimer = null; }
+  api('resize', {body: {session_id: p.sid, cols: cols, rows: rows}})
+    .then(r => {
+      if (r && r.error) return;
+      p.lastSentCols = cols;
+      p.lastSentRows = rows;
+    })
+    .catch(() => { /* leave lastSent alone so the next refit retries */ });
+}
+
+// applySettings(opts):
+//   forceFlush=true  (default — discrete user intent: zoom hotkey,
+//                     reset, font select)  → bypass term.onResize
+//                     150ms debounce, post /api/resize immediately.
+//   forceFlush=false (continuous input: slider drag in Options)
+//                     → let the existing term.onResize debounce
+//                     coalesce a burst of mutations into one POST.
+//
+// Why the RAF: xterm v5's CharSizeService measures cell width
+// synchronously when fontSize changes (offsetWidth forces a layout),
+// so xterm itself is not the cause of stale cols. The bug we fix is
+// (a) webfont rasterisation lag — for a webfont not yet rendered at
+// the new size, the glyph metric the browser hands to xterm can lag
+// the visible glyph by one frame; and (b) applySettings mutates five
+// options back-to-back (fontSize, fontWeight, fontWeightBold,
+// lineHeight, fontFamily) and each one re-fires the measure cascade.
+// One animation frame after the last mutation, layout has settled and
+// the webfont is laid out at its new size, so fit() reads stable
+// metrics and proposeDimensions returns the correct cols.
+function applySettings(opts){
+  opts = opts || {};
+  let forceFlush = opts.forceFlush !== false;
   let stack = fontStack(settings.font);
   Object.keys(panes).forEach(k => {
-    let t = panes[k].term;
+    let p = panes[k];
+    let t = p.term;
     t.options.fontSize = settings.fontSize;
     t.options.fontWeight = settings.fontWeight;
     t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
     t.options.lineHeight = settings.lineHeight;
     if (t.options.fontFamily !== stack) t.options.fontFamily = stack;
-    waitForFontThenRefresh(t, panes[k].fitAddon);
-    try { panes[k].fitAddon.fit(); } catch(e){}
+    waitForFontThenRefresh(t, p.fitAddon, forceFlush ? p : null);
+    requestAnimationFrame(() => {
+      // closePane / disconnect can run between scheduling and firing;
+      // bail if the pane object was replaced or removed so we don't
+      // touch a disposed terminal or post to a freed sid.
+      if (panes[k] !== p) return;
+      try { p.fitAddon.fit(); } catch(e){}
+      if (forceFlush) flushPaneResize(p);
+    });
   });
 }
-function waitForFontThenRefresh(term, fit){
+// Schedule a refit once the current settings.font's webfont is loaded.
+// Pass `p` (optional) to also force-flush /api/resize after the refit
+// — pass null when the caller doesn't want to bypass the debounce
+// (slider drag) or doesn't have a pane object yet (initial createPane).
+function waitForFontThenRefresh(term, fit, p){
   let f = FONTS[settings.font];
   let webfont = f && f[1];
   if (!webfont || !document.fonts || !document.fonts.load) return;
   document.fonts.load(`${settings.fontWeight} ${settings.fontSize}px '${webfont}'`)
     .then(() => {
-      // xterm caches glyph metrics — bump fontFamily through a throwaway value
-      // to force a re-measure once the webfont has arrived.
+      // Bail before any DOM/xterm writes if the pane was torn down
+      // while we were waiting on the font face to load. Without this
+      // guard the slow-CDN / fast-close case would write to a
+      // disposed terminal via the fontFamily round-trip below.
+      if (p && panes[p.id] !== p) return;
+      // xterm caches glyph metrics — bump fontFamily through a throwaway
+      // value so CharSizeService.measure re-runs once the webfont face
+      // is actually available at the requested size. xterm's setter
+      // invalidates the metric cache on every assignment regardless of
+      // value, so a no-op round-trip forces a re-measure.
       let ff = term.options.fontFamily;
       term.options.fontFamily = 'monospace';
       term.options.fontFamily = ff;
-      try { fit && fit.fit(); } catch(e){}
+      // Same RAF rationale as applySettings: defer fit one frame so
+      // layout settles after the fontFamily round-trip and the webfont
+      // is rasterised at the new size before fit reads cell metrics.
+      requestAnimationFrame(() => {
+        if (p && panes[p.id] !== p) return;
+        try { fit && fit.fit(); } catch(e){}
+        if (p) flushPaneResize(p);
+      });
     }).catch(()=>{});
 }
 
@@ -2596,7 +2640,10 @@ function onOptInput(key, el, valEl, fmt){
   if (key === 'fontSize') fontSize = v;
   valEl.textContent = fmt(v);
   saveSettings();
-  applySettings();
+  // Slider 'input' fires per pixel of mouse movement — let the existing
+  // 150ms term.onResize debounce coalesce the burst into a single
+  // /api/resize POST instead of force-flushing on every step.
+  applySettings({forceFlush: false});
   renderOptPreview();
 }
 document.addEventListener('DOMContentLoaded', () => {

@@ -136,12 +136,8 @@ audience (English-facing ssh, OpenSSH client, localhost/VPN
 deployments). File this as "nice refactor when we touch `_spawn`
 next", not a shipping blocker.
 
-## What this means for the current PR
-
-Nothing. Leave the detector as-is. If we want to revisit:
-
-- The stderr-pipe rewrite is isolated to `SSHSession._spawn` /
-  `_read_loop`. No API change, no frontend change.
-- Auth-fail signalling to the client (`session.auth_failed` flag
-  surfaced via `/api/output`) stays identical, so the tests and the
-  frontend don't move.
+If we ever revisit: the stderr-pipe rewrite is isolated to
+`SSHSession._spawn` / `_read_loop` — no API change, no frontend
+change. Auth-fail signalling to the client (`session.auth_failed`
+flag surfaced via `/api/output`) stays identical, so the tests and
+the frontend don't move.

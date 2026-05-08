@@ -9,3 +9,4 @@ __pycache__/
 
 # Local outreach / marketing notes — not part of the project
 outreach/
+.claude/
