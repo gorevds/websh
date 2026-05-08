@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends openssh-client 
 RUN useradd -r -s /bin/false websh
 
 WORKDIR /app
-COPY server.py index.html websh.js .
+COPY server.py index.html websh.js ./
+COPY assets/ ./assets/
 
 USER websh
 

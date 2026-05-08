@@ -1482,8 +1482,9 @@ function runConnect(opts) {
   // bg SSH session + MOTD-drain wait). It added ~2.5 s of latency and
   // duplicated work the reactive showTmuxBar fallback already does
   // post-connect when a "tmux not found" message arrives. Removed.
-  // Users with user-installed tmux (e.g. ~/.local/bin/tmux) can set
-  // a custom path via the saved-card editor's "Tmux command path".
+  // Users with non-default tmux locations need to either symlink to
+  // PATH on the target or configure the connection via server-side
+  // websh.json.
   realConnect(opts, run).then(result => {
     if (run.cancelled || !result) return;
     finalizeSuccess(opts, result, run);

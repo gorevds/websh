@@ -37,7 +37,7 @@ Shared-хостинг не даёт держать долгоживущий пр
 
 ## Требования
 
-- **Бэкенд.** Python 3.5+ с `ssh` в PATH. Только CPython — код ожидания SSE завязан на refcount-GC для lifetime'а пайпов.
+- **Бэкенд.** Python 3.5+ с `ssh` в PATH. Только stdlib — никаких pip-зависимостей.
 - **Браузер.** Любой современный. xterm.js грузится с CDN.
 - **Опциональный proxy на shared-хостинге.** PHP 5.3+ с расширением `curl`.
 - **Опциональный reverse-proxy.** nginx, Caddy или Apache.

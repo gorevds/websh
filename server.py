@@ -934,6 +934,8 @@ sessions_lock = Lock()
 class SSHSession(object):
     """Manages a single SSH connection via PTY subprocess."""
 
+    # ── Init / spawn ────────────────────────────────────────────────
+
     # Class-level defaults so `SSHSession.__new__(SSHSession)` (used by
     # tests that bypass __init__) still has these attributes — _signal()
     # reads them and would AttributeError on a stripped instance.
@@ -1130,6 +1132,8 @@ class SSHSession(object):
             # torn down; ioctl is best-effort.
             pass
 
+    # ── Read loop / output buffer ───────────────────────────────────
+
     def _read_loop(self):
         """Background thread: reads PTY output into buffer."""
         # Entry-guard: pty.fork() may have failed in __init__ (or a test
@@ -1299,6 +1303,8 @@ class SSHSession(object):
             self.last_activity = time.time()
         return data
 
+    # ── Cross-thread signalling / wait ──────────────────────────────
+
     def _signal(self):
         """Wake any consumer thread blocked in wait_for_data(). Setting
         an already-set Event is a no-op, so wakeups coalesce naturally.
@@ -1378,6 +1384,8 @@ class SSHSession(object):
                 ev.clear()
                 return
 
+    # ── Output helpers (echo-off / unread / write / resize) ─────────
+
     def echo_off_hint(self):
         """True iff the most recent PTY output ends with a prompt that
         typically disables remote echo (sudo / mysql -p / passwd /
@@ -1449,6 +1457,8 @@ class SSHSession(object):
     def resize(self, cols, rows):
         self.last_activity = time.time()
         self._set_winsize(cols, rows)
+
+    # ── Persistent tmux (terminate / capture / push options) ────────
 
     def terminate_remote_tmux(self):
         """Kill the remote tmux session deterministically.
@@ -1582,6 +1592,8 @@ class SSHSession(object):
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return False, "tmux exit %d: %s" % (proc.returncode, err)
         return True, ""
+
+    # ── File transfer (ControlMaster side-channel) ──────────────────
 
     def upload_file(self, rel_path, body_stream, length,
                     timeout=UPLOAD_TIMEOUT):
@@ -1883,13 +1895,14 @@ class SSHSession(object):
         except Exception as e:
             return None, str(e)
 
+    # ── Lifecycle (close / expiry) ──────────────────────────────────
+
     def close(self):
         self.alive = False
-        # Wake any consumer parked in wait_for_data BEFORE we tear down
-        # the pipe — once the read end is closed, the selector returns
-        # an error and the wait helper falls back to a brief sleep, but
-        # signaling first lets the consumer exit cleanly via the normal
-        # `if not session.alive: break` path.
+        # Wake any consumer parked in wait_for_data so it observes
+        # alive=False and exits via the normal
+        # `if not session.alive: break` path. Setting an Event whose
+        # listener has already exited is a harmless no-op.
         self._signal()
         if self.master_fd >= 0:
             fd = self.master_fd
@@ -1991,6 +2004,8 @@ def _cleanup_loop():
 
 class Handler(BaseHTTPRequestHandler):
 
+    # ── HTTP plumbing ───────────────────────────────────────────────
+
     def log_message(self, fmt, *args):
         pass
 
@@ -2062,8 +2077,6 @@ class Handler(BaseHTTPRequestHandler):
         p = self.path.split("?")[0].rstrip("/")
         return p or "/"
 
-    # ── Routes ──
-
     def _resolve_action(self):
         """Extract API action from /api/<action> or api.php?action=<action>."""
         p = self._path()
@@ -2090,6 +2103,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
         self.wfile.write(data)
+
+    # ── Dispatch ────────────────────────────────────────────────────
 
     def do_POST(self):
         action = self._resolve_action()
@@ -2136,7 +2151,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._json({"error": "not found"}, 404)
 
-    # ── Handlers ──
+    # ── Source-IP / session-ID validation ───────────────────────────
 
     def _client_ip(self):
         """Return the IP we treat as the request's source for rate-limit
@@ -2171,6 +2186,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
+
+    # ── Connect ─────────────────────────────────────────────────────
 
     def _connect(self):
         # Rate limit by IP
@@ -2397,6 +2414,8 @@ class Handler(BaseHTTPRequestHandler):
                              target_host=host, target_user=username,
                              error=str(e)[:200])
             self._json({"error": str(e)}, 500)
+
+    # ── I/O endpoints (input / output / stream / resize) ────────────
 
     def _input(self):
         try:
@@ -2630,11 +2649,12 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 # No data and session still alive: send keepalive if
                 # we've been silent for too long, then park on the
-                # cached selector (notify pipe + client socket) until
-                # either the PTY produces more bytes (signal), the
-                # peer closes (FIN -> client socket readable), or the
-                # keepalive deadline arrives. This replaces the
-                # previous 100 Hz time.sleep(POLL_INTERVAL) busy-poll.
+                # cached client-socket selector and the data Event
+                # until either the PTY produces more bytes (Event
+                # signalled by _read_loop), the peer closes (FIN ->
+                # client socket readable), or the keepalive deadline
+                # arrives. This replaces the previous 100 Hz
+                # time.sleep(POLL_INTERVAL) busy-poll.
                 now = time.time()
                 if now - last_send > KEEPALIVE:
                     self.wfile.write(b": keepalive\n\n")
@@ -2715,6 +2735,8 @@ class Handler(BaseHTTPRequestHandler):
         session.resize(cols, rows)
         self._json({"ok": True})
 
+    # ── Tmux endpoints (capture / options) ──────────────────────────
+
     def _tmux_capture(self):
         """GET /api/tmux_capture?session_id=...
         Returns the full tmux pane buffer as text/plain; only valid for
@@ -2766,6 +2788,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": err}, 502)
             return
         self._json({"ok": True, "applied": [k for k, _ in opts]})
+
+    # ── File transfer endpoints (upload / ls / download) ────────────
 
     def _upload(self):
         """POST /api/upload?session_id=...&path=<rel_name>
@@ -3035,6 +3059,8 @@ class Handler(BaseHTTPRequestHandler):
                 proc.kill()
                 _reap()
         session.last_activity = time.time()
+
+    # ── Disconnect ──────────────────────────────────────────────────
 
     def _disconnect(self):
         try:

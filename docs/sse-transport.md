@@ -348,32 +348,6 @@ Event-based form has no fd, no kernel resource, and no teardown
 ordering hazard, so that whole machinery (and the Windows-specific
 `_HAVE_SELECTABLE_PIPES` fallback) is gone.
 
-## What this means for the PR
-
-Net new code paths:
-
-- `server.py:_stream` (~80 lines)
-- `websh.js`: `startOutput`, `streamOutput`, `handleOutputPayload`,
-  `consumeEcho`, `predictKey`, `nextRetryDelay`, etc.
-- `api.php`: `proxy_stream` (CURLOPT_WRITEFUNCTION-based passthrough)
-
-Net unchanged surface:
-
-- Existing `/api/output` continues to behave exactly as before.
-- `/api/input`, `/api/connect`, `/api/disconnect`, `/api/resize`,
-  `/api/upload*`, `/api/tmux_*`, `/api/ls`, `/api/download`, `/api/ping`,
-  `/api/config` — untouched.
-- All existing tests still pass. New tests cover `/api/stream`
-  validation paths, the peek-FIN semantics
-  (`test_client_gone_detects_fin` /
-  `_false_with_pending_data`), the unread push-back contract
-  (`test_session_unread_prepends`), an integration check that
-  bytes survive a mid-stream client close
-  (`test_stream_returns_undelivered_bytes_to_buffer`), and a
-  frontend regression that drives `handleOutputPayload` directly
-  with a three-frame disconnect sequence to confirm both
-  tail-byte rendering and single banner emission.
-
 Sessions that the SSE branch interacts with go through the same
 `SSHSession.read()` as long-poll does — there's no separate buffer,
 no separate reaping path. From the session's point of view, SSE is

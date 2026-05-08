@@ -37,7 +37,7 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 
 ## Requirements
 
-- **Backend.** Python 3.5+ with `ssh` in PATH. CPython only — the SSE wait code relies on refcount-based GC for pipe-fd lifetime.
+- **Backend.** Python 3.5+ with `ssh` in PATH. Stdlib only — no pip dependencies.
 - **Browser.** Any modern browser. xterm.js is loaded from a CDN.
 - **Optional shared-hosting proxy.** PHP 5.3+ with the `curl` extension.
 - **Optional reverse proxy.** nginx, Caddy, or Apache.
