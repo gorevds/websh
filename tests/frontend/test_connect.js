@@ -175,42 +175,37 @@ test('non-persistent auth-fail: popup shown, form open, no pane', async () => {
   cleanup(env);
 });
 
-test('persistent + no-tmux: popup, form open, no real-connect attempted', async () => {
-  const probeOut = 'prompt$ \r\n__WEBSH_TMUX__:installed=no:cmd=\r\n';
-  let outCalls = 0;
+// After dropping the tmux probe, persistent connects no longer block on
+// a separate bg session. The "tmux not found" UX is reactive: the real
+// connect succeeds, dies quickly, and showTmuxBar is raised by
+// handleOutputPayload's regex match. The connect popup itself only sees
+// the bare "connection went away" outcome here — no special title.
+test('persistent + no-tmux: real connect runs (no separate probe session)', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: []}},
-    {action: 'connect', match: b => b.background === true,
-     response: {session_id: 'bg', alive: true}},
-    {action: 'input', response: {ok: true}},
-    {action: 'output', response: () => {
-      outCalls++;
-      if (outCalls === 1) return {data: '', alive: true};
-      return {data: Buffer.from(probeOut).toString('base64'), alive: true};
-    }},
-    {action: 'disconnect', response: {ok: true}},
+    {action: 'connect', response: {session_id: 'real-sid', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
   ];
   const env = await mkEnv(plan); const win = env.win; const log = env.log;
   $(win, 'iH').value = 'remote'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p';
   $(win, 'iPersistent').checked = true;
   win.doConnect();
-  await sleep(3500);
-  ok(!hidden($(win, 'tmuxOv')), 'popup visible');
-  ok($(win, 'tmTitle').textContent.indexOf('tmux not found') !== -1,
-     'title mentions tmux not found, got: ' + $(win, 'tmTitle').textContent);
-  ok($(win, 'tmCancel').textContent === 'OK', 'button OK');
-  ok(!hidden($(win, 'ov')), 'form visible behind popup');
-  ok(paneList(win).length === 0, 'no pane');
-  const realConnects = log.filter(e => e.action === 'connect' && !(e.body && e.body.background));
-  ok(realConnects.length === 0, 'no real /api/connect called, saw ' + realConnects.length);
+  await sleep(80);
+  // Exactly one /api/connect, NOT a bg-tagged probe call.
+  const connects = log.filter(e => e.action === 'connect');
+  ok(connects.length === 1, 'one connect call, got ' + connects.length);
+  ok(connects[0].body && connects[0].body.background !== true,
+     'connect call is NOT background-tagged');
+  ok(connects[0].body && connects[0].body.persistent === true,
+     'connect call is persistent');
   cleanup(env);
 });
 
-test('persistent + probe auth-fail: auth_failed popup, no pane', async () => {
+test('persistent + auth-fail at real connect: auth_failed popup, no pane', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: []}},
-    {action: 'connect', match: b => b.background === true,
-     response: {auth_failed: true, alive: false}},
+    {action: 'connect', response: {auth_failed: true, alive: false}},
   ];
   const env = await mkEnv(plan); const win = env.win;
   $(win, 'iH').value = 'r'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'bad';
@@ -418,30 +413,23 @@ test('ESC dismisses popup first, then form (split mode)', async () => {
   cleanup(env);
 });
 
-test('persistent + tmux installed: full success, pane gets tmuxCmd, slotId', async () => {
-  const probeOut = 'prompt$ \r\n__WEBSH_TMUX__:installed=yes:cmd=/usr/bin/tmux\r\n';
-  let outCalls = 0;
+// The user-supplied tmux path (typed into iTmuxCmd) must round-trip
+// from the form into the connect body. Server returns its own tmux_cmd
+// which the client adopts on success.
+test('persistent + manual tmux path: connect body carries it; pane stores it', async () => {
   const plan = [
     {action: 'config', response: {restrict_hosts: false, connections: []}},
-    {action: 'connect', match: b => b.background === true,
-     response: {session_id: 'bg', alive: true}, once: true},
-    {action: 'input', response: {ok: true}},
-    {action: 'output', response: () => {
-      outCalls++;
-      if (outCalls === 1) return {data: '', alive: true};
-      if (outCalls === 2) return {data: Buffer.from(probeOut).toString('base64'), alive: true};
-      return {data: '', alive: true};
-    }},
-    {action: 'disconnect', response: {ok: true}},
-    {action: 'connect', match: b => !b.background,
-     response: {session_id: 'real1', alive: true, slot_id: 'alex@rh#1', tmux_cmd: '/usr/bin/tmux'}},
+    {action: 'connect',
+     response: {session_id: 'real1', alive: true, slot_id: 'alex@rh#1', tmux_cmd: '/home/alex/.local/bin/tmux'}},
     {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
   ];
   const env = await mkEnv(plan); const win = env.win; const log = env.log;
   $(win, 'iH').value = 'rh'; $(win, 'iU').value = 'alex'; $(win, 'iPw').value = 'p';
   $(win, 'iPersistent').checked = true;
+  $(win, 'iTmuxCmd').value = '/home/alex/.local/bin/tmux';
   win.doConnect();
-  await sleep(3500);
+  await sleep(80);
   ok(hidden($(win, 'ov')), 'form hidden on success');
   ok(hidden($(win, 'tmuxOv')), 'popup hidden on success');
   const ps = paneList(win);
@@ -450,15 +438,45 @@ test('persistent + tmux installed: full success, pane gets tmuxCmd, slotId', asy
     ok(ps[0].sid === 'real1', 'sid; got=' + ps[0].sid);
     ok(ps[0].persistent === true, 'persistent=true');
     ok(ps[0].slotId === 'alex@rh#1', 'slotId; got=' + ps[0].slotId);
-    ok(ps[0].tmuxCmd === '/usr/bin/tmux', 'tmuxCmd; got=' + ps[0].tmuxCmd);
+    ok(ps[0].tmuxCmd === '/home/alex/.local/bin/tmux',
+       'tmuxCmd; got=' + ps[0].tmuxCmd);
   }
-  const realConnects = log.filter(e => e.action === 'connect' && e.body && !e.body.background);
-  ok(realConnects.length === 1, 'one real connect');
-  if (realConnects.length) {
-    const b = realConnects[0].body;
-    ok(b.tmux_cmd === '/usr/bin/tmux', 'connect body has tmux_cmd; got=' + b.tmux_cmd);
+  const connects = log.filter(e => e.action === 'connect');
+  ok(connects.length === 1, 'one connect call (no probe), got ' + connects.length);
+  if (connects.length) {
+    const b = connects[0].body;
+    ok(b.tmux_cmd === '/home/alex/.local/bin/tmux',
+       'connect body carries user-supplied tmux_cmd; got=' + b.tmux_cmd);
     ok(b.persistent === true, 'connect body persistent=true');
+    ok(b.background !== true, 'NOT a background probe call');
   }
+  cleanup(env);
+});
+
+// Reactive showTmuxBar: regex must catch the major shells' wordings.
+test('showTmuxBar regex matches bash/zsh/fish/csh "tmux not found"', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // We assert via the same boolean expression websh.js uses internally.
+  // Recreate it here to lock in regression-safety on the regex.
+  const re = win.eval('(/tmux: (?:command )?not found|command not found:?\\s*tmux|tmux:\\s*Command not found|Unknown command:?\\s*tmux|tmux:\\s*No such file/i)');
+  const should = [
+    'bash: tmux: command not found',
+    'zsh: command not found: tmux',
+    'Unknown command: tmux',
+    'tmux: Command not found.',
+    'tmux: No such file or directory',
+    '/bin/sh: tmux: not found',
+    'ksh: tmux: not found',
+  ];
+  const shouldNot = [
+    'bash: foo: command not found',
+    'No such file or directory',
+    'permission denied',
+    'connection closed',
+  ];
+  for (const s of should) ok(re.test(s), 'should match: ' + JSON.stringify(s));
+  for (const s of shouldNot) ok(!re.test(s), 'should NOT match: ' + JSON.stringify(s));
   cleanup(env);
 });
 

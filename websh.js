@@ -1072,7 +1072,16 @@ function handleOutputPayload(p, r) {
     // missing tmux binary on the target. Offer re-probe / short-lived.
     let quick = p.connectedAt && (Date.now() - p.connectedAt) < 5000;
     let tail = p.recentOutput || '';
-    let hit = /tmux: not found|tmux: command not found|No such file|command not found/i.test(tail);
+    // Cover the common shells' wordings for "tmux not installed":
+    //   bash/dash/sh:  "bash: tmux: command not found", "/bin/sh: tmux: not found"
+    //   zsh:           "zsh: command not found: tmux"
+    //   ksh:           "ksh: tmux: not found"
+    //   fish:          "Unknown command: tmux"  (literal, case-sensitive in fish)
+    //   csh/tcsh:      "tmux: Command not found." (capitalised, with period)
+    // Plus the ENOENT path: "tmux: No such file or directory" (when invoked
+    // with an explicit path that doesn't exist). Avoid matching a bare
+    // "not found" without tmux context to stay clear of unrelated errors.
+    let hit = /tmux: (?:command )?not found|command not found:?\s*tmux|tmux:\s*Command not found|Unknown command:?\s*tmux|tmux:\s*No such file/i.test(tail);
     if (p.persistent && quick && hit) {
       showTmuxBar(p, 'tmux seems missing on ' + (p.host || 'target') + '.');
     } else if (p.host || p.connection) {
@@ -1410,113 +1419,6 @@ function tmuxSwitchToShortLived(id) {
   connectPane(p, {label: p.label, persistent: false});
 }
 
-// ── tmux probe ─────────────────────────────────────────────────────
-// On a manual connect with Persistent checked, we open a background
-// SSH session (same mechanism as file upload/download), ask the remote
-// shell whether tmux is installed, and report back its path. If the
-// user has already said "connect short-lived" for this target, we
-// skip the probe next time — they've opted out.
-
-const TMUX_MARKER = '__WEBSH_TMUX__';
-
-function probeScript() {
-  // One-liner that prints a marker line our parser can find. Checks
-  // both $PATH and ~/.local/bin — a common user-space install location.
-  // The marker is assembled from two halves so the typed command itself
-  // (which the remote shell echoes back to our buffer) does not contain
-  // the full marker string — only the expanded output does.
-  return (
-    'PATH="$HOME/.local/bin:$PATH"; ' +
-    'CMD=""; ' +
-    'if command -v tmux >/dev/null 2>&1; then CMD="$(command -v tmux)"; ' +
-    'elif [ -x "$HOME/.local/bin/tmux" ]; then CMD="$HOME/.local/bin/tmux"; fi; ' +
-    'WTA=__WEBSH; WTB=_TMUX__; ' +
-    'printf "%s%s:installed=%s:cmd=%s\\n" "$WTA" "$WTB" "${CMD:+yes}${CMD:-no}" "$CMD"'
-  );
-}
-
-function parseProbeOutput(text) {
-  let m = text.match(new RegExp(TMUX_MARKER + ':installed=(\\S+?):cmd=(\\S*)'));
-  if (!m) return null;
-  return {
-    installed: m[1].indexOf('yes') === 0,
-    tmux_cmd: m[2] || ''
-  };
-}
-
-function openBgSession(rec) {
-  // Spins up a non-persistent, background-tagged SSH session that
-  // borrows the caller's creds. Used only for the probe.
-  let body = buildConnectBody(rec, 80, 24);
-  delete body.persistent; delete body.slot_id; delete body.tmux_cmd;
-  body.background = true;
-  return api('connect', {body: body}).then(r => {
-    if (r.auth_failed) {
-      let err = new Error('authentication failed');
-      err.authFailed = true;
-      throw err;
-    }
-    if (r.error || r.alive === false) throw new Error(r.error || 'bg connect failed');
-    return r.session_id;
-  });
-}
-
-function drainOutput(sid, shouldStop) {
-  // Long-poll /api/output until shouldStop(buf) returns truthy or
-  // the session dies. Returns the accumulated decoded output.
-  let buf = '';
-  function step() {
-    return api('output', {query: '&session_id=' + sid}).then(r => {
-      if (r.error) return {buf: buf, reason: 'error', error: r.error};
-      if (r.data) buf += atob(r.data);
-      if (r.auth_failed) return {buf: buf, reason: 'auth_failed'};
-      let stop = shouldStop ? shouldStop(buf) : null;
-      if (stop) return {buf: buf, reason: stop};
-      if (r.alive === false) return {buf: buf, reason: 'closed'};
-      return step();
-    });
-  }
-  return step();
-}
-
-// Classify a chunk of PTY output as an auth failure. Mirrors the server's
-// AUTH_FAIL_PATTERNS so we don't depend solely on session.auth_failed
-// flag propagation (a poll can race ahead of the read loop's flag set).
-function looksLikeAuthFail(text) {
-  if (!text) return false;
-  return /permission denied|authentication failed|access denied|too many authentication failures/i.test(text);
-}
-
-function probeTmux(rec) {
-  // Returns a Promise<{installed, tmux_cmd} | null>. Opens a bg
-  // session, runs the probe one-liner, reads until the marker,
-  // disconnects. Caps at 20 s total.
-  let bgSid = null;
-  let timeoutId = null;
-  let timed = new Promise((_, reject) => {
-    timeoutId = setTimeout(() => reject(new Error('probe timeout')), 20000);
-  });
-  let work = openBgSession(rec).then(sid => {
-    bgSid = sid;
-    return delay(2500); // let MOTD / login banner drain
-  }).then(() => {
-    return api('input', {body: {session_id: bgSid, data: probeScript() + '\n'}});
-  }).then(() => {
-    return drainOutput(bgSid, buf => buf.indexOf(TMUX_MARKER + ':') !== -1 ? 'marker' : null);
-  }).then(res => {
-    if (res.reason === 'auth_failed' || looksLikeAuthFail(res.buf)) {
-      let err = new Error('authentication failed');
-      err.authFailed = true;
-      throw err;
-    }
-    return parseProbeOutput(res.buf);
-  });
-  return Promise.race([work, timed]).finally(() => {
-    clearTimeout(timeoutId);
-    if (bgSid) api('disconnect', {body: {session_id: bgSid}}).catch(() => {});
-  });
-}
-
 // ── Terminate-session confirm modal ────────────────────────────────
 // Shown only when [x] is clicked on a successful tmux-backed pane.
 // Three outcomes: cancel, terminate once, terminate + suppress prompt
@@ -1558,29 +1460,7 @@ function confirmTerminate(neverAgain) {
 //      the form; the form remains the single "close me" control.
 //
 // The popup's DOM is #tmuxOv (kept for backwards-compat; the visible
-// title is "Connecting" by default). The probeTmux / openBgSession /
-// drainOutput helpers below stay as building blocks.
-
-// Synthesize a paneRecord-shaped object from opts so probeTmux can run
-// before any pane exists. Probe is always non-persistent and uses a
-// fixed 80x24 PTY, so cols/rows/persistent fields don't matter.
-function recForProbe(opts) {
-  return {
-    label: opts.label || '',
-    host: opts.host || '',
-    port: opts.port || 22,
-    user: opts.user || '',
-    connection: opts.connection || null,
-    auth: opts.auth || (opts.key ? 'key' : 'pw'),
-    password: opts.password || '',
-    key: opts.key || '',
-    key_pass: opts.keyPass || '',
-    persistent: false,
-    slot_id: null,
-    tmux_cmd: opts.tmuxCmd || 'tmux',
-    cols: 80, rows: 24
-  };
-}
+// title is "Connecting" by default).
 
 // Tracks the active attempt so the popup's Cancel / form's × can abort
 // it and so we don't leak bg or half-connected sessions.
@@ -1598,20 +1478,13 @@ function runConnect(opts) {
   hideErr();
   showConnectStatus('connecting', {host: opts.host, persistent: !!opts.persistent});
 
-  let step = opts.persistent
-    ? probeTmux(recForProbe(opts)).then(res => {
-        if (run.cancelled) return null;
-        if (!res) throw { kind: 'probe_unparseable' };
-        if (!res.installed) throw { kind: 'no_tmux' };
-        opts.tmuxCmd = res.tmux_cmd || 'tmux';
-        return true;
-      })
-    : Promise.resolve(true);
-
-  step.then(ok => {
-    if (run.cancelled || ok === null) return null;
-    return realConnect(opts, run);
-  }).then(result => {
+  // Persistent panes used to run a tmux-presence probe here (separate
+  // bg SSH session + MOTD-drain wait). It added ~2.5 s of latency and
+  // duplicated work the reactive showTmuxBar fallback already does
+  // post-connect when a "tmux not found" message arrives. Removed.
+  // Users with user-installed tmux (e.g. ~/.local/bin/tmux) can set
+  // a custom path via the saved-card editor's "Tmux command path".
+  realConnect(opts, run).then(result => {
     if (run.cancelled || !result) return;
     finalizeSuccess(opts, result, run);
   }).catch(err => {
@@ -1764,27 +1637,13 @@ function showConnectStatus(kind, ctx) {
 
   if (kind === 'connecting') {
     title.textContent = 'Connecting';
-    sub.textContent = ctx.persistent
-      ? 'Connecting to ' + host + ' and checking for tmux…'
-      : 'Connecting to ' + host + '…';
+    sub.textContent = 'Connecting to ' + host + '…';
     btn.textContent = 'Cancel';
   } else if (kind === 'auth_failed') {
     title.textContent = 'Authentication failed';
     sub.textContent = 'Could not log in to ' + host + '.';
     status.textContent = 'Check your password or key and try again.';
     status.className = 'tm-status err';
-    btn.textContent = 'OK';
-  } else if (kind === 'no_tmux') {
-    title.textContent = 'tmux not found on ' + host;
-    sub.textContent =
-      'Uncheck "Persistent session" to connect short-lived, then ' +
-      'install tmux on the remote and try again with Persistent on.';
-    btn.textContent = 'OK';
-  } else if (kind === 'probe_unparseable') {
-    title.textContent = 'tmux check failed';
-    sub.textContent =
-      'The tmux probe on ' + host + ' returned no recognisable answer. ' +
-      'Uncheck "Persistent session" to connect short-lived.';
     btn.textContent = 'OK';
   } else if (kind === 'policy_deny') {
     title.textContent = 'Connection not allowed';
@@ -1872,6 +1731,15 @@ function focusFirst() {
 }
 
 function toggleSaveName() { $('saveNameWrap').className=$('iSave').checked?'save-name':'save-name h' }
+
+// Hide the manual tmux-path input when persistent is off (it's a no-op
+// for short-lived sessions). Users without sudo can still set it for a
+// user-installed tmux at e.g. ~/.local/bin/tmux.
+function toggleTmuxCmd() {
+  let el = $('tmuxCmdWrap'); if (!el) return;
+  let want = $('iPersistent') ? $('iPersistent').checked : true;
+  el.className = want ? 'save-name' : 'save-name h';
+}
 
 function setAuthTab(mode) {
   authMode=mode;
@@ -1961,16 +1829,21 @@ function doConnect() {
   if(authMode==='key'&&!key){showErr('Private key is required');return}
   let label = $('iName').value.trim() || (username+'@'+host);
   let wantPersistent = $('iPersistent') ? $('iPersistent').checked : true;
+  // Optional manual tmux path. Only meaningful when persistent is on;
+  // ignored otherwise. Empty string and the literal "tmux" both mean
+  // "use the default — let server.py invoke `tmux`".
+  let tmuxCmdInput = $('iTmuxCmd') ? $('iTmuxCmd').value.trim() : '';
+  let tmuxCmd = (wantPersistent && tmuxCmdInput && tmuxCmdInput !== 'tmux')
+                  ? tmuxCmdInput : 'tmux';
   // Build the save-intent but defer writing: we only commit after the
-  // connect is confirmed stable (no auth failure, still alive). If the
-  // user downgrades persistent→short-lived via the tmux modal, the
-  // saved entry records the actual outcome (persistent=false).
+  // connect is confirmed stable (no auth failure, still alive).
   let saveEntry = null;
   if ($('iSave').checked) {
     saveEntry = {name: label, host: host, port: port, user: username,
                  auth: authMode, persistent: wantPersistent};
     if (authMode === 'pw') saveEntry.pass = password; else saveEntry.key = key;
     if (selectedPrompt) saveEntry.connection = selectedPrompt.name;
+    if (tmuxCmd && tmuxCmd !== 'tmux') saveEntry.tmux_cmd = tmuxCmd;
   }
   let opts = {
     label: label,
@@ -1979,6 +1852,7 @@ function doConnect() {
     auth: authMode,
     persistent: wantPersistent,
     slotId: null,
+    tmuxCmd: tmuxCmd,
     saveEntry: saveEntry
   };
   if (authMode === 'pw') opts.password = password;

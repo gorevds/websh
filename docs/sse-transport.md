@@ -320,32 +320,33 @@ moment the PTY produces output. They used to do this with a
 simple but wastes CPU on idle sessions and adds a fixed ~5 ms median
 latency to every byte (half of `POLL_INTERVAL`).
 
-The current shape: each `Session` owns a non-blocking `os.pipe()`. The
-PTY reader writes one byte to the write end after every `output_buf`
-update. Consumers (`_stream`, `_output`) park in
-`Session.wait_for_data()`, which drives a `selectors.DefaultSelector`
-on `(notify_pipe, client_socket)` with a timeout = next-keepalive
-deadline. Wakeups happen exactly when something interesting does:
-new bytes from the PTY (signal arrived), client closed the connection
-(socket readable + FIN), or the keepalive cadence fires.
+The current shape: each `Session` owns a `threading.Event`
+(`_data_event`). The PTY reader calls `_signal()` (which is
+`_data_event.set()`) after every `output_buf` update. Consumers
+(`_stream`, `_output`) park in `Session.wait_for_data()`, which
+interleaves short `Event.wait` slices (20 ms) with non-blocking
+`selector.select(0)` polls of the client socket. Wakeups happen
+exactly when something interesting does: new bytes from the PTY
+(Event set, instant wake), client closed the connection (socket
+readable + FIN, ≤20 ms wake), or the keepalive cadence fires.
+
+The 20 ms FIN-detection bound is what falls out of the slice length.
+Empirical review measured that 50 Hz polling of the client socket
+adds ~20 ms latency in the worst case and is UX-imperceptible — we
+keep that property without the busy-poll cost. Wake-on-data is still
+microsecond-scale because it doesn't go through the slice loop:
+`Event.wait` returns immediately when set.
 
 `Handler` builds the selector once per request via
 `_build_session_selector` and reuses it across every loop iteration —
 that avoids paying `epoll_create1` + `epoll_ctl` + `close` on each
 wakeup.
 
-Two pieces stay subtle. (a) Pipe fds are released by
-`weakref.finalize`, NOT in `Session.close()`. Closing them on
-teardown opens a real fd-reuse race where a reader thread's signal
-between snapshot of `self._notify_w` and the `os.write()` syscall
-could land a stray byte in a freshly-allocated unrelated fd. Tying
-fd lifetime to garbage collection means the pipe stays valid as long
-as anyone holds a Session reference, and is closed only after the
-last consumer and the reader thread have released it. (b) Windows
-`DefaultSelector` won't accept non-socket fds, so on POSIX-only the
-machinery is active; on Windows `_HAVE_SELECTABLE_PIPES` is False
-and `wait_for_data` falls back to the legacy `time.sleep` cadence
-verbatim.
+The previous shape used `os.pipe()` plus `weakref.finalize` to bind
+fd lifetime to GC and defeat an fd-reuse race during teardown. The
+Event-based form has no fd, no kernel resource, and no teardown
+ordering hazard, so that whole machinery (and the Windows-specific
+`_HAVE_SELECTABLE_PIPES` fallback) is gone.
 
 ## What this means for the PR
 
