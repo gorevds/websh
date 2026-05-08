@@ -912,8 +912,16 @@ document.addEventListener('visibilitychange', () => {
   if (hiddenFor < VISIBILITY_PROBE_THRESHOLD_MS) return;
   Object.values(panes).forEach(p => {
     if (!p || !p.sid || !p.polling) return;
-    // Long-poll panes don't need this kick: fetch isn't frozen the way
-    // EventSource is in a backgrounded tab, the existing pollOutput
+    // Refit before touching transports — the window may have been
+    // resized while the tab was hidden (external monitor plugged in,
+    // user dragged the window) and ResizeObserver is allowed by spec
+    // to skip notifications for off-screen elements. A reconnect on
+    // stale cols/rows lets the shell format lines for the wrong width
+    // until the next layout event. Fit is cheap and idempotent when
+    // the size hasn't actually changed.
+    try { p.fitAddon.fit(); } catch(e){}
+    // Long-poll panes don't need the SSE kick: fetch isn't frozen the
+    // way EventSource is in a backgrounded tab, the existing pollOutput
     // recursion keeps running across the freeze. Worse, kicking it
     // would stack a second pollOutput chain on top of the in-flight
     // one — both call session.read() server-side (destructive) and
@@ -2550,14 +2558,34 @@ function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=
 function applySettings(){
   let stack = fontStack(settings.font);
   Object.keys(panes).forEach(k => {
-    let t = panes[k].term;
+    let p = panes[k];
+    let t = p.term;
     t.options.fontSize = settings.fontSize;
     t.options.fontWeight = settings.fontWeight;
     t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
     t.options.lineHeight = settings.lineHeight;
     if (t.options.fontFamily !== stack) t.options.fontFamily = stack;
-    waitForFontThenRefresh(t, panes[k].fitAddon);
-    try { panes[k].fitAddon.fit(); } catch(e){}
+    waitForFontThenRefresh(t, p.fitAddon);
+    // Defer fit to the next animation frame: xterm.js re-measures cell
+    // width/height asynchronously after fontSize / fontFamily changes,
+    // so a synchronous fit here uses the previous cell metrics. The
+    // resulting cols overshoots reality, /api/resize tells the server
+    // the wrong width, and the shell formats lines past the right edge
+    // until the next layout-trigger event.
+    requestAnimationFrame(() => {
+      try { p.fitAddon.fit(); } catch(e){}
+      // Force-flush any pending /api/resize debounce so the server sees
+      // the post-zoom size immediately. Without this, fast Ctrl+=/Ctrl+-
+      // sequences leave the server holding a stale cols for up to 150ms,
+      // which is exactly long enough for the shell to print a misaligned
+      // line and nothing is repainted afterwards because the dimensions
+      // didn't change a second time.
+      if (p.resizeTimer) { clearTimeout(p.resizeTimer); p.resizeTimer = null; }
+      if (p.sid) {
+        api('resize', {body: {session_id: p.sid,
+                                cols: t.cols, rows: t.rows}}).catch(() => {});
+      }
+    });
   });
 }
 function waitForFontThenRefresh(term, fit){
@@ -2571,7 +2599,12 @@ function waitForFontThenRefresh(term, fit){
       let ff = term.options.fontFamily;
       term.options.fontFamily = 'monospace';
       term.options.fontFamily = ff;
-      try { fit && fit.fit(); } catch(e){}
+      // Same RAF rationale as applySettings(): xterm re-measures cell
+      // metrics asynchronously, so fit() must run after the next layout
+      // pass to read fresh cellWidth/cellHeight.
+      requestAnimationFrame(() => {
+        try { fit && fit.fit(); } catch(e){}
+      });
     }).catch(()=>{});
 }
 
