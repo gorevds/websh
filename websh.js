@@ -884,6 +884,40 @@ function closeStream(p) {
   }
 }
 
+// ── Visibility-change recovery ───────────────────────────────────────
+// Background tabs get frozen by the browser (Chrome's memory saver /
+// page lifecycle freeze) after ~5 min in the background: timers stop,
+// EventSource pauses, our 30s empty-input keepalive doesn't go out.
+// The server reaps the PTY after SESSION_TIMEOUT idle, the SSE socket
+// rots, but EventSource doesn't always fire onerror on resume — the
+// tab looks frozen until the user hits F5. Persistent panes survive
+// because the real shell lives in tmux on the remote host; a fresh
+// connect transparently re-attaches by slot_id.
+//
+// On returning to foreground after a non-trivial absence we force
+// every active pane to reopen its output stream. If the server-side
+// session is still alive, the SSE primer arrives in one frame and
+// nothing visible happens. If it was reaped, the reconnect path
+// fires and tmux brings the shell back for persistent panes.
+let _lastHiddenAt = 0;
+const VISIBILITY_PROBE_THRESHOLD_MS = 10000;
+
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    _lastHiddenAt = Date.now();
+    return;
+  }
+  let hiddenFor = _lastHiddenAt ? (Date.now() - _lastHiddenAt) : 0;
+  _lastHiddenAt = 0;
+  if (hiddenFor < VISIBILITY_PROBE_THRESHOLD_MS) return;
+  Object.values(panes).forEach(p => {
+    if (!p || !p.sid || !p.polling) return;
+    closeStream(p);
+    clearRetryClock(p);
+    startOutput(p);
+  });
+});
+
 // Apply one decoded JSON payload from either transport. Returns true if
 // the session ended (auth_failed / alive=false / fatal session error)
 // so callers know to stop their read loop.
