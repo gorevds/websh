@@ -193,6 +193,12 @@ function createPane(container) {
     sid:null, connecting:false, polling:false, pollRetries:0,
     inputQueue:[], flushTimer:null, keepaliveTimer:null,
     label:'', resizeTimer:null, upload:null, download:null,
+    // Last (cols,rows) we POSTed to the server — used to skip duplicate
+    // /api/resize calls when several refit triggers fire in the same
+    // tick (applySettings RAF + waitForFontThenRefresh inner RAF;
+    // visibility recovery + ResizeObserver; held-key zoom autorepeat
+    // landing on the cap value).
+    lastSentCols:0, lastSentRows:0,
     // Connection identity — set once per connect, used for save/restore/reconnect.
     host:'', port:22, user:'', connection:null,
     auth:'pw', password:'', key:'', keyPass:'',
@@ -228,7 +234,14 @@ function createPane(container) {
     if(p.resizeTimer) clearTimeout(p.resizeTimer);
     p.resizeTimer = setTimeout(() => {
       p.resizeTimer=null;
-      if(p.sid) api('resize',{body:{session_id:p.sid,cols:size.cols,rows:size.rows}}).catch(() => {});
+      if(!p.sid) return;
+      // Skip if the dimensions match the last POST we made — saves a
+      // round-trip when several refit triggers converge on the same
+      // size (held-key zoom past the cap, ResizeObserver echo, etc.).
+      if(p.lastSentCols === size.cols && p.lastSentRows === size.rows) return;
+      p.lastSentCols = size.cols;
+      p.lastSentRows = size.rows;
+      api('resize',{body:{session_id:p.sid,cols:size.cols,rows:size.rows}}).catch(() => {});
     }, 150);
   });
   term.onSelectionChange(() => {
@@ -268,9 +281,12 @@ function createPane(container) {
     }
   });
 
-  // Resize observer
+  // Resize observer fires immediately on observe() with the current
+  // container size, so the initial fit happens automatically. The
+  // older setTimeout(fit, 50) fallback is now redundant: ResizeObserver
+  // covers the cold-layout case and waitForFontThenRefresh covers the
+  // webfont-load case.
   new ResizeObserver(() => { fit.fit() }).observe(termEl);
-  setTimeout(() => { fit.fit() }, 50);
 
   return p;
 }
@@ -886,21 +902,52 @@ function closeStream(p) {
   }
 }
 
-// ── Visibility-change recovery ───────────────────────────────────────
+// ── Recovery after a long absence ────────────────────────────────────
 // Background tabs get frozen by the browser (Chrome's memory saver /
-// page lifecycle freeze) after ~5 min in the background: timers stop,
-// EventSource pauses, our 30s empty-input keepalive doesn't go out.
-// The server reaps the PTY after SESSION_TIMEOUT idle, the SSE socket
-// rots, but EventSource doesn't always fire onerror on resume — the
-// tab looks frozen until the user hits F5. Persistent panes survive
-// because the real shell lives in tmux on the remote host; a fresh
-// connect transparently re-attaches by slot_id.
+// page lifecycle freeze) after ~5 min hidden: timers stop, EventSource
+// pauses, our 30s empty-input keepalive stops going out. The server
+// reaps the PTY after SESSION_TIMEOUT idle, the SSE socket rots, but
+// EventSource doesn't always fire onerror on resume — the tab looks
+// frozen until F5. Persistent panes survive because the real shell
+// lives in tmux on the remote host; a fresh connect re-attaches by
+// slot_id. bfcache restore (Firefox/Safari Back navigation, sometimes
+// Chrome) is a sibling case: pageshow with persisted=true means the
+// page was un-bfcached; timers and EventSource state are stale.
 //
-// On returning to foreground after a non-trivial absence we force
-// every active pane to reopen its output stream. If the server-side
-// session is still alive, the SSE primer arrives in one frame and
-// nothing visible happens. If it was reaped, the reconnect path
-// fires and tmux brings the shell back for persistent panes.
+// Strategy: on either signal — visibility return after >10s hidden,
+// or bfcache restore — refit every active pane and reopen its output
+// stream. If the server-side session is still alive, the SSE primer
+// arrives in one frame and nothing visible happens. If it was reaped,
+// the reconnect path fires and tmux brings the shell back.
+//
+// Long-poll panes don't need the SSE kick (fetch isn't frozen the way
+// EventSource is in a backgrounded tab, the existing pollOutput
+// recursion keeps running across the freeze; double-firing would
+// stack a second poll chain and garble output via destructive
+// session.read() races). They DO benefit from the refit, though,
+// since the window may have changed size while we were hidden.
+function kickPanesAfterAbsence() {
+  Object.values(panes).forEach(p => {
+    if (!p || !p.sid || !p.polling) return;
+    // Defer to the next frame so:
+    //   1) the refit reads fresh cell metrics (background tabs don't
+    //      run layout, so xterm and the webfont rasteriser may need a
+    //      fresh paint pass);
+    //   2) the post-fit /api/resize lands BEFORE the new SSE stream
+    //      opens, so the server's PTY is the right size when the
+    //      shell next prints.
+    requestAnimationFrame(() => {
+      if (panes[p.id] !== p) return;
+      try { p.fitAddon.fit(); } catch(e){}
+      flushPaneResize(p);
+      if (p.sseDisabled) return;
+      closeStream(p);
+      clearRetryClock(p);
+      startOutput(p);
+    });
+  });
+}
+
 let _lastHiddenAt = 0;
 const VISIBILITY_PROBE_THRESHOLD_MS = 10000;
 
@@ -912,31 +959,15 @@ document.addEventListener('visibilitychange', () => {
   let hiddenFor = _lastHiddenAt ? (Date.now() - _lastHiddenAt) : 0;
   _lastHiddenAt = 0;
   if (hiddenFor < VISIBILITY_PROBE_THRESHOLD_MS) return;
-  Object.values(panes).forEach(p => {
-    if (!p || !p.sid || !p.polling) return;
-    // Defer everything to the next frame so:
-    //   1) the refit reads fresh cell metrics — same RAF rationale as
-    //      applySettings (background tabs don't run layout, so xterm
-    //      and the webfont rasteriser may need a fresh paint pass);
-    //   2) the post-fit /api/resize lands BEFORE the new SSE stream
-    //      opens, so the server's PTY is the right size when the
-    //      shell next prints.
-    // Long-poll panes don't need the SSE kick (fetch isn't frozen the
-    // way EventSource is in a backgrounded tab, the existing pollOutput
-    // recursion keeps running across the freeze; double-firing would
-    // stack a second poll chain and garble output via destructive
-    // session.read() races). They DO benefit from the refit, though,
-    // since the window may have changed size while we were hidden.
-    requestAnimationFrame(() => {
-      if (panes[p.id] !== p) return;
-      try { p.fitAddon.fit(); } catch(e){}
-      flushPaneResize(p);
-      if (p.sseDisabled) return;
-      closeStream(p);
-      clearRetryClock(p);
-      startOutput(p);
-    });
-  });
+  kickPanesAfterAbsence();
+});
+
+// bfcache restore: Firefox / Safari (and Chrome since 96) cache the
+// whole page across navigations and restore it on Back. visibilitychange
+// is unreliable on this path; pageshow with event.persisted=true is
+// the canonical signal per the WICG Page Lifecycle spec.
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) kickPanesAfterAbsence();
 });
 
 // Apply one decoded JSON payload from either transport. Returns true if
@@ -1288,11 +1319,10 @@ function connectPane(p, opts) {
       p.polling = true;
       p.pollRetries = 0;
       // Force a resize so resumed tmux sessions redraw at the real size.
+      // flushPaneResize uses p.term.cols/rows post-fit and updates
+      // p.lastSent* so subsequent refit triggers can dedup.
       p.fitAddon.fit();
-      let dims = p.fitAddon.proposeDimensions();
-      let cols = (dims && dims.cols) || p.term.cols;
-      let rows = (dims && dims.rows) || p.term.rows;
-      api('resize', {body:{session_id:p.sid, cols:cols, rows:rows}}).catch(() => {});
+      flushPaneResize(p);
       startKeepalive(p);
       saveSessions();
       startOutput(p);
@@ -1682,10 +1712,7 @@ function finalizeSuccess(opts, result, run) {
   p.polling = true;
   p.pollRetries = 0;
   p.fitAddon.fit();
-  let dims = p.fitAddon.proposeDimensions();
-  let cols = (dims && dims.cols) || p.term.cols;
-  let rows = (dims && dims.rows) || p.term.rows;
-  api('resize', {body: {session_id: p.sid, cols: cols, rows: rows}}).catch(() => {});
+  flushPaneResize(p);
   startKeepalive(p);
   saveSessions();
   startOutput(p);
@@ -2559,18 +2586,38 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Zoom ────────────────────────────────────────────────────────────
-function zoomIn(){ settings.fontSize=Math.min(settings.fontSize+2,32); fontSize=settings.fontSize; saveSettings(); applySettings(); }
-function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=settings.fontSize; saveSettings(); applySettings(); }
+// Hotkey zoom uses forceFlush:false so a held-key autorepeat (~30Hz)
+// doesn't fire one /api/resize POST per tick. The 150ms term.onResize
+// debounce coalesces the burst — 30 keystrokes → 1 POST 150ms after
+// release. Trade-off: the server learns the new size 150ms late, so
+// any shell output during that window may be wrapped at the old cols.
+// On a quiet terminal this is invisible; on a streaming command (top,
+// tail -f) the user sees one stale row. Acceptable for a hotkey burst
+// that, by definition, the user is mid-tweaking anyway.
+function zoomIn(){ settings.fontSize=Math.min(settings.fontSize+2,32); fontSize=settings.fontSize; saveSettings(); applySettings({forceFlush:false}); }
+function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=settings.fontSize; saveSettings(); applySettings({forceFlush:false}); }
 // Cancel any pending /api/resize debounce and post the current xterm
 // dimensions to the server immediately. Used after a programmatic
 // refit when we want the server to learn the new geometry without the
-// 150ms debounce window in term.onResize. No-op when the pane has no
-// session id yet (initial-fit path during pane creation).
+// 150ms debounce window in term.onResize.
+//
+// Dedup guard: skip the POST when (cols,rows) matches the last value
+// we sent. Two real cases hit this:
+//   - applySettings schedules its own RAF AND waitForFontThenRefresh
+//     schedules an inner RAF. Both call this. The second is a no-op
+//     because dims have settled.
+//   - held Ctrl+= autorepeat past the fontSize cap (32) — fontSize
+//     stops changing, dims stop changing, every additional keystroke
+//     would otherwise re-POST the same value 30 times/sec.
 function flushPaneResize(p) {
   if (!p || !p.sid) return;
+  let cols = p.term.cols, rows = p.term.rows;
+  if (p.lastSentCols === cols && p.lastSentRows === rows) return;
   if (p.resizeTimer) { clearTimeout(p.resizeTimer); p.resizeTimer = null; }
+  p.lastSentCols = cols;
+  p.lastSentRows = rows;
   api('resize', {body: {session_id: p.sid,
-                          cols: p.term.cols, rows: p.term.rows}}).catch(() => {});
+                          cols: cols, rows: rows}}).catch(() => {});
 }
 
 // applySettings(opts):
@@ -2625,9 +2672,16 @@ function waitForFontThenRefresh(term, fit, p){
   if (!webfont || !document.fonts || !document.fonts.load) return;
   document.fonts.load(`${settings.fontWeight} ${settings.fontSize}px '${webfont}'`)
     .then(() => {
+      // Bail before any DOM/xterm writes if the pane was torn down
+      // while we were waiting on the font face to load. Without this
+      // guard the slow-CDN / fast-close case would write to a
+      // disposed terminal via the fontFamily round-trip below.
+      if (p && panes[p.id] !== p) return;
       // xterm caches glyph metrics — bump fontFamily through a throwaway
       // value so CharSizeService.measure re-runs once the webfont face
-      // is actually available at the requested size.
+      // is actually available at the requested size. xterm's setter
+      // invalidates the metric cache on every assignment regardless of
+      // value, so a no-op round-trip forces a re-measure.
       let ff = term.options.fontFamily;
       term.options.fontFamily = 'monospace';
       term.options.fontFamily = ff;
@@ -2635,7 +2689,6 @@ function waitForFontThenRefresh(term, fit, p){
       // layout settles after the fontFamily round-trip and the webfont
       // is rasterised at the new size before fit reads cell metrics.
       requestAnimationFrame(() => {
-        // Pane teardown guard for the force-flush path.
         if (p && panes[p.id] !== p) return;
         try { fit && fit.fit(); } catch(e){}
         if (p) flushPaneResize(p);
