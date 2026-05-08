@@ -1794,7 +1794,12 @@ class SSHSession(object):
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
         # Entry rows are NUL-terminated (not \n) so filenames containing
         # an embedded newline don't split a row in half. The PWD: line
-        # before the find output still uses \n — easy to peel off first.
+        # before the entries still uses \n — easy to peel off first.
+        # Pure POSIX shell loop (no GNU `find -printf`) so this works on
+        # BusyBox / Alpine / dash targets in addition to glibc Linux.
+        # `stat -c` covers GNU + BusyBox; `stat -f` is the BSD/macOS
+        # fallback; final fallback yields "0 0" so a host without stat
+        # at all still returns a usable listing (size/mtime degraded).
         remote_cmd = (
             'P=$(printf %s ' + b64 + ' | base64 -d); '
             'case "$P" in '
@@ -1805,8 +1810,18 @@ class SSHSession(object):
             'esac; '
             'cd "$D" 2>/dev/null || exit 1; '
             'printf "PWD:%s\\n" "$(pwd)"; '
-            'find . -maxdepth 1 ! -name . '
-            '-printf "%y\\t%s\\t%Ts\\t%f\\0" 2>/dev/null'
+            'for f in * .[!.]* ..?*; do '
+              '[ -e "$f" ] || [ -L "$f" ] || continue; '
+              'if [ -L "$f" ]; then t=l; '
+              'elif [ -d "$f" ]; then t=d; '
+              'elif [ -f "$f" ]; then t=f; '
+              'else t=o; fi; '
+              'sm=$(stat -c "%s %Y" -- "$f" 2>/dev/null '
+                    '|| stat -f "%z %m" -- "$f" 2>/dev/null '
+                    '|| echo "0 0"); '
+              's=${sm% *}; m=${sm#* }; '
+              'printf "%s\\t%s\\t%s\\t%s\\0" "$t" "$s" "$m" "$f"; '
+            'done'
         )
         ssh_cmd = [
             "ssh", "-T",
@@ -1824,8 +1839,8 @@ class SSHSession(object):
             return None, None, "directory not found"
 
         # Peel the PWD:<path>\n preamble off the front, then split the
-        # rest on NUL — every find -printf row ends with \0 so embedded
-        # newlines in filenames stay intact.
+        # rest on NUL — each `printf ... \0` row from the loop ends
+        # with \0 so embedded newlines in filenames stay intact.
         raw = result.stdout
         abs_path = remote_path
         nl = raw.find(b"\n")
