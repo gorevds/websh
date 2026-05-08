@@ -1732,15 +1732,6 @@ function focusFirst() {
 
 function toggleSaveName() { $('saveNameWrap').className=$('iSave').checked?'save-name':'save-name h' }
 
-// Hide the manual tmux-path input when persistent is off (it's a no-op
-// for short-lived sessions). Users without sudo can still set it for a
-// user-installed tmux at e.g. ~/.local/bin/tmux.
-function toggleTmuxCmd() {
-  let el = $('tmuxCmdWrap'); if (!el) return;
-  let want = $('iPersistent') ? $('iPersistent').checked : true;
-  el.className = want ? 'save-name' : 'save-name h';
-}
-
 function setAuthTab(mode) {
   authMode=mode;
   $('tabPw').className='auth-tab'+(mode==='pw'?' active':'');
@@ -1829,21 +1820,17 @@ function doConnect() {
   if(authMode==='key'&&!key){showErr('Private key is required');return}
   let label = $('iName').value.trim() || (username+'@'+host);
   let wantPersistent = $('iPersistent') ? $('iPersistent').checked : true;
-  // Optional manual tmux path. Only meaningful when persistent is on;
-  // ignored otherwise. Empty string and the literal "tmux" both mean
-  // "use the default — let server.py invoke `tmux`".
-  let tmuxCmdInput = $('iTmuxCmd') ? $('iTmuxCmd').value.trim() : '';
-  let tmuxCmd = (wantPersistent && tmuxCmdInput && tmuxCmdInput !== 'tmux')
-                  ? tmuxCmdInput : 'tmux';
   // Build the save-intent but defer writing: we only commit after the
-  // connect is confirmed stable (no auth failure, still alive).
+  // connect is confirmed stable (no auth failure, still alive). Note:
+  // saved entries from earlier versions may carry tmux_cmd from the
+  // probe era; that field still flows through buildConnectBody for
+  // backward compatibility, but new entries don't capture it.
   let saveEntry = null;
   if ($('iSave').checked) {
     saveEntry = {name: label, host: host, port: port, user: username,
                  auth: authMode, persistent: wantPersistent};
     if (authMode === 'pw') saveEntry.pass = password; else saveEntry.key = key;
     if (selectedPrompt) saveEntry.connection = selectedPrompt.name;
-    if (tmuxCmd && tmuxCmd !== 'tmux') saveEntry.tmux_cmd = tmuxCmd;
   }
   let opts = {
     label: label,
@@ -1852,7 +1839,7 @@ function doConnect() {
     auth: authMode,
     persistent: wantPersistent,
     slotId: null,
-    tmuxCmd: tmuxCmd,
+    tmuxCmd: 'tmux',
     saveEntry: saveEntry
   };
   if (authMode === 'pw') opts.password = password;

@@ -413,46 +413,6 @@ test('ESC dismisses popup first, then form (split mode)', async () => {
   cleanup(env);
 });
 
-// The user-supplied tmux path (typed into iTmuxCmd) must round-trip
-// from the form into the connect body. Server returns its own tmux_cmd
-// which the client adopts on success.
-test('persistent + manual tmux path: connect body carries it; pane stores it', async () => {
-  const plan = [
-    {action: 'config', response: {restrict_hosts: false, connections: []}},
-    {action: 'connect',
-     response: {session_id: 'real1', alive: true, slot_id: 'alex@rh#1', tmux_cmd: '/home/alex/.local/bin/tmux'}},
-    {action: 'resize', response: {ok: true}},
-    {action: 'output', response: {data: '', alive: true}},
-  ];
-  const env = await mkEnv(plan); const win = env.win; const log = env.log;
-  $(win, 'iH').value = 'rh'; $(win, 'iU').value = 'alex'; $(win, 'iPw').value = 'p';
-  $(win, 'iPersistent').checked = true;
-  $(win, 'iTmuxCmd').value = '/home/alex/.local/bin/tmux';
-  win.doConnect();
-  await sleep(80);
-  ok(hidden($(win, 'ov')), 'form hidden on success');
-  ok(hidden($(win, 'tmuxOv')), 'popup hidden on success');
-  const ps = paneList(win);
-  ok(ps.length === 1, 'one pane');
-  if (ps.length) {
-    ok(ps[0].sid === 'real1', 'sid; got=' + ps[0].sid);
-    ok(ps[0].persistent === true, 'persistent=true');
-    ok(ps[0].slotId === 'alex@rh#1', 'slotId; got=' + ps[0].slotId);
-    ok(ps[0].tmuxCmd === '/home/alex/.local/bin/tmux',
-       'tmuxCmd; got=' + ps[0].tmuxCmd);
-  }
-  const connects = log.filter(e => e.action === 'connect');
-  ok(connects.length === 1, 'one connect call (no probe), got ' + connects.length);
-  if (connects.length) {
-    const b = connects[0].body;
-    ok(b.tmux_cmd === '/home/alex/.local/bin/tmux',
-       'connect body carries user-supplied tmux_cmd; got=' + b.tmux_cmd);
-    ok(b.persistent === true, 'connect body persistent=true');
-    ok(b.background !== true, 'NOT a background probe call');
-  }
-  cleanup(env);
-});
-
 // Reactive showTmuxBar: regex must catch the major shells' wordings.
 test('showTmuxBar regex matches bash/zsh/fish/csh "tmux not found"', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];

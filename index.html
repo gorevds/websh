@@ -373,16 +373,8 @@
     </div>
 
     <div class="save-row">
-      <input type="checkbox" id="iPersistent" checked onchange="toggleTmuxCmd()">
+      <input type="checkbox" id="iPersistent" checked>
       <label for="iPersistent" title="Wraps the remote shell in tmux so this pane survives browser refresh and server restart.">Persistent session (tmux)</label>
-    </div>
-    <div id="tmuxCmdWrap" class="save-name">
-      <div class="fg">
-        <label for="iTmuxCmd">Tmux command path (optional)</label>
-        <input id="iTmuxCmd" placeholder="tmux"
-               title="e.g. /home/user/.local/bin/tmux for user-installed tmux"
-               autocomplete="off" data-lpignore="true" data-1p-ignore="true">
-      </div>
     </div>
     <div class="save-row">
       <input type="checkbox" id="iSave" onchange="toggleSaveName()">
