@@ -912,6 +912,13 @@ document.addEventListener('visibilitychange', () => {
   if (hiddenFor < VISIBILITY_PROBE_THRESHOLD_MS) return;
   Object.values(panes).forEach(p => {
     if (!p || !p.sid || !p.polling) return;
+    // Long-poll panes don't need this kick: fetch isn't frozen the way
+    // EventSource is in a backgrounded tab, the existing pollOutput
+    // recursion keeps running across the freeze. Worse, kicking it
+    // would stack a second pollOutput chain on top of the in-flight
+    // one — both call session.read() server-side (destructive) and
+    // bytes get split between responses, garbling output.
+    if (p.sseDisabled) return;
     closeStream(p);
     clearRetryClock(p);
     startOutput(p);

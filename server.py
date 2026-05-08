@@ -2522,25 +2522,33 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
-        # Acquire the per-session stream slot under sessions_lock. Reject
-        # a second /api/stream for the same session with 409 instead of
-        # silently racing two consumers for destructive reads. EventSource
-        # auto-reconnect can briefly overlap with a manual reconnect on
-        # flaky networks; the duplicate is rejected fast and the client's
-        # onerror handler picks the next attempt.
-        with sessions_lock:
-            session = sessions.get(sid)
-            if session and session._stream_active:
-                session = None
-                duplicate = True
-            else:
-                duplicate = False
-                if session:
+        # Acquire the per-session stream slot under sessions_lock. A second
+        # /api/stream for the same session is mostly the *legitimate*
+        # client reconnecting (visibility resume, network blip, EventSource
+        # auto-retry); the previous holder may not have observed the FIN
+        # yet, especially through nginx. Wait briefly (~250 ms) for the
+        # previous holder's `finally` to release the slot — most races
+        # resolve in single-digit ms. After the deadline, fall back to a
+        # 409 so a truly stuck holder doesn't deadlock the client.
+        deadline = time.time() + 0.25
+        session = None
+        duplicate = False
+        while True:
+            with sessions_lock:
+                session = sessions.get(sid)
+                if session is None:
+                    break
+                if not session._stream_active:
                     session._stream_active = True
+                    break
+            if time.time() >= deadline:
+                duplicate = True
+                break
+            time.sleep(0.01)
         if duplicate:
             self._json({"error": "stream already active for this session"}, 409)
             return
-        if not session:
+        if session is None:
             self._json({"error": "session not found"}, 404)
             return
 
@@ -2592,6 +2600,13 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(
                 ("event: data\ndata: " + primer + "\n\n").encode("utf-8"))
             self.wfile.flush()
+            # Connecting to /api/stream is itself proof of user interest in
+            # the session. Without this bump, a quiet pane (idle vim, idle
+            # tmux) reconnected from a freshly-foregrounded tab can still
+            # be reaped by the SESSION_TIMEOUT idle watchdog 5 minutes
+            # later, because last_activity hasn't moved since before the
+            # browser froze the tab.
+            session.last_activity = time.time()
         except (BrokenPipeError, ConnectionResetError, OSError):
             return
 
