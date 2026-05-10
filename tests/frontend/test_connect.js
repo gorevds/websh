@@ -512,7 +512,6 @@ test('disconnect: tail-drain data after alive=false still rendered', async () =>
       buffer: {active: {type: 'normal'}}
     },
     el: win.document.createElement('div'),
-    echoQueue: '', echoTimer: null,
     persistent: false, host: '', connection: null,
     connectedAt: 0, recentOutput: ''
   };
@@ -568,7 +567,6 @@ test("SSE 'open' event does not mark body as arrived", async () => {
     id: 'p1', sid: 'abc', polling: true,
     term: {write: () => {}, buffer: {active: {type: 'normal'}}},
     el: win.document.createElement('div'),
-    echoQueue: '', echoTimer: null,
     persistent: false, host: '', connection: null,
     connectedAt: 0, recentOutput: '',
     firstFailureAt: 0, retryCount: 0, pollRetries: 0,
@@ -603,115 +601,6 @@ test("SSE 'open' event does not mark body as arrived", async () => {
   captured.listeners.data({data: JSON.stringify({data: '', alive: true})});
   ok(p.sseGotAnyMessage === true,
      "'data' marks body arrived; got " + p.sseGotAnyMessage);
-  cleanup(env);
-});
-
-// =====================================================================
-// echo_off hint: server tells the client when the recent visible output
-// ends with a prompt that disables remote echo (sudo, mysql -p, passwd,
-// ssh passphrase, read -s). The client toggles p.echoEnabled so
-// predictionsEnabled() short-circuits on the next predictKey call —
-// nothing is rendered as a dim glyph. Backward-compat: undefined in the
-// payload must NOT clobber the previous value.
-test('echo_off=true disables predictions; absent field leaves state alone', async () => {
-  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
-  const env = await mkEnv(plan); const win = env.win;
-  const writes = [];
-  const p = {
-    id: 'p1', sid: 'abc', polling: true,
-    term: {
-      write(b) {
-        if (typeof b === 'string') { writes.push(b); return; }
-        let s = ''; for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
-        writes.push(s);
-      },
-      buffer: {active: {type: 'normal'}},
-    },
-    el: win.document.createElement('div'),
-    echoQueue: '', echoTimer: null,
-    persistent: false, host: '', connection: null,
-    connectedAt: 0, recentOutput: '',
-  };
-  win._tp = p;
-  win.eval(`panes['p1'] = window._tp; activeId = 'p1';`);
-
-  // Frame with the prompt and echo_off=true: predictions must be off.
-  win.handleOutputPayload(p, {
-    data: win.btoa('[sudo] password for alexey: '),
-    alive: true, echo_off: true,
-  });
-  ok(p.echoEnabled === false,
-     'echoEnabled flipped false on echo_off=true; got ' + p.echoEnabled);
-  ok(win.predictionsEnabled(p) === false,
-     'predictionsEnabled() short-circuits on echoEnabled===false');
-  // predictKey must not write a dim glyph at the prompt.
-  const before = writes.length;
-  win.predictKey(p, 'a');
-  ok(writes.length === before,
-     'predictKey wrote nothing while echoEnabled=false; new writes=' +
-     (writes.length - before));
-
-  // Frame with no echo_off field: echoEnabled must be unchanged
-  // (back-compat with older servers).
-  win.handleOutputPayload(p, {data: win.btoa('x'), alive: true});
-  ok(p.echoEnabled === false,
-     'absent echo_off must not flip the gate; got ' + p.echoEnabled);
-
-  // Frame with echo_off=false: predictions back on.
-  win.handleOutputPayload(p, {data: win.btoa('alexey@host:~$ '),
-                              alive: true, echo_off: false});
-  ok(p.echoEnabled === true,
-     'echoEnabled flipped true on echo_off=false; got ' + p.echoEnabled);
-  ok(win.predictionsEnabled(p) === true,
-     'predictionsEnabled() truthy again');
-  cleanup(env);
-});
-
-// Wide chars and non-ASCII bypass the prediction queue. rewindEcho's
-// '\b \b' assumes one column per queued char, but CJK / fullwidth /
-// emoji glyphs occupy 2 columns. Non-ASCII (Cyrillic, etc.) is
-// single-cell but doesn't round-trip safely against base64-decoded
-// server bytes (consumeEcho compares JS char codes byte-for-byte).
-// predictKey must drop those at entry.
-test('predictKey skips wide chars and non-ASCII', async () => {
-  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
-  const env = await mkEnv(plan); const win = env.win;
-  const writes = [];
-  const p = {
-    id: 'p1', sid: 'abc', polling: true,
-    term: {
-      write(b) { writes.push(typeof b === 'string' ? b : '<bin>'); },
-      buffer: {active: {type: 'normal'}},
-    },
-    el: win.document.createElement('div'),
-    echoQueue: '', echoTimer: null, echoEnabled: true,
-  };
-
-  // ASCII printable: predicted (writes a dim glyph).
-  win.predictKey(p, 'a');
-  ok(p.echoQueue === 'a',
-     'ASCII queued; got echoQueue=' + JSON.stringify(p.echoQueue));
-  ok(writes.some(w => w.includes('\x1b[2m')),
-     'ASCII printable wrote a dim glyph; writes=' + JSON.stringify(writes));
-  // Reset: rewind, then drop predictions silently.
-  p.echoQueue = '';
-  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
-  writes.length = 0;
-
-  // CJK (wide): NOT predicted — column-only \b would corrupt.
-  win.predictKey(p, '中');
-  ok(p.echoQueue === '',
-     'CJK char must not enter prediction queue; got ' + JSON.stringify(p.echoQueue));
-  // Cyrillic single-cell but UTF-8 multibyte on the wire — still rejected.
-  win.predictKey(p, 'я');
-  ok(p.echoQueue === '',
-     'Cyrillic must not enter prediction queue; got ' + JSON.stringify(p.echoQueue));
-  // Emoji are length 2 in UTF-16 (surrogate pair) and already filtered
-  // by `ch.length !== 1` — confirm explicit assertion still holds.
-  win.predictKey(p, '😀');
-  ok(p.echoQueue === '',
-     'Emoji must not enter prediction queue; got ' + JSON.stringify(p.echoQueue));
-
   cleanup(env);
 });
 
