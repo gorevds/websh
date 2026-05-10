@@ -126,6 +126,11 @@
     .upload-progress-cancel{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:2px 4px;border-radius:3px;transition:.15s;flex-shrink:0}
     .upload-progress-cancel:hover{color:var(--dg);background:rgba(248,81,73,.1)}
     .pane-term{flex:1;overflow:hidden}
+    /* A few px of breathing room so the first column doesn't kiss the
+       frame. Padding goes on .xterm itself (not on .pane-term) because
+       FitAddon reads .xterm's padding to subtract it from the parent's
+       available width — keeping cols and visual width in sync. */
+    .xterm{padding:0 6px;box-sizing:border-box}
     .xterm-viewport::-webkit-scrollbar{width:8px}
     .xterm-viewport::-webkit-scrollbar-track{background:transparent}
     .xterm-viewport::-webkit-scrollbar-thumb{background:var(--bd);border-radius:4px}
