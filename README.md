@@ -33,7 +33,7 @@ Shared hosting that doesn't allow long-lived processes? Ship `api.php` next to `
 
 **Why not WebSocket?** Many shared-hosting PHP setups don't proxy it — websh has to drop in there too. SSE gives the same low latency on plain HTTP and tunnels through any HTTPS proxy without a protocol upgrade.
 
-For deeper internals — buffer-detection probe, lost-byte handling on disconnect, local-echo prediction, selectors-based wait — see [`docs/sse-transport.md`](docs/sse-transport.md).
+For deeper internals — buffer-detection probe, lost-byte handling on disconnect, selectors-based wait — see [`docs/sse-transport.md`](docs/sse-transport.md).
 
 ## Requirements
 

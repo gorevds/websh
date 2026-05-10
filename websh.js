@@ -209,20 +209,10 @@ function createPane(container) {
   // Terminal events
   term.onData(d => {
     if (!p.sid) return;
-    // Predict only single printable keystrokes — paste, escape sequences
-    // and IME composition arrive as multi-byte and aren't safely echoed.
-    if (d.length === 1) predictKey(p, d);
     queueInput(p, d);
   });
   term.onBinary(d => { if(p.sid) queueInput(p,d) });
   term.onResize(size => {
-    // Pending predictions reference cursor coordinates that the resize
-    // just invalidated — drop them without writing. rewindEcho()'s
-    // \b/space/\b sequence isn't actually silent: after xterm.js reflow
-    // the cursor sits in a new logical position, and backspace is
-    // column-only so on narrowing it misses the predicted glyphs while
-    // the spaces clobber legitimate content.
-    clearEchoState(p);
     if(!p.sid) return;
     if(p.resizeTimer) clearTimeout(p.resizeTimer);
     p.resizeTimer = setTimeout(() => {
@@ -462,7 +452,6 @@ function _destroyPane(id, terminate) {
     if (terminate) body.terminate = true;
     api('disconnect', {body: body}).catch(() => {});
   }
-  clearEchoState(p);
   p.term.dispose();
 
   let wrap = p.el.parentNode;
@@ -772,117 +761,6 @@ function commitPendingSave(p) {
   renderSaved();
 }
 
-// ── Local echo prediction (Mosh-style lite) ─────────────────────────
-// Render printable keystrokes in dim style at the cursor before the
-// server has had a chance to echo them. When the real echo arrives we
-// either "promote" the dim chars to normal (common case: shell prompt
-// echoes verbatim) or rewind them and let the server's bytes draw
-// freely (vim, programs that filter/replace input). Only enabled in
-// the normal buffer — alt-screen apps (vim/htop/less) get raw bytes.
-//
-// Stale predictions self-clear after PREDICT_TTL_MS so a missed echo
-// (e.g. piped command swallows input) doesn't leave dim ghosts behind.
-
-const PREDICT_TTL_MS = 1000;
-
-function predictionsEnabled(p) {
-  if (p.echoEnabled === false) return false;
-  if (!p.term || !p.term.buffer || !p.term.buffer.active) return false;
-  return p.term.buffer.active.type === 'normal';
-}
-
-function rewindEcho(p) {
-  if (!p.echoQueue) return '';
-  let n = p.echoQueue.length;
-  p.echoQueue = '';
-  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
-  // Backspace, overwrite with spaces, backspace again — visually clears
-  // the predicted glyphs and leaves the cursor at the original position.
-  return '\b'.repeat(n) + ' '.repeat(n) + '\b'.repeat(n);
-}
-
-// Drop any in-flight prediction without writing to the terminal. Used
-// when the cursor coordinates the predictions reference are about to
-// be invalidated (resize) or when the disconnect banner is taking over
-// the screen — writing rewindEcho() in those moments would either miss
-// the dim glyphs (resize-narrowing wraps the cursor past the prediction
-// row, and \b doesn't cross wraps) or paint over the freshly-written
-// banner.
-function clearEchoState(p) {
-  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
-  p.echoQueue = '';
-}
-
-function predictKey(p, ch) {
-  if (!predictionsEnabled(p)) return;
-  if (!ch || ch.length !== 1) return;
-  let code = ch.charCodeAt(0);
-  // Control chars (Enter, Backspace, arrows, Esc-prefixed sequences):
-  // any prediction we held is now suspect, so wipe it. The server's
-  // next bytes will redraw correctly without our interference.
-  if (code < 32 || code === 127) {
-    let undo = rewindEcho(p);
-    if (undo) p.term.write(undo);
-    return;
-  }
-  // Predict only single-cell ASCII printable. Wide chars (CJK, fullwidth,
-  // many emoji) occupy 2 terminal columns; rewindEcho's '\b \b' assumes
-  // 1 column per queued char and would leave half a glyph and a stray
-  // space behind. Non-ASCII (Cyrillic, Greek, Latin extended) is single-
-  // cell but doesn't round-trip safely against a base64-decoded server
-  // chunk that may include UTF-8 continuation bytes — consumeEcho
-  // compares JS char codes byte-for-byte. ASCII-only keeps the matcher
-  // honest.
-  if (code > 126) {
-    let undo = rewindEcho(p);
-    if (undo) p.term.write(undo);
-    return;
-  }
-  p.echoQueue = (p.echoQueue || '') + ch;
-  p.term.write('\x1b[2m' + ch + '\x1b[22m');
-  if (p.echoTimer) clearTimeout(p.echoTimer);
-  p.echoTimer = setTimeout(() => {
-    p.echoTimer = null;
-    let undo = rewindEcho(p);
-    if (undo) p.term.write(undo);
-  }, PREDICT_TTL_MS);
-}
-
-// Called from handleOutputPayload before writing server bytes. Returns
-// the (possibly modified) byte string to write, after reconciling any
-// pending predictions with the incoming echo.
-function consumeEcho(p, chunk) {
-  if (!p.echoQueue) return chunk;
-  let q = p.echoQueue;
-  // Find the longest common prefix between the prediction queue and
-  // the leading bytes of the server chunk.
-  let common = 0;
-  let m = Math.min(q.length, chunk.length);
-  while (common < m && q.charCodeAt(common) === chunk.charCodeAt(common)) {
-    common++;
-  }
-  if (common === 0) {
-    // Server didn't echo what we predicted (e.g. autocomplete, vim).
-    // Rewind everything so its bytes draw on a clean slate.
-    return rewindEcho(p) + chunk;
-  }
-  if (p.echoTimer) { clearTimeout(p.echoTimer); p.echoTimer = null; }
-  if (common === q.length) {
-    // Whole prediction confirmed: backspace over the dim chars and
-    // rewrite them as normal-intensity, then append the rest.
-    p.echoQueue = '';
-    return '\b'.repeat(common) + chunk.slice(0, common) + chunk.slice(common);
-  }
-  // Partial match: confirm `common` chars, drop the unconfirmed tail.
-  let unconfirmed = q.length - common;
-  p.echoQueue = '';
-  return '\b'.repeat(q.length)               // back to start of predictions
-       + chunk.slice(0, common)              // promote confirmed (normal SGR)
-       + ' '.repeat(unconfirmed)             // erase unconfirmed dim
-       + '\b'.repeat(unconfirmed)            // back to end of confirmed
-       + chunk.slice(common);                // remaining server bytes
-}
-
 // ── Output transport ────────────────────────────────────────────────
 // Two transports share one payload shape ({data, alive, auth_failed}).
 // Primary: SSE via /api/stream, opened with EventSource. Falls back to
@@ -985,7 +863,6 @@ function handleOutputPayload(p, r) {
     if (!p.sid) return true;
     console.log('output: session error:', r.error);
     closeStream(p);
-    clearEchoState(p);
     stopKeepalive(p); p.polling=false; p.sid=null; p.connecting=false;
     updatePaneBadge(p);
     if(p.host || p.connection) {
@@ -994,15 +871,6 @@ function handleOutputPayload(p, r) {
     return true;
   }
   p.connecting=false;
-  // Server-side hint that the recent visible output ends with a prompt
-  // that disables remote echo (sudo, mysql -p, passwd, ssh passphrase,
-  // read -s). predictionsEnabled() short-circuits on echoEnabled===false,
-  // so toggling here suppresses the dim-glyph prediction at exactly
-  // those prompts. Older servers omit the field — keep the previous
-  // value untouched in that case.
-  if (typeof r.echo_off === 'boolean') {
-    p.echoEnabled = !r.echo_off;
-  }
   if(r.data){
     // Always render incoming bytes — even on a tail-drain frame that
     // arrives after the disconnect banner, the bytes may be the last
@@ -1012,8 +880,7 @@ function handleOutputPayload(p, r) {
     // silently drop end-of-session output.
     updatePaneBadge(p);
     let chunk = atob(r.data);
-    let processed = consumeEcho(p, chunk);
-    p.term.write(Uint8Array.from(processed, c => c.charCodeAt(0)));
+    p.term.write(Uint8Array.from(chunk, c => c.charCodeAt(0)));
     // Keep a short tail of decoded output only while we're still
     // within the tmux-death detection window on a persistent pane.
     if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
@@ -1031,10 +898,6 @@ function handleOutputPayload(p, r) {
   // (reconnect placeholder). The login form never reopens on its own.
   if (r.auth_failed) {
     p.pendingSave = null;
-    // Clear predictions before writing the banner — a pending TTL
-    // timer would otherwise paint \b/space/\b over our freshly-drawn
-    // banner ~1 s later.
-    clearEchoState(p);
     p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
     closeStream(p);
     stopKeepalive(p); p.polling = false;
@@ -1055,7 +918,6 @@ function handleOutputPayload(p, r) {
     commitPendingSave(p);
   }
   if(r.alive===false){
-    clearEchoState(p);
     p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
     closeStream(p);
     stopKeepalive(p); p.polling=false; p.sid=null;
@@ -1112,7 +974,6 @@ function transportFatal(p, e) {
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
     ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
     : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
-  clearEchoState(p);
   p.term.write(msg);
   closeStream(p);
   stopKeepalive(p); p.polling=false; p.sid=null;

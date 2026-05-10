@@ -827,18 +827,15 @@ class TestHTTPApi(unittest.TestCase):
         sid = str(uuid.uuid4())
 
         class FakeSession(_FakeNotifyMixin):
-            def __init__(self, echo_off=False):
+            def __init__(self):
                 self.alive = True
                 self.auth_failed = False
                 self._chunks = [b"hello\r\n"]
-                self._echo_off = echo_off
             def read(self):
                 if self._chunks:
                     return self._chunks.pop(0)
                 self.alive = False
                 return b""
-            def echo_off_hint(self):
-                return self._echo_off
 
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
@@ -885,13 +882,6 @@ class TestHTTPApi(unittest.TestCase):
             self.assertEqual(base64.b64decode(chunk_payload["data"]),
                              b"hello\r\n")
             self.assertFalse(chunk_payload["auth_failed"])
-            # echo_off propagates from the session into every payload
-            # (primer included) so the client can gate local-echo
-            # prediction at echo-disabled prompts.
-            self.assertIn("echo_off", data_payloads[0])
-            self.assertFalse(data_payloads[0]["echo_off"])
-            self.assertIn("echo_off", chunk_payload)
-            self.assertFalse(chunk_payload["echo_off"])
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
@@ -917,8 +907,6 @@ class TestHTTPApi(unittest.TestCase):
                 if self._calls > 3:
                     self.alive = False
                 return b""
-            def echo_off_hint(self):
-                return False
 
         with server.sessions_lock:
             server.sessions[sid] = IdleSession()
@@ -946,58 +934,6 @@ class TestHTTPApi(unittest.TestCase):
             self.assertEqual(primer["data"], "",
                 "primer carries empty data")
             self.assertTrue(primer["alive"])
-            self.assertFalse(primer["echo_off"])
-        finally:
-            with server.sessions_lock:
-                server.sessions.pop(sid, None)
-
-    def test_stream_propagates_echo_off_hint(self):
-        """When the session reports echo_off_hint=True (recent output
-        looks like a password prompt), every SSE 'data' frame — primer
-        included — must carry echo_off=true so the client suppresses
-        local-echo prediction from the very first event."""
-        import http.client
-        sid = str(uuid.uuid4())
-
-        class FakeSession(_FakeNotifyMixin):
-            def __init__(self):
-                self.alive = True
-                self.auth_failed = False
-                self._chunks = [b"[sudo] password for alexey: "]
-            def read(self):
-                if self._chunks:
-                    return self._chunks.pop(0)
-                self.alive = False
-                return b""
-            def echo_off_hint(self):
-                return True
-
-        with server.sessions_lock:
-            server.sessions[sid] = FakeSession()
-        try:
-            conn = http.client.HTTPConnection("127.0.0.1", self.port,
-                                              timeout=5)
-            conn.request("GET", "/api/stream?session_id=" + sid)
-            resp = conn.getresponse()
-            buf = b""
-            deadline = time.time() + 3
-            while time.time() < deadline and b"event: end" not in buf:
-                chunk = resp.read(256)
-                if not chunk:
-                    break
-                buf += chunk
-            conn.close()
-            text = buf.decode("utf-8")
-            data_payloads = [
-                json.loads(line[len("data: "):])
-                for line in text.splitlines()
-                if line.startswith("data: ") and '"data"' in line
-            ]
-            self.assertGreaterEqual(len(data_payloads), 1)
-            for p in data_payloads:
-                self.assertTrue(p["echo_off"],
-                    "echo_off=True from session must propagate "
-                    "to wire on every frame, got: " + repr(p))
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
@@ -1026,8 +962,6 @@ class TestHTTPApi(unittest.TestCase):
                     gate.wait(timeout=5)
                 self.alive = False
                 return b""
-            def echo_off_hint(self):
-                return False
 
         with server.sessions_lock:
             server.sessions[sid] = Sess()
@@ -1104,59 +1038,6 @@ class TestHTTPApi(unittest.TestCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
-    def test_stream_event_end_carries_echo_off(self):
-        """The terminating event:end frame must include echo_off so the
-        client can reset its prediction gate consistently with data
-        frames. Missing field would leave the prediction in a stale
-        state if the disconnect arrives mid-prompt."""
-        import http.client
-        sid = str(uuid.uuid4())
-
-        class Sess(_FakeNotifyMixin):
-            def __init__(self):
-                self.alive = True
-                self.auth_failed = False
-                self._calls = 0
-            def read(self):
-                self._calls += 1
-                if self._calls > 2:
-                    self.alive = False
-                return b""
-            def echo_off_hint(self):
-                return True
-
-        with server.sessions_lock:
-            server.sessions[sid] = Sess()
-        try:
-            conn = http.client.HTTPConnection("127.0.0.1", self.port,
-                                              timeout=5)
-            conn.request("GET", "/api/stream?session_id=" + sid)
-            resp = conn.getresponse()
-            buf = b""
-            deadline = time.time() + 3
-            while time.time() < deadline and b"event: end" not in buf:
-                chunk = resp.read(256)
-                if not chunk:
-                    break
-                buf += chunk
-            conn.close()
-            text = buf.decode("utf-8")
-            self.assertIn("event: end", text,
-                          "stream did not deliver event:end")
-            # Find the JSON immediately after `event: end`.
-            end_idx = text.find("event: end")
-            tail = text[end_idx:]
-            data_line = next(line for line in tail.splitlines()
-                             if line.startswith("data: "))
-            payload = json.loads(data_line[len("data: "):])
-            self.assertIn("echo_off", payload,
-                "event:end must include echo_off for client consistency")
-            self.assertTrue(payload["echo_off"])
-            self.assertFalse(payload["alive"])
-        finally:
-            with server.sessions_lock:
-                server.sessions.pop(sid, None)
-
     def test_stream_returns_undelivered_bytes_to_buffer(self):
         """Regression: when the client closes /api/stream mid-flight,
         bytes the SSE handler had already drained from the session must
@@ -1189,8 +1070,6 @@ class TestHTTPApi(unittest.TestCase):
             def feed(self, b):
                 with self.buf_lock:
                     self.output_buf += b
-            def echo_off_hint(self):
-                return False
 
         sess = Sess()
         with server.sessions_lock:
@@ -2479,149 +2358,6 @@ class TestIdleTimer(unittest.TestCase):
         self.assertFalse(s.is_expired())
 
 
-# ── Echo-off prompt detection ──────────────────────────────────────────
-# Heuristic that hints the client to suppress local-echo prediction at
-# prompts where the remote pty disables ECHO (sudo / mysql -p / passwd /
-# ssh passphrase / read -s). The local pty between server.py and the ssh
-# client is in raw mode regardless of remote ECHO state, so a tail-of-
-# output regex is the next-best signal we can derive on the proxy side.
-
-class TestEchoOffHint(unittest.TestCase):
-
-    def _fake_session(self, recent_tail=b""):
-        s = server.SSHSession.__new__(server.SSHSession)
-        s.buf_lock = threading.Lock()
-        s._recent_tail = recent_tail
-        return s
-
-    def test_sudo_prompt_matches(self):
-        s = self._fake_session(b"[sudo] password for alexey: ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_mysql_prompt_matches(self):
-        s = self._fake_session(b"Enter password: ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_ssh_passphrase_matches(self):
-        s = self._fake_session(
-            b"Enter passphrase for key '/home/u/.ssh/id_rsa': ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_passcode_prompt_matches(self):
-        s = self._fake_session(b"Passcode: ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_uppercase_prompt_matches(self):
-        s = self._fake_session(b"PASSWORD: ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_colored_prompt_with_sgr_reset_matches(self):
-        """Distros and PAM modules sometimes wrap the prompt in ANSI
-        SGR sequences (bold, color). The trailing class admits whitespace
-        and SGR runs after the colon so these still hit."""
-        s = self._fake_session(b"\x1b[1mPassword:\x1b[0m ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_colored_prompt_trailing_sgr_matches(self):
-        s = self._fake_session(b"Password: \x1b[0m")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_non_prompt_text_after_colon_does_not_match(self):
-        """ANSI CSI stripping must not turn non-prompt content into a
-        false match — the post-colon content still has to be whitespace
-        for the regex's `:\\s*$` anchor to fire."""
-        s = self._fake_session(b"Password:\x1b[Knot a prompt")
-        self.assertFalse(s.echo_off_hint())
-
-    def test_only_last_line_considered(self):
-        """Earlier lines containing the keyword must not trip detection
-        — only the line the cursor is on can be a live prompt."""
-        s = self._fake_session(
-            b"changing password for alexey\nuser@host:~$ ")
-        self.assertFalse(s.echo_off_hint())
-
-    def test_prompt_followed_by_newline_does_not_match(self):
-        """If the prompt has scrolled past with a trailing newline, the
-        cursor is on a fresh line and the user has already moved on."""
-        s = self._fake_session(b"[sudo] password for alexey: \n")
-        self.assertFalse(s.echo_off_hint())
-
-    def test_word_inside_running_text_does_not_match(self):
-        s = self._fake_session(
-            b"i could tell you my password but i won't, $ ")
-        self.assertFalse(s.echo_off_hint())
-
-    def test_prose_ending_with_password_colon_does_not_match(self):
-        """The keyword must be the label of the prompt, not a word
-        inside running prose. 'I forgot my password yesterday: ' has
-        the keyword and a trailing colon but is clearly not a prompt
-        — the conservative regex rejects it because the gap between
-        keyword and colon is filled with prose words rather than the
-        narrow PAM-style ' for X' shape."""
-        s = self._fake_session(b"I forgot my password yesterday: ")
-        self.assertFalse(s.echo_off_hint())
-        s = self._fake_session(b"echo password is supersecret: ")
-        self.assertFalse(s.echo_off_hint())
-        s = self._fake_session(b"My password: hunter2 was hacked")
-        self.assertFalse(s.echo_off_hint())
-
-    def test_doas_prompt_matches(self):
-        """doas, OpenBSD's sudo equivalent, uses the same shape."""
-        s = self._fake_session(b"doas (alexey@host) password: ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_passwd_change_prompts_match(self):
-        """passwd(1) emits three prompts in sequence."""
-        for tail in (b"(current) UNIX password: ",
-                     b"New password: ",
-                     b"Retype new password: "):
-            s = self._fake_session(tail)
-            self.assertTrue(s.echo_off_hint(),
-                            "expected match on " + repr(tail))
-
-    def test_osc_title_around_prompt_stripped(self):
-        """OSC sequences (terminal title updates from PAM modules) must
-        not break detection. xterm/gnome-terminal style: ESC ] 0; <title>
-        BEL or ST."""
-        # OSC with BEL terminator
-        s = self._fake_session(b"\x1b]0;sudo prompt\x07Password: ")
-        self.assertTrue(s.echo_off_hint())
-        # OSC with ST terminator
-        s = self._fake_session(b"\x1b]2;Sudo\x1b\\Password: ")
-        self.assertTrue(s.echo_off_hint())
-
-    def test_empty_tail(self):
-        s = self._fake_session(b"")
-        self.assertFalse(s.echo_off_hint())
-
-    def test_shell_prompt_does_not_match(self):
-        s = self._fake_session(b"alexey@hetzner-hel:~$ ")
-        self.assertFalse(s.echo_off_hint())
-
-    def test_regex_anchored_to_recent_tail_only(self):
-        """RECENT_TAIL_MAX bounds prevent unbounded buffer growth and
-        keep the regex cheap regardless of session output volume."""
-        s = self._fake_session()
-        # Lots of preceding output, then a newline, then the prompt —
-        # the realistic shape after truncation.
-        big = b"some output\n" * 30
-        s._recent_tail = (big + b"Password: ")[-server.RECENT_TAIL_MAX:]
-        self.assertTrue(s.echo_off_hint())
-
-    def test_tail_grows_then_truncates(self):
-        """End-to-end: feeding bytes through the same path the read loop
-        uses keeps _recent_tail bounded and still detects a final prompt."""
-        s = self._fake_session()
-        cap = server.RECENT_TAIL_MAX
-        for _ in range(20):
-            chunk = b"some shell output line\n"
-            s._recent_tail = (s._recent_tail + chunk)[-cap:]
-        self.assertLessEqual(len(s._recent_tail), cap)
-        prompt = b"\n[sudo] password for alexey: "
-        s._recent_tail = (s._recent_tail + prompt)[-cap:]
-        self.assertTrue(s.echo_off_hint())
-
-
 # ── Cross-thread wake machinery ────────────────────────────────────────
 # _stream and _output used to busy-poll session.read() at 100 Hz via
 # time.sleep(POLL_INTERVAL). They now park in Session.wait_for_data(),
@@ -2637,7 +2373,6 @@ class TestSessionNotify(unittest.TestCase):
         s.buf_lock = threading.Lock()
         s.alive = True
         s.output_buf = b""
-        s._recent_tail = b""
         s.last_activity = time.time()
         s.master_fd = -1
         s.pid = None
