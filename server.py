@@ -135,46 +135,6 @@ TERM_RESET = b"\x1b[?1049l\x1b[?25h\x1b[0m\x1bc"
 # Password prompt patterns (lowercase, checked against lowered PTY output)
 PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
 
-# Tail-of-output detector for prompts that typically disable echo on the
-# remote side (sudo, su, mysql -p, passwd, ssh passphrase). When the recent
-# PTY output ends with a match, the server hints the client via the output
-# payload's `echo_off` field — used to suppress the local-echo prediction
-# so typed chars aren't briefly rendered as dim glyphs at exactly those
-# prompts. Heuristic only: the *local* PTY (between server.py and the ssh
-# client) is in raw mode regardless of remote ECHO state, so we can't read
-# the remote pty's termios bit directly.
-# Recognize the "PAM-style label + colon" shape rather than any
-# co-occurrence of the keyword with a colon. Real prompts have a tight
-# structure:
-#     "Password:"                       — keyword then colon
-#     "[sudo] password for user:"       — keyword + " for " + username
-#     "Enter passphrase for key '...':" — keyword + " for " + path
-#     "(current) UNIX password:"        — keyword then colon
-#     "MySQL password:"                 — keyword then colon
-# Prose, by contrast, puts other words between the keyword and the
-# closing colon: "I forgot my password yesterday: ",
-# "echo password is supersecret: ". This regex accepts only:
-#   keyword + (immediate ":" with optional whitespace), OR
-#   keyword + " for ..." + ":" (the "for" is the only verb that appears
-#   in the canonical prompt shapes — covers sudo, ssh, doas, polkit).
-ECHO_OFF_PROMPT_RE = re.compile(
-    rb"(?i)\b(?:password|passcode|passphrase)\b"
-    rb"(?:\s*:|\s+for\s+[^:\n]{1,80}:)\s*$")
-# ANSI control sequences. CSI ends in an ASCII letter, OSC ends in BEL or
-# ST (ESC \), DCS/APC/PM/SOS end in ST. `\b` between a sequence terminator
-# and the next keyword would fail to match if the terminator is a word
-# char (CSI's ending letter is word-class), so we strip them before
-# applying ECHO_OFF_PROMPT_RE. Covers colored prompts (CSI), title-bar
-# updates around prompts (OSC), and DCS-wrapped prompts on exotic shells.
-ANSI_CSI_RE = re.compile(
-    rb"\x1b\[[0-9;]*[A-Za-z]"                           # CSI
-    rb"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"              # OSC ... BEL or ST
-    rb"|\x1b[PX\^_][^\x1b]*\x1b\\"                      # DCS/SOS/PM/APC ... ST
-)
-# Bytes of recent PTY output kept on each Session for ECHO_OFF_PROMPT_RE.
-# 256 covers any single-line prompt; the regex only inspects the last line.
-RECENT_TAIL_MAX = 256
-
 # Auth-failure patterns — if we see any of these AFTER we auto-typed the
 # password, ssh rejected our attempt and we should not keep the session
 # limping in an endless retry loop.
@@ -959,10 +919,6 @@ class SSHSession(object):
         self.master_fd = -1
         self.pid = None
         self.output_buf = b""
-        # Last RECENT_TAIL_MAX bytes of PTY output, kept independently of
-        # output_buf drain so echo_off_hint() can match against what the
-        # user actually sees on screen, not against what hasn't shipped.
-        self._recent_tail = b""
         self.buf_lock = Lock()
         # Cross-thread wake signal: the PTY read-loop calls _signal() (which
         # is _data_event.set()) after every output_buf update; consumers
@@ -1211,8 +1167,6 @@ class SSHSession(object):
                                 if len(self.output_buf) > OUTPUT_BUF_MAX:
                                     self.output_buf = (
                                         self.output_buf[-OUTPUT_BUF_KEEP:])
-                                self._recent_tail = (
-                                    self._recent_tail + data)[-RECENT_TAIL_MAX:]
                             self._signal()
                             self._auth_buf = b""
                             try:
@@ -1225,8 +1179,6 @@ class SSHSession(object):
                         self.output_buf += data
                         if len(self.output_buf) > OUTPUT_BUF_MAX:
                             self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
-                        self._recent_tail = (
-                            self._recent_tail + data)[-RECENT_TAIL_MAX:]
                     self._signal()
 
                 # Check if child exited
@@ -1250,9 +1202,6 @@ class SSHSession(object):
                         if leftover:
                             with self.buf_lock:
                                 self.output_buf += leftover
-                                self._recent_tail = (
-                                    self._recent_tail
-                                    + leftover)[-RECENT_TAIL_MAX:]
                             self._signal()
                         else:
                             break
@@ -1384,31 +1333,7 @@ class SSHSession(object):
                 ev.clear()
                 return
 
-    # ── Output helpers (echo-off / unread / write / resize) ─────────
-
-    def echo_off_hint(self):
-        """True iff the most recent PTY output ends with a prompt that
-        typically disables remote echo (sudo / mysql -p / passwd /
-        ssh passphrase / read -s). Forwarded to the client as the
-        `echo_off` field on output payloads so it can suppress the
-        local-echo prediction at exactly those prompts.
-
-        Stateless heuristic: re-evaluated on each call against the
-        last RECENT_TAIL_MAX bytes of output. We can't read the
-        remote pty's termios ECHO bit through the ssh tunnel, so
-        a tail-pattern match is the next-best signal."""
-        with self.buf_lock:
-            tail = self._recent_tail
-        # Only the last line matters — anything before \n is stale.
-        nl = tail.rfind(b"\n")
-        if nl >= 0:
-            tail = tail[nl + 1:]
-        # Strip ANSI CSI sequences so `\b` boundaries work correctly on
-        # colored prompts (CSI sequences end in a letter, which `\b`
-        # treats as a word char and refuses to break against the
-        # following keyword).
-        tail = ANSI_CSI_RE.sub(b"", tail)
-        return bool(ECHO_OFF_PROMPT_RE.search(tail))
+    # ── Output helpers (unread / write / resize) ────────────────────
 
     def unread(self, data):
         """Push bytes back to the front of the output buffer.
@@ -2482,7 +2407,6 @@ class Handler(BaseHTTPRequestHandler):
                             "data": base64.b64encode(data).decode("ascii"),
                             "alive": session.alive,
                             "auth_failed": session.auth_failed,
-                            "echo_off": session.echo_off_hint(),
                         })
                     except (BrokenPipeError, ConnectionResetError, OSError):
                         session.unread(data)
@@ -2490,8 +2414,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 if not session.alive:
                     self._json({"data": "", "alive": False,
-                                "auth_failed": session.auth_failed,
-                                "echo_off": session.echo_off_hint()})
+                                "auth_failed": session.auth_failed})
                     return
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -2505,8 +2428,7 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
         self._json({"data": "", "alive": session.alive,
-                    "auth_failed": session.auth_failed,
-                    "echo_off": session.echo_off_hint()})
+                    "auth_failed": session.auth_failed})
 
     def _stream(self):
         """SSE: stream output as 'data' events until session dies or client
@@ -2588,13 +2510,11 @@ class Handler(BaseHTTPRequestHandler):
             # let it through (timer fires, fallback to long-poll); a
             # healthy channel delivers it instantly even on a session
             # that has nothing to print yet (idle reconnect, quiet tmux
-            # pane, long-running command with no output). Carries the
-            # current echo_off hint so the gate is correct from frame 1.
+            # pane, long-running command with no output).
             primer = json.dumps({
                 "data": "",
                 "alive": session.alive,
                 "auth_failed": session.auth_failed,
-                "echo_off": session.echo_off_hint(),
             })
             self.wfile.write(
                 ("event: data\ndata: " + primer + "\n\n").encode("utf-8"))
@@ -2634,7 +2554,6 @@ class Handler(BaseHTTPRequestHandler):
                         "data": base64.b64encode(data).decode("ascii"),
                         "alive": session.alive,
                         "auth_failed": session.auth_failed,
-                        "echo_off": session.echo_off_hint(),
                     })
                     self.wfile.write(
                         ("event: data\ndata: " + payload + "\n\n")
@@ -2672,7 +2591,6 @@ class Handler(BaseHTTPRequestHandler):
                     "data": base64.b64encode(tail).decode("ascii"),
                     "alive": False,
                     "auth_failed": session.auth_failed,
-                    "echo_off": session.echo_off_hint(),
                 })
                 try:
                     self.wfile.write(
@@ -2686,16 +2604,9 @@ class Handler(BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     session.unread(tail)
                     return
-            # Carry echo_off here too for consistency with event:data
-            # frames. The browser's handleOutputPayload only updates
-            # p.echoEnabled when the field is present; missing field
-            # would leave a stale echo-off-on state if the session
-            # disconnected at exactly the moment the user finished a
-            # password prompt. Cheap to include, no-op on the happy path.
             end_payload = json.dumps({
                 "alive": False,
                 "auth_failed": session.auth_failed,
-                "echo_off": session.echo_off_hint(),
             })
             self.wfile.write(
                 ("event: end\ndata: " + end_payload + "\n\n")
