@@ -151,8 +151,8 @@ function createPane(container) {
       `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>&#x2B06;</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
       `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>&#x2B07;</button>` +
-      `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split horizontally (new pane below)" aria-label="Split horizontally — pane below">&#x25A4;</button>` +
-      `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split vertically (new pane to the right)" aria-label="Split vertically — pane right">&#x25A5;</button>` +
+      `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">&#x2194;</button>` +
+      `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">&#x2195;</button>` +
       `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">&#x2715;</button>` +
     `</div>` +
     `<div class="reconnect-bar h" data-reconnect="${id}">` +
