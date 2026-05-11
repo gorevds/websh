@@ -38,10 +38,11 @@ let serverConfig = null;
 const SETTINGS_KEY = 'websh_settings';
 const DEFAULT_SETTINGS = {
   fontSize: 14, lineHeight: 1.0, fontWeight: 400, font: 'jetbrains-mono',
-  // tmux options sent on /api/connect when persistent. Defaults give a
-  // sensible "wheel scrolls" UX out of the box; users on hosts with their
-  // own .tmux.conf can uncheck them to fall back to that file.
-  tmuxMouse: true, tmuxClipboard: true, tmuxHistory: 100000
+  // tmux options sent on /api/connect when persistent. tmux mouse mode
+  // is no longer user-configurable — the server hardcodes `set -g mouse
+  // on` so wheel-scroll-history and click-in-vim work out of the box
+  // without ever needing to toggle in /options.
+  tmuxClipboard: true, tmuxHistory: 100000
 };
 // id → [label, webfont-name-or-null, fallback-stack]
 // webfont-name is the family loaded via Google Fonts; null = system only.
@@ -595,8 +596,8 @@ function buildConnectBody(rec, termCols, termRows) {
     b.slot_id = rec.slot_id || slotIdFor(rec.user, rec.host, rec.port);
     // tmux options from local settings, applied on every connect/resume.
     // Server validates against an allow-list, so unexpected values are
-    // dropped silently rather than fail the connect.
-    b.tmux_mouse = !!settings.tmuxMouse;
+    // dropped silently rather than fail the connect. Mouse is hardcoded
+    // on the server side (no user-facing toggle).
     b.tmux_set_clipboard = !!settings.tmuxClipboard;
     let hl = parseInt(settings.tmuxHistory, 10);
     if (Number.isFinite(hl) && hl >= 100) b.tmux_history_limit = hl;
@@ -2455,7 +2456,6 @@ function openOptions(){
   $('optLineHeightVal').textContent = Number(settings.lineHeight).toFixed(2);
   $('optWeight').value = settings.fontWeight;
   $('optWeightVal').textContent = settings.fontWeight;
-  let cm = $('optTmuxMouse'); if (cm) cm.checked = !!settings.tmuxMouse;
   let cc = $('optTmuxClipboard'); if (cc) cc.checked = !!settings.tmuxClipboard;
   let ch = $('optTmuxHistory'); if (ch) ch.value = settings.tmuxHistory;
   renderOptPreview();
@@ -2491,8 +2491,7 @@ document.addEventListener('DOMContentLoaded', () => {
   lh.addEventListener('input', () => onOptInput('lineHeight', lh, lhv, v => v.toFixed(2)));
   w.addEventListener('input', () => onOptInput('fontWeight', w, wv, v => String(v)));
   f.addEventListener('change', () => { settings.font = f.value; saveSettings(); applySettings(); renderOptPreview(); });
-  let cm = $('optTmuxMouse'), cc = $('optTmuxClipboard'), ch = $('optTmuxHistory');
-  if (cm) cm.addEventListener('change', () => { settings.tmuxMouse = cm.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
+  let cc = $('optTmuxClipboard'), ch = $('optTmuxHistory');
   if (cc) cc.addEventListener('change', () => { settings.tmuxClipboard = cc.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
   if (ch) ch.addEventListener('change', () => {
     let v = parseInt(ch.value, 10);
@@ -2512,7 +2511,6 @@ document.addEventListener('DOMContentLoaded', () => {
 // a running editor / pager that happens to occupy the foreground PTY.
 function pushTmuxOptionsToActiveSessions() {
   let payload = {
-    tmux_mouse: !!settings.tmuxMouse,
     tmux_set_clipboard: !!settings.tmuxClipboard,
   };
   let hl = parseInt(settings.tmuxHistory, 10);

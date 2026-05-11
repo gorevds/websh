@@ -2752,7 +2752,8 @@ class TestBuildRemoteCommand(unittest.TestCase):
         cmd = server._build_remote_command("alice", "tmux", 0)
         self.assertEqual(
             cmd,
-            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l')
+            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
+            ' \\; set -g mouse on')
 
     def test_ttl_negative_treated_as_disabled(self):
         # The _build function is called with TMUX_IDLE_TTL which is
@@ -2770,7 +2771,8 @@ class TestBuildRemoteCommand(unittest.TestCase):
         self.assertIn("-ge 3600", cmd)  # the TTL comparison
         # Ends with the exec so the login shell doesn't linger.
         self.assertTrue(cmd.rstrip().endswith(
-            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'))
+            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
+            ' \\; set -g mouse on'))
 
     def test_ttl_uses_session_last_attached(self):
         """Watchdog must read session_last_attached so reconnects reset
@@ -2854,10 +2856,12 @@ class TestBuildRemoteCommand(unittest.TestCase):
     def test_tmux_options_chained_after_new_session(self):
         """Per-connect tmux options are tacked onto the same `tmux …`
         invocation via `\\;`, so they apply to the global tmux server
-        whether the session was newly created or re-attached."""
+        whether the session was newly created or re-attached. `set -g
+        mouse on` is part of the baseline (hardcoded, not via the
+        options list) so the chain starts with it before user options."""
         cmd = server._build_remote_command(
             "ok", "tmux", 0,
-            tmux_options=[("mouse", "on"), ("set-clipboard", "on"),
+            tmux_options=[("set-clipboard", "on"),
                           ("history-limit", "100000")])
         self.assertIn(
             'new-session -A -D -s websh-ok -- "$SHELL" -l'
@@ -2865,6 +2869,16 @@ class TestBuildRemoteCommand(unittest.TestCase):
             ' \\; set -g set-clipboard on'
             ' \\; set -g history-limit 100000',
             cmd)
+
+    def test_mouse_on_baked_into_command(self):
+        """Mouse is hardcoded on the server side — every command must
+        include `set -g mouse on` regardless of options passed in."""
+        for tmux_options in (None, [], [("set-clipboard", "off")]):
+            cmd = server._build_remote_command(
+                "ok", "tmux", 0, tmux_options=tmux_options)
+            self.assertIn(' \\; set -g mouse on', cmd,
+                "missing baked-in mouse on for tmux_options=%r" %
+                (tmux_options,))
 
     def test_tmux_options_none_leaves_command_unchanged(self):
         baseline = server._build_remote_command("ok", "tmux", 0)
@@ -2878,7 +2892,8 @@ class TestBuildRemoteCommand(unittest.TestCase):
     def test_tmux_options_sh_syntax_valid_with_ttl(self):
         ok, err = self._sh_syntax_ok(server._build_remote_command(
             "ok", "tmux", 86400,
-            tmux_options=[("mouse", "off"), ("history-limit", "50000")]))
+            tmux_options=[("set-clipboard", "off"),
+                          ("history-limit", "50000")]))
         self.assertTrue(ok, "sh -n rejected with tmux_options: " + err)
 
 
@@ -2893,13 +2908,13 @@ class TestValidateTmuxOptions(unittest.TestCase):
 
     def test_bool_true_becomes_on(self):
         self.assertEqual(
-            server._validate_tmux_options({"tmux_mouse": True}),
-            [("mouse", "on")])
+            server._validate_tmux_options({"tmux_set_clipboard": True}),
+            [("set-clipboard", "on")])
 
     def test_bool_false_becomes_off(self):
         self.assertEqual(
-            server._validate_tmux_options({"tmux_mouse": False}),
-            [("mouse", "off")])
+            server._validate_tmux_options({"tmux_set_clipboard": False}),
+            [("set-clipboard", "off")])
 
     def test_bool_string_on_off(self):
         self.assertEqual(
@@ -2913,7 +2928,8 @@ class TestValidateTmuxOptions(unittest.TestCase):
         # 'true', 2, None — none of these match the allow-list
         for v in ("true", 2, None, "yes", [], {}):
             self.assertEqual(
-                server._validate_tmux_options({"tmux_mouse": v}), [],
+                server._validate_tmux_options({"tmux_set_clipboard": v}),
+                [],
                 "value %r should have been dropped" % (v,))
 
     def test_history_limit_in_range(self):
@@ -2947,21 +2963,21 @@ class TestValidateTmuxOptions(unittest.TestCase):
             "tmux_evil": "rm -rf /",
             "tmux_status": "on",  # not on the allow-list
             "host": "ignored",
-            "tmux_mouse": True,
+            "tmux_mouse": True,  # legacy key, no longer on the allow-list
+            "tmux_set_clipboard": True,
         }
         self.assertEqual(
-            server._validate_tmux_options(body), [("mouse", "on")])
+            server._validate_tmux_options(body),
+            [("set-clipboard", "on")])
 
     def test_combined_body(self):
         body = {
-            "tmux_mouse": True,
             "tmux_set_clipboard": False,
             "tmux_history_limit": 200000,
         }
         self.assertEqual(
             server._validate_tmux_options(body),
-            [("mouse", "on"),
-             ("set-clipboard", "off"),
+            [("set-clipboard", "off"),
              ("history-limit", "200000")])
 
 
@@ -3496,13 +3512,13 @@ class TestTmuxOptionsHTTPDispatch(unittest.TestCase):
     def test_unknown_session_404(self):
         body, code = self._post("/api/tmux_options",
                                 {"session_id": str(uuid.uuid4()),
-                                 "tmux_mouse": True})
+                                 "tmux_set_clipboard": True})
         self.assertEqual(code, 404)
 
     def test_invalid_session_id_404(self):
         body, code = self._post("/api/tmux_options",
                                 {"session_id": "not-a-uuid",
-                                 "tmux_mouse": True})
+                                 "tmux_set_clipboard": True})
         self.assertEqual(code, 404)
 
     def test_invalid_json_400(self):
@@ -3534,22 +3550,23 @@ class TestTmuxOptionsHTTPDispatch(unittest.TestCase):
         try:
             body, code = self._post("/api/tmux_options", {
                 "session_id": sid,
-                "tmux_mouse": True,
                 "tmux_set_clipboard": False,
                 "tmux_history_limit": 50000,
                 # Garbage that must be dropped by validation, never passed
-                # through to the session:
+                # through to the session. `tmux_mouse` lands here too —
+                # mouse is hardcoded on the server side and no longer
+                # configurable per-session.
+                "tmux_mouse": True,
                 "tmux_evil": "rm -rf /",
                 "tmux_status": "on",
             })
             self.assertEqual(code, 200)
             self.assertTrue(body["ok"])
             self.assertEqual(set(body["applied"]),
-                             {"mouse", "set-clipboard", "history-limit"})
-            self.assertIn(("mouse", "on"), captured["opts"])
+                             {"set-clipboard", "history-limit"})
             self.assertIn(("set-clipboard", "off"), captured["opts"])
             self.assertIn(("history-limit", "50000"), captured["opts"])
-            self.assertEqual(len(captured["opts"]), 3)
+            self.assertEqual(len(captured["opts"]), 2)
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
@@ -3565,7 +3582,8 @@ class TestTmuxOptionsHTTPDispatch(unittest.TestCase):
             server.sessions[sid] = FakeSession()
         try:
             body, code = self._post("/api/tmux_options",
-                                    {"session_id": sid, "tmux_mouse": True})
+                                    {"session_id": sid,
+                                     "tmux_set_clipboard": True})
             self.assertEqual(code, 502)
             self.assertIn("control socket", body["error"])
         finally:
