@@ -2408,9 +2408,17 @@ function fitPaneWhenStable(p, opts){
   // the in-flight call will land on the latest values anyway.
   if (p._fitInFlight) return;
   p._fitInFlight = true;
+  // Stuck-timer safety. If the font load hangs (CDN unreachable,
+  // captive portal, document.fonts.ready waiting on an unrelated
+  // never-completing face) the flag would stay true forever and every
+  // subsequent fitPaneWhenStable call — including the 1 s watchdog —
+  // would silently bail. After 10 s, force-release the flag; the
+  // settle-loop checks p._fitInFlight at every iteration and exits
+  // cleanly if the timer fired mid-flight (no double-fit, no leak).
+  let stuckTimer = setTimeout(() => { p._fitInFlight = false; }, 10000);
   let shouldFlush = !opts || opts.flush !== false;
   let onSettled = (opts && opts.onSettled) || null;
-  let release = () => { p._fitInFlight = false; };
+  let release = () => { clearTimeout(stuckTimer); p._fitInFlight = false; };
   let f = FONTS[settings.font];
   let webfont = f && f[1];
   // `document.fonts.load(spec)` actively triggers the load AND resolves
@@ -2424,27 +2432,34 @@ function fitPaneWhenStable(p, opts){
         .then(() => document.fonts.ready)
     : Promise.resolve();
   waitFont.then(() => {
-    if (panes[p.id] !== p) { release(); return; }
+    if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
     // Invalidate xterm's CharSizeService cache via a no-op fontFamily
-    // round-trip — the setter triggers re-measure regardless of value.
+    // round-trip. xterm v5's options setter has a value-equality
+    // short-circuit (`rawOptions[k] !== v && fire(k)`), so the
+    // intermediate value MUST differ from the original — otherwise
+    // both setters get filtered out and no re-measure happens. Pair
+    // the canonical fallback families ('monospace' / 'serif') so the
+    // sentinel is guaranteed to differ from the user's actual stack.
     let ff = p.term.options.fontFamily;
-    p.term.options.fontFamily = 'monospace';
+    let invalidator = (ff === 'monospace' ? 'serif' : 'monospace');
+    p.term.options.fontFamily = invalidator;
     p.term.options.fontFamily = ff;
     // Belt-and-suspenders: directly invoke xterm's internal measurement
     // service. The options round-trip is supposed to trigger this via
-    // its onMultipleOptionChange listener, but the actual measure()
-    // reads offsetWidth from a hidden <span> that must have been laid
-    // out with the new font face. Calling it again from each settle
+    // its options-change listener, but the actual measure() reads
+    // offsetWidth from a hidden <span> that must have been laid out
+    // with the new font face. Calling it again from each settle
     // iteration guarantees the cached width can't pin the loop at a
     // wrong-cols fixed point.
     let forceMeasure = () => {
       try { p.term._core._charSizeService.measure(); } catch(e){}
     };
     // Settle loop: fit, observe cols, fit again next frame until two
-    // consecutive iterations agree, or we hit the cap.
+    // consecutive iterations agree, or we hit the cap of 8 attempts
+    // (~130 ms total, imperceptible).
     let attempts = 0, lastCols = -1;
     let step = () => {
-      if (panes[p.id] !== p) { release(); return; }
+      if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
       forceMeasure();
       try { p.fitAddon.fit(); } catch(e){}
       let cols = p.term.cols;
@@ -2474,6 +2489,9 @@ function fitPaneWhenStable(p, opts){
 const PANE_DRIFT_CHECK_MS = 1000;
 const PANE_DRIFT_TOLERANCE_PX = 3;
 setInterval(() => {
+  // Skip when no panes are open — no panes means no terminals to fit,
+  // and getComputedStyle / Object.values churn every second is silly.
+  if (!Object.keys(panes).length) return;
   Object.values(panes).forEach(p => {
     if (!p || !p.term || !p.term.element || !p.term.element.parentElement) {
       return;
