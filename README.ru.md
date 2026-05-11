@@ -1,4 +1,4 @@
-# <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"></picture> websh
+# <img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"> websh
 
 [English](README.md) | **Русский**
 
@@ -50,7 +50,6 @@ Shared-хостинг не даёт держать долгоживущий пр
 
 - Разделение на панели, горизонтально и вертикально, с перетаскиваемыми разделителями
 - Переключение панелей: `Ctrl+Tab` / `Ctrl+Shift+Tab`
-- Тёмная и светлая темы (выбор сохраняется)
 - Выбор шрифта (⚙) с живым предпросмотром — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono, Source Code Pro, Inconsolata или системный. Кастомный размер, межстрочный, начертание
 
 ### 🔁 Постоянные сессии
@@ -125,7 +124,7 @@ python3 server.py
         websh.js            <- логика фронтенда
         api.php             <- PHP-прокси
         server.py           <- бэкенд (автозапускается api.php)
-        assets/             <- бренд-SVG (логотипы, светлая/тёмная)
+        assets/             <- бренд-SVG (логотип)
 ```
 
 **Шаги:**
@@ -486,10 +485,10 @@ TRUSTED_PROXIES=127.0.0.1,10.0.0.5 python3 server.py
 
 ```
 index.html                Фронтенд — xterm.js терминал + UI подключений
-websh.js                  Логика фронтенда — управление панелями, передача файлов, темы
+websh.js                  Логика фронтенда — управление панелями, передача файлов
 api.php                   PHP-прокси — пробрасывает запросы браузера на бэкенд (опционально)
 server.py                 Python-бэкенд — управляет SSH-сессиями через PTY, отдаёт фронтенд
-assets/                   Бренд-SVG (логотипы, светлая/тёмная) загружаемые index.html
+assets/                   Бренд-SVG (логотип) загружаемый index.html
 websh.json.example        Пример серверного конфига
 test_server.py            Тесты бэкенда (unit + integration)
 tests/frontend/           Тесты фронтенда на jsdom
