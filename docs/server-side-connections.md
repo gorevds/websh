@@ -42,6 +42,15 @@ Override default SSH behavior for specific connections:
 }
 ```
 
+Only the connection-shape options (host-key policy, jump host,
+timeouts, algorithm preferences) are accepted. Directives that turn
+`ssh -o` into local command execution — `ProxyCommand`, `LocalCommand`,
+`PermitLocalCommand`, `KnownHostsCommand`, `Include`, `Match`,
+`IdentityAgent` — are dropped at session creation with a WARN in the
+server log. If you need those, put them in the system `ssh_config` on
+the websh host instead of in `websh.json` (which has a broader trust
+profile — FTP'able on shared hosting, sometimes restored from backups).
+
 ## Connection kinds: Ready vs Prompt
 
 Each `connections[]` entry is one of two kinds, auto-detected by whether

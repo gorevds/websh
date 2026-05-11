@@ -3041,6 +3041,78 @@ esac
 """
 
 
+class TestFilterSshOptions(unittest.TestCase):
+    """Allow-list for `ssh -o` options coming from websh.json. Keys not
+    on the list (ProxyCommand, LocalCommand, Include, KnownHostsCommand,
+    IdentityAgent, …) are dropped — they turn an editable config into
+    RCE on the websh host."""
+
+    def test_safe_keys_pass(self):
+        opts = {"StrictHostKeyChecking": "yes", "ProxyJump": "bastion",
+                "UserKnownHostsFile": "/home/x/.ssh/k",
+                "ServerAliveInterval": "30"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, opts)
+        self.assertEqual(dropped, [])
+
+    def test_proxy_command_dropped(self):
+        opts = {"ProxyCommand": "evil-script"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, {})
+        self.assertEqual(dropped, ["ProxyCommand"])
+
+    def test_local_command_dropped(self):
+        opts = {"LocalCommand": "id", "PermitLocalCommand": "yes"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, {})
+        self.assertEqual(sorted(dropped),
+                         ["LocalCommand", "PermitLocalCommand"])
+
+    def test_include_and_match_dropped(self):
+        opts = {"Include": "/etc/ssh/evil.conf",
+                "Match": "exec /tmp/evil"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, {})
+        self.assertEqual(sorted(dropped), ["Include", "Match"])
+
+    def test_known_hosts_command_dropped(self):
+        opts = {"KnownHostsCommand": "/tmp/evil"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, {})
+
+    def test_identity_agent_dropped(self):
+        opts = {"IdentityAgent": "/tmp/evil.sock"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, {})
+
+    def test_case_insensitive(self):
+        opts = {"stricthostkeychecking": "yes", "PROXYJUMP": "b",
+                "ProxyJUMP": "c"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, opts)
+        self.assertEqual(dropped, [])
+
+    def test_mixed_pass_and_drop(self):
+        opts = {"StrictHostKeyChecking": "yes", "ProxyCommand": "evil",
+                "ConnectTimeout": "10"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, {"StrictHostKeyChecking": "yes",
+                                    "ConnectTimeout": "10"})
+        self.assertEqual(dropped, ["ProxyCommand"])
+
+    def test_non_string_key_dropped(self):
+        opts = {None: "x", 5: "y", "StrictHostKeyChecking": "yes"}
+        filtered, dropped = server._filter_ssh_options(opts)
+        self.assertEqual(filtered, {"StrictHostKeyChecking": "yes"})
+        # Non-string keys come back through repr() so the WARN message
+        # never crashes on the join.
+        self.assertEqual(sorted(dropped), ["5", "None"])
+
+    def test_empty_inputs(self):
+        self.assertEqual(server._filter_ssh_options({}), ({}, []))
+        self.assertEqual(server._filter_ssh_options(None), ({}, []))
+
+
 class TestWatchdogRuntime(unittest.TestCase):
     """Integration test: run the actual shell command against a fake
     tmux and verify the watchdog kills the session after TTL seconds.

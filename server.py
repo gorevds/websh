@@ -331,6 +331,78 @@ def _validate_tmux_options(body):
             out.append((opt, str(iv)))
     return out
 
+
+# ─── ssh_options allow-list ─────────────────────────────────────────
+#
+# Default-deny for `ssh -o KEY=VALUE` pairs sourced from websh.json.
+# Anything not on this list is dropped at session construction time
+# with an operator-visible WARN.
+#
+# Why this is restrictive: websh.json is a broader trust surface than
+# it looks — on shared hosting it lives next to the site files (FTP'able,
+# sometimes restored from backups, occasionally edited by CI bots) — and
+# a few ssh-config directives turn that surface directly into RCE on the
+# websh host:
+#
+#   ProxyCommand / KnownHostsCommand — exec at connect time
+#   LocalCommand + PermitLocalCommand — exec after auth
+#   Include / Match exec — pull in / dispatch on arbitrary commands
+#   IdentityAgent — point ssh at an attacker-controlled agent socket
+#
+# The allow-list covers the connection-shape options people actually
+# put in websh.json (host-key policy, jump host, timeouts, algorithm
+# preferences). Anything more exotic should go in the system ssh_config
+# on the websh host, which has tighter access controls than websh.json.
+# Matching is case-insensitive to mirror ssh_config(5).
+_SSH_OPTIONS_ALLOWED = frozenset({
+    "stricthostkeychecking",
+    "userknownhostsfile",
+    "globalknownhostsfile",
+    "checkhostip",
+    "verifyhostkeydns",
+    "proxyjump",
+    "connecttimeout",
+    "connectionattempts",
+    "serveraliveinterval",
+    "serveralivecountmax",
+    "tcpkeepalive",
+    "compression",
+    "identitiesonly",
+    "preferredauthentications",
+    "pubkeyacceptedalgorithms",
+    "pubkeyacceptedkeytypes",
+    "hostkeyalgorithms",
+    "kexalgorithms",
+    "ciphers",
+    "macs",
+    "port",
+    "bindaddress",
+    "exitonforwardfailure",
+    "loglevel",
+    "addressfamily",
+    "requesttty",
+})
+
+
+def _filter_ssh_options(opts):
+    """Apply the ssh_options allow-list. Returns (filtered_dict, dropped_keys).
+
+    Keys are matched case-insensitively. Non-string keys are also dropped
+    (they would crash the f"{}={}" interpolation anyway and have no
+    legitimate source — only a malformed JSON config could produce them).
+    """
+    if not opts:
+        return {}, []
+    filtered = {}
+    dropped = []
+    for k, v in opts.items():
+        if not isinstance(k, str) or k.lower() not in _SSH_OPTIONS_ALLOWED:
+            dropped.append(k if isinstance(k, str) else repr(k))
+            continue
+        filtered[k] = v
+    return filtered, dropped
+
+
 # Static file serving (Python-only mode, without PHP proxy)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _STATIC_FILES = {
@@ -966,7 +1038,16 @@ class SSHSession(object):
         # classify auth vs network failure via the 255 exit code.
         self._exit_status = None
         self._key_file = None
-        self._ssh_options = ssh_options or {}
+        # Strip any -o option that isn't on the safe allow-list (see
+        # _SSH_OPTIONS_ALLOWED). Filter here so SSHSession is also
+        # defended when constructed from places other than _connect
+        # (e.g. tests, future code paths).
+        self._ssh_options, _ssh_opts_dropped = _filter_ssh_options(ssh_options)
+        if _ssh_opts_dropped:
+            _log("WARN", ("session {}: dropped ssh_options not in allow-list: "
+                          "{} — edit websh.json to remove or use the system "
+                          "ssh_config on the websh host").format(
+                session_id, ", ".join(sorted(_ssh_opts_dropped))))
         self.persistent = bool(persistent and slot_id)
         self.slot_id = slot_id if self.persistent else None
         self.tmux_cmd = tmux_cmd if _TMUX_CMD_RE.match(tmux_cmd or "") else "tmux"
