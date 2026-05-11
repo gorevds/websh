@@ -201,6 +201,20 @@ function createPane(container) {
   // Schedule a font-load-aware settle-loop refit after registration so
   // the helper can guard its RAFs against pane teardown via panes[id].
   fitPaneWhenStable(p);
+  // Event-driven safety: xterm's CharSizeService re-measures whenever
+  // the underlying char metrics change (most commonly: the webfont
+  // finally arrives and renders wider than the fallback). When it
+  // does, refit immediately — without this listener the visible cols
+  // stay at the fallback-derived value until the next external
+  // trigger (resize / settings change / 5 s drift-watchdog tick).
+  try {
+    let cs = term._core && term._core._charSizeService;
+    if (cs && cs.onCharSizeChange) {
+      cs.onCharSizeChange(() => {
+        if (panes[id] === p) fitPaneWhenStable(p);
+      });
+    }
+  } catch (e) { /* xterm internals shifted — fall back to polling */ }
 
   // Focus tracking
   el.addEventListener('mousedown', () => { activatePane(id) });
