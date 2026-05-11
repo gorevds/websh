@@ -3015,7 +3015,10 @@ class Handler(BaseHTTPRequestHandler):
             # Snapshot attacker-relevant state up front: if cleanup
             # raises we still want the access-log entry, with `error`
             # set so the failure is observable.
-            host_for_log = getattr(session, "host", "")
+            # SSHSession stores it as `_host`; the prior `"host"` lookup
+            # silently fell through to "" so every disconnect record had
+            # empty target_host, breaking fail2ban correlation.
+            host_for_log = getattr(session, "_host", "")
             err = None
             try:
                 if terminate:

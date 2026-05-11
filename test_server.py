@@ -5440,7 +5440,7 @@ class TestAccessLogDisconnectEvents(unittest.TestCase):
         class _Stub(object):
             pass
         s = _Stub()
-        s.host = host
+        s._host = host
         s.terminated = False
         s.closed = False
         def _term():
