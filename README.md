@@ -344,6 +344,14 @@ These `set -g` lines run after the target's own `~/.tmux.conf` and
 therefore override matching options there. Untick the toggles in the
 Options panel if you'd rather your host-side config win.
 
+**tmux status bar is hidden by default.** websh runs `set -g status
+off` on every persistent attach. Multi-pane is handled by websh's
+own splits (each pane is a separate SSH connection), not by tmux
+windows, so the default status bar — slot-id session name, empty
+window list, and a clock — is visual noise that just steals a row of
+terminal real estate. To re-enable for a single session: `Ctrl+B
+:set -g status on` (resets on next reconnect).
+
 ## Configuration
 
 Environment variables for `server.py`:

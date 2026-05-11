@@ -273,8 +273,14 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     no user-controlled data is ever evaluated as shell.
     """
     tname = "websh-" + slot_id
+    # `set -g status off` hides tmux's bottom status bar. websh manages
+    # its own multi-pane UX on the frontend (split panes are independent
+    # SSH connections, not tmux windows), so the default status bar —
+    # showing the slot-id session name, an empty window list, and a
+    # clock — is visual noise that just steals a row of terminal real
+    # estate.
     attach = (tmux_cmd + " new-session -A -D -s " + tname
-              + ' -- "$SHELL" -l')
+              + ' -- "$SHELL" -l \\; set -g status off')
     # Per-connect tmux options. Tuples are pre-validated against an
     # allow-list (see _validate_tmux_options) so direct interpolation
     # below is shell- and tmux-injection-safe. `\;` chains commands in
