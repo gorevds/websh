@@ -263,7 +263,13 @@ function createPane(container) {
     el.classList.remove('bell'); void el.offsetWidth; el.classList.add('bell');
   });
 
-  // Right-click paste
+  // Right-click paste. Also swallow button-2 mousedown at capture phase
+  // so xterm.js never forwards it to the remote — otherwise tmux (with
+  // `mouse on`) catches MouseDown3Pane and pops its own menu, which
+  // competes with our paste UX.
+  termEl.addEventListener('mousedown', e => {
+    if (e.button === 2) e.stopPropagation();
+  }, true);
   termEl.addEventListener('contextmenu', e => {
     e.preventDefault();
     if(navigator.clipboard && navigator.clipboard.readText){
