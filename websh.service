@@ -23,5 +23,11 @@ ProtectHome=read-only
 PrivateTmp=yes
 ReadWritePaths=/tmp
 
+# Open-file limit. Each active session holds: 1 PTY master_fd + 1 SSH
+# ControlMaster socket + 1 epoll fd in every SSE/long-poll worker. Under
+# 50 sessions × split panes + side-channel uploads the default 1024 is
+# easy to exhaust without a clear error. 4096 leaves plenty of slack.
+LimitNOFILE=4096
+
 [Install]
 WantedBy=multi-user.target

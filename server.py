@@ -14,6 +14,9 @@ Environment variables:
     WEBSH_CONFIG          — path to websh.json config file (optional)
     TRUSTED_PROXIES       — comma-separated IPs to trust X-Forwarded-For from (default: 127.0.0.1)
     MAX_BG_SESSIONS       — max background SSH sessions for file transfer (default: 50)
+    WEBSH_MAX_THREADS     — max concurrent HTTP worker threads; new requests
+                            past this get 503 immediately (default:
+                            4*(MAX_SESSIONS+MAX_BG_SESSIONS)+64 = 464)
     RATE_LIMIT_MAX        — max /api/connect attempts per IP per window (default: 50)
     RATE_LIMIT_WINDOW     — rate-limit window in seconds (default: 60)
     WEBSH_TMUX_IDLE_TTL   — seconds a detached persistent tmux session may idle
@@ -65,8 +68,7 @@ import urllib.parse
 import uuid
 from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Event, BoundedSemaphore
 
 __version__ = "0.2.0"
 
@@ -93,6 +95,36 @@ MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
 # an abuser holding N sessions does not care about the classification.
 MAX_SESSIONS_PER_IP = _int_env("MAX_SESSIONS_PER_IP", "0")
 MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "50")
+# Bound on concurrent HTTP worker threads. ThreadingMixIn would spawn a
+# thread per request without limit — a glitchy client that reconnects
+# /api/stream in a tight loop could explode the thread count before any
+# session-cap triggers. Default leaves room for every active session's
+# SSE worker (and a long-poll fallback worker on each) plus headroom
+# for short requests. When the bound is hit the new request gets a
+# 503 immediately instead of queuing.
+def _clamp_max_threads(value):
+    """Clamp WEBSH_MAX_THREADS to >=1 with a startup WARN on out-of-range
+    input. Factored out so tests can drive the same clamp logic the
+    module uses at import time, instead of re-implementing the
+    arithmetic inside the test body.
+
+    BoundedSemaphore(0) raises ValueError at startup, and an operator
+    who sets WEBSH_MAX_THREADS=0 thinking "unlimited" (the way some
+    other knobs work) would kill the process before serving anything.
+    Clamp loudly so the misconfiguration surfaces instead of crashing.
+    There is no "unlimited" mode by design — use a large explicit value.
+    """
+    if value < 1:
+        sys.stderr.write(
+            "WARN: WEBSH_MAX_THREADS={} is below the minimum of 1; "
+            "clamping. There is no 'unlimited' mode — set a large "
+            "value if you want effectively no cap.\n".format(value))
+        return 1
+    return value
+
+
+MAX_THREADS = _clamp_max_threads(_int_env(
+    "WEBSH_MAX_THREADS", str(4 * (MAX_SESSIONS + MAX_BG_SESSIONS) + 64)))
 # Hard cap on a single binary upload via /api/upload (bytes).
 MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 # Hard cap on a single binary download via /api/download (bytes). The
@@ -3136,9 +3168,115 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
 
-class Server(ThreadingMixIn, HTTPServer):
+_BUSY_RESPONSE = (
+    b"HTTP/1.1 503 Service Unavailable\r\n"
+    b"Content-Type: application/json\r\n"
+    b"Content-Length: 17\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+    b'{"error":"busy"}\n'
+)
+
+
+class Server(HTTPServer):
+    """Threaded HTTP server with a hard cap on concurrent workers.
+
+    Drop-in replacement for socketserver.ThreadingMixIn+HTTPServer. The
+    plain mixin spawns a thread per request without limit; under a
+    glitchy client that reconnects /api/stream in a tight loop, or a
+    coordinated DoS, the thread count would explode before any of the
+    session/IP caps trigger.
+
+    We hold a BoundedSemaphore sized to WEBSH_MAX_THREADS (env). The
+    semaphore is acquired non-blocking in process_request; if it's
+    exhausted the request gets an immediate 503 and the socket is shut
+    down — better than queuing, which would create the same back-pressure
+    failure mode with a longer fuse. Worker slot is released in a finally
+    so a handler exception can't leak it.
+
+    Permit-leak defences:
+      - process_request wraps Thread()+start() in try/except so a spawn
+        failure (RuntimeError "can't start new thread", MemoryError under
+        the OS thread cap) releases the just-acquired permit before
+        propagating the error. Without this, repeated spawn failures
+        would silently drain capacity to zero — every subsequent request
+        would get 503 forever, requiring a restart.
+      - _run_under_semaphore makes release() the *last* operation in
+        the worker (ordered after shutdown_request) and wraps every
+        prior step in its own try/except. Even a misbehaving handler
+        or a shutdown_request that throws cannot prevent the permit
+        from being returned.
+    """
+
     allow_reuse_address = True
-    daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        HTTPServer.__init__(self, *args, **kwargs)
+        # BoundedSemaphore (not plain Semaphore) so an over-release would
+        # raise instead of silently inflating capacity — defends against
+        # a refactor accidentally double-releasing on the error path.
+        self._req_sem = BoundedSemaphore(MAX_THREADS)
+
+    def process_request(self, request, client_address):
+        if not self._req_sem.acquire(blocking=False):
+            # The 503 is written here on the accept thread (no worker
+            # was spawned). A misbehaving peer that holds its TCP recv
+            # window at zero would otherwise pin the accept thread on
+            # sendall — single-client slowloris on the busy path.
+            # 2 s is short enough that one stuck peer doesn't starve
+            # accept and long enough that any healthy client's kernel
+            # buffer absorbs the 80 B body well before timeout.
+            try:
+                request.settimeout(2.0)
+            except OSError:
+                pass
+            try:
+                request.sendall(_BUSY_RESPONSE)
+            except OSError:
+                # Client already gone, or settimeout fired — nothing
+                # to report. Both branches end with shutdown_request
+                # below; the permit was never taken on this path.
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            t = Thread(target=self._run_under_semaphore,
+                       args=(request, client_address),
+                       daemon=True)
+            t.start()
+        except BaseException:
+            # Thread() construction or .start() failed (OS thread cap,
+            # MemoryError, …). Return the permit, close the socket,
+            # then re-raise so BaseServer.handle_error can log via the
+            # normal path. Without this, the permit would leak and
+            # repeated failures would drain capacity to permanent 503.
+            self._req_sem.release()
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+            raise
+
+    def _run_under_semaphore(self, request, client_address):
+        # release() must always run, even if every other step throws.
+        # That means: each prior step is in its own try/except, and the
+        # release sits in an outer finally so it executes last and
+        # unconditionally. handle_error is wrapped too in case stderr
+        # itself is unhappy (full disk, closed fd).
+        try:
+            try:
+                self.finish_request(request, client_address)
+            except Exception:
+                try:
+                    self.handle_error(request, client_address)
+                except Exception:
+                    pass
+            try:
+                self.shutdown_request(request)
+            except Exception:
+                pass
+        finally:
+            self._req_sem.release()
 
 
 def _warn_per_ip_misconfig():
@@ -3169,8 +3307,37 @@ def _warn_per_ip_misconfig():
             MAX_SESSIONS_PER_IP, MAX_SESSIONS, MAX_BG_SESSIONS))
 
 
+def _warn_max_threads_misconfig():
+    """Emit a WARN when MAX_THREADS is so low it cannot serve the
+    configured session caps.
+
+    Each persistent SSE worker holds one permit for the lifetime of
+    the stream (sessions can live for hours). If MAX_THREADS is at
+    or below the total session ceiling, a real workload can drain
+    every permit into long-running streams and leave nothing for
+    short requests — including /api/disconnect, locking the operator
+    out of cleanup without a restart.
+
+    The threshold here (2 × (MAX_SESSIONS + MAX_BG_SESSIONS)) leaves
+    one streaming slot plus one short-request slot per planned
+    session, plus the +64 headroom baked into the default. Crossing
+    below it is almost always a typo; raising it is harmless.
+    """
+    threshold = 2 * (MAX_SESSIONS + MAX_BG_SESSIONS)
+    if MAX_THREADS < threshold:
+        _log("WARN", ("MAX_THREADS={} is below 2 * (MAX_SESSIONS={} + "
+                      "MAX_BG_SESSIONS={}) = {}. Each long-running SSE "
+                      "worker pins one permit; once {} sessions are "
+                      "streaming, every remaining request — including "
+                      "/api/disconnect — will 503. Raise MAX_THREADS "
+                      "or lower the session caps.").format(
+            MAX_THREADS, MAX_SESSIONS, MAX_BG_SESSIONS, threshold,
+            MAX_THREADS))
+
+
 def main():
     _warn_per_ip_misconfig()
+    _warn_max_threads_misconfig()
     # Start background cleanup thread
     t = Thread(target=_cleanup_loop, daemon=True)
     t.start()

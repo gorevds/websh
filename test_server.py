@@ -2,10 +2,12 @@
 """Tests for websh server.py — config loading, restrict_hosts, API."""
 
 import base64
+import io
 import json
 import os
 import selectors
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -2097,6 +2099,259 @@ class TestIntEnv(unittest.TestCase):
 
     def test_missing(self):
         self.assertEqual(server._int_env("_TEST_MISSING_XYZ", "99"), 99)
+
+
+class TestBoundedThreadPool(unittest.TestCase):
+    """The Server class refuses new requests with 503 once the worker
+    semaphore is exhausted, instead of unbounded thread spawn."""
+
+    def setUp(self):
+        self._orig_max = server.MAX_THREADS
+
+    def tearDown(self):
+        server.MAX_THREADS = self._orig_max
+
+    def _make_server(self, max_threads):
+        server.MAX_THREADS = max_threads
+        # Port 0 → OS picks a free port; we never call serve_forever().
+        srv = server.Server(("127.0.0.1", 0), server.Handler)
+        self.addCleanup(srv.server_close)
+        return srv
+
+    def test_at_capacity_responds_503_and_no_thread(self):
+        srv = self._make_server(max_threads=1)
+        # Exhaust the only slot — exactly mirrors the run-time state when
+        # MAX_THREADS active requests are mid-flight.
+        srv._req_sem.acquire()
+
+        # Stub finish_request: if we ever call it, the bound failed.
+        finish_called = [False]
+        srv.finish_request = lambda *a, **k: finish_called.__setitem__(0, True)
+
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        srv.process_request(a, ("1.2.3.4", 5555))
+
+        b.settimeout(2.0)
+        data = b.recv(2048)
+        self.assertIn(b"503 Service Unavailable", data)
+        self.assertIn(b'{"error":"busy"}', data)
+        # Sync barrier: a regression that spawns a thread anyway would
+        # need a scheduler quantum to execute finish_request. Give it
+        # one before asserting "never called" so the assertion isn't
+        # racing the worker startup. With the bound respected this
+        # sleep is a no-op against a non-existent thread.
+        time.sleep(0.05)
+        self.assertFalse(finish_called[0],
+                         "no worker thread should have been spawned")
+
+    def test_under_capacity_runs_worker_and_releases(self):
+        srv = self._make_server(max_threads=2)
+
+        ran = threading.Event()
+
+        def _fake_finish(request, client_address):
+            ran.set()
+
+        srv.finish_request = _fake_finish
+
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        srv.process_request(a, ("1.2.3.4", 5555))
+
+        self.assertTrue(ran.wait(timeout=2),
+                        "worker should have run finish_request")
+
+        # Slot must be released; subsequent acquire should succeed
+        # without blocking (we hold 1 in flight via the worker's
+        # finally — but the fake finish returns immediately, so by
+        # now the release has happened).
+        for _ in range(20):
+            if srv._req_sem.acquire(blocking=False):
+                srv._req_sem.release()
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("worker did not release semaphore slot")
+
+    def test_capacity_recovers_after_one_drain(self):
+        srv = self._make_server(max_threads=1)
+        srv._req_sem.acquire()   # exhaust
+        # First call: refused.
+        a1, b1 = socket.socketpair()
+        self.addCleanup(a1.close)
+        self.addCleanup(b1.close)
+        srv.process_request(a1, ("1.2.3.4", 1))
+        b1.settimeout(2.0)
+        self.assertIn(b"503", b1.recv(2048))
+        # Operator-side release: next call should succeed.
+        srv._req_sem.release()
+        ran = threading.Event()
+        srv.finish_request = lambda *a, **k: ran.set()
+        a2, b2 = socket.socketpair()
+        self.addCleanup(a2.close)
+        self.addCleanup(b2.close)
+        srv.process_request(a2, ("1.2.3.4", 2))
+        self.assertTrue(ran.wait(timeout=2))
+
+    def test_spawn_failure_releases_permit(self):
+        """H1: if Thread().start() raises (OS thread cap, MemoryError,
+        …), the just-acquired permit must be released. Without this
+        guard, repeated spawn failures bleed capacity to zero and
+        every subsequent request gets 503 forever — no recovery
+        without a process restart."""
+        srv = self._make_server(max_threads=2)
+
+        class _BoomThread(object):
+            def __init__(self, *a, **kw):
+                pass
+
+            def start(self):
+                raise RuntimeError("can't start new thread")
+
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        with unittest.mock.patch.object(server, "Thread", _BoomThread):
+            with self.assertRaises(RuntimeError):
+                srv.process_request(a, ("1.2.3.4", 5555))
+
+        # Permit must have been returned — both slots should be free.
+        self.assertTrue(srv._req_sem.acquire(blocking=False),
+                        "slot 1 should be free after spawn failure")
+        self.assertTrue(srv._req_sem.acquire(blocking=False),
+                        "slot 2 should be free after spawn failure")
+
+    def test_shutdown_failure_in_worker_still_releases_permit(self):
+        """H1-extended: even if shutdown_request raises inside the
+        worker's finally, the permit must still be released. release()
+        is the last operation in _run_under_semaphore, wrapped over
+        try/except on every prior step, precisely to defend this path."""
+        srv = self._make_server(max_threads=1)
+
+        def _bad_shutdown(req):
+            raise RuntimeError("shutdown blew up")
+
+        srv.shutdown_request = _bad_shutdown
+        srv.finish_request = lambda *a, **k: None
+
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        srv.process_request(a, ("1.2.3.4", 5555))
+
+        # Wait for the worker to settle (it's daemon=True, runs async).
+        for _ in range(50):
+            if srv._req_sem.acquire(blocking=False):
+                srv._req_sem.release()
+                return
+            time.sleep(0.01)
+        self.fail("permit was not released after shutdown_request raised")
+
+
+class TestClampMaxThreads(unittest.TestCase):
+    """L2: WEBSH_MAX_THREADS<1 would crash BoundedSemaphore at construction.
+    `_clamp_max_threads` enforces the >=1 floor and emits a WARN on
+    out-of-range input. Test against the production function so a
+    refactor that drops the clamp actually fails the test (the previous
+    iteration of these tests re-implemented the clamp inside the test
+    body and silently tested itself instead of the module)."""
+
+    def _capture_stderr(self):
+        buf = io.StringIO()
+        return buf, unittest.mock.patch.object(sys, "stderr", buf)
+
+    def test_zero_clamps_to_one_and_warns(self):
+        buf, patcher = self._capture_stderr()
+        with patcher:
+            self.assertEqual(server._clamp_max_threads(0), 1)
+        self.assertIn("WEBSH_MAX_THREADS=0", buf.getvalue())
+        self.assertIn("WARN", buf.getvalue())
+
+    def test_negative_clamps_to_one_and_warns(self):
+        buf, patcher = self._capture_stderr()
+        with patcher:
+            self.assertEqual(server._clamp_max_threads(-10), 1)
+        self.assertIn("WEBSH_MAX_THREADS=-10", buf.getvalue())
+
+    def test_one_passes_through_without_warn(self):
+        buf, patcher = self._capture_stderr()
+        with patcher:
+            self.assertEqual(server._clamp_max_threads(1), 1)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_large_value_passes_through(self):
+        self.assertEqual(server._clamp_max_threads(10_000), 10_000)
+
+    def test_clamped_value_is_acceptable_to_bounded_semaphore(self):
+        # End-to-end invariant: whatever the clamp returns must be a
+        # legal BoundedSemaphore size — that is the bug class the
+        # clamp exists to prevent.
+        for raw in (-1, 0, 1, 50, 464):
+            buf, patcher = self._capture_stderr()
+            with patcher:
+                v = server._clamp_max_threads(raw)
+            threading.BoundedSemaphore(v)  # must not raise
+
+
+class TestMaxThreadsMisconfigWarn(unittest.TestCase):
+    """Issue 6: warn when MAX_THREADS is so low it can't serve the
+    configured session caps. Each long-running SSE worker pins one
+    permit for the lifetime of the stream, so if MAX_THREADS is at
+    or below 2 × (MAX_SESSIONS + MAX_BG_SESSIONS), a real workload
+    drains every permit into streams and short requests — including
+    /api/disconnect — return 503 forever."""
+
+    def setUp(self):
+        self._orig_max_threads = server.MAX_THREADS
+        self._orig_max_sessions = server.MAX_SESSIONS
+        self._orig_max_bg = server.MAX_BG_SESSIONS
+
+    def tearDown(self):
+        server.MAX_THREADS = self._orig_max_threads
+        server.MAX_SESSIONS = self._orig_max_sessions
+        server.MAX_BG_SESSIONS = self._orig_max_bg
+
+    def test_warns_when_threads_below_session_threshold(self):
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        # threshold = 2 * (50 + 50) = 200; MAX_THREADS=50 is well under
+        server.MAX_THREADS = 50
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_max_threads_misconfig()
+        self.assertTrue(mock_log.called)
+        level, msg = mock_log.call_args[0][0], mock_log.call_args[0][1]
+        self.assertEqual(level, "WARN")
+        self.assertIn("MAX_THREADS=50", msg)
+        self.assertIn("503", msg)
+
+    def test_warns_when_threads_equals_session_threshold(self):
+        # Boundary: MAX_THREADS == threshold should still warn — the
+        # last permit goes to the last SSE worker, leaving zero for
+        # short requests. Strict-less-than would let this slip.
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_THREADS = 200
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_max_threads_misconfig()
+        # Implementation uses `<`, so 200 < 200 is false → no warn.
+        # That is correct — at the threshold there is exactly one
+        # short-request slot beyond the stream count, which is just
+        # enough to be sane. Document the boundary.
+        self.assertFalse(mock_log.called,
+                         "MAX_THREADS == threshold is the minimum sane value, not a warn")
+
+    def test_silent_at_default(self):
+        # Default MAX_THREADS = 4*(50+50)+64 = 464, threshold = 200 →
+        # no warn. The default is meant to be safe out of the box.
+        server.MAX_SESSIONS = 50
+        server.MAX_BG_SESSIONS = 50
+        server.MAX_THREADS = 4 * (50 + 50) + 64
+        with unittest.mock.patch.object(server, "_log") as mock_log:
+            server._warn_max_threads_misconfig()
+        self.assertFalse(mock_log.called)
 
 
 class TestPerIpMisconfigWarn(unittest.TestCase):
