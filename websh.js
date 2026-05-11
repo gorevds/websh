@@ -159,18 +159,11 @@ function createPane(container) {
       `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
       `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
     `</div>` +
-    `<div class="pane-term"></div>` +
-    `<div class="search-bar h" data-search="${id}">` +
-      `<input type="text" placeholder="Search...">` +
-      `<button onclick="searchPrev()">&#x25B2;</button>` +
-      `<button onclick="searchNext()">&#x25BC;</button>` +
-      `<button onclick="closeSearch()">&#x2715;</button>` +
-    `</div>`;
+    `<div class="pane-term"></div>`;
   container.appendChild(el);
 
   let termEl = el.querySelector('.pane-term');
   let fit = new FitAddon.FitAddon();
-  let search = new SearchAddon.SearchAddon();
   let term = new Terminal({
     cursorBlink:true, cursorStyle:'bar',
     fontSize: settings.fontSize,
@@ -185,11 +178,10 @@ function createPane(container) {
   term.loadAddon(new WebLinksAddon.WebLinksAddon());
   let u = new Unicode11Addon.Unicode11Addon(); term.loadAddon(u);
   term.unicode.activeVersion = '11';
-  term.loadAddon(search);
   term.open(termEl);
 
   let p = {
-    id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
+    id:id, el:el, term:term, fitAddon:fit,
     sid:null, connecting:false, polling:false, pollRetries:0,
     inputQueue:[], flushTimer:null, keepaliveTimer:null,
     label:'', resizeTimer:null, upload:null, download:null,
@@ -2431,30 +2423,6 @@ function fbDownloadManual() {
   startFastDownload(id, path);
 }
 
-// ── Search ──────────────────────────────────────────────────────────
-function activeSearch() { let p=panes[activeId]; return p?p.searchAddon:null }
-function toggleSearch() {
-  let p=panes[activeId]; if(!p) return;
-  let bar=p.el.querySelector('[data-search]');
-  if(bar.classList.contains('h')){bar.classList.remove('h');bar.querySelector('input').focus()}
-  else closeSearch();
-}
-function closeSearch(){
-  let p=panes[activeId]; if(!p) return;
-  p.el.querySelector('[data-search]').classList.add('h');
-  p.searchAddon.clearDecorations(); p.term.focus();
-}
-function searchNext(){ let s=activeSearch(); if(s){let p=panes[activeId];s.findNext(p.el.querySelector('[data-search] input').value)} }
-function searchPrev(){ let s=activeSearch(); if(s){let p=panes[activeId];s.findPrevious(p.el.querySelector('[data-search] input').value)} }
-
-// Search input events — delegated
-document.addEventListener('keydown', e => {
-  if(e.target.closest('[data-search]')){
-    if(e.key==='Enter'){e.shiftKey?searchPrev():searchNext()}
-    if(e.key==='Escape') closeSearch();
-  }
-});
-
 // ── Zoom ────────────────────────────────────────────────────────────
 // Hotkey zoom uses forceFlush:false so a held-key autorepeat (~30Hz)
 // doesn't fire one /api/resize POST per tick. The 150ms term.onResize
@@ -2769,7 +2737,6 @@ function cyclePanes(reverse) {
   activatePane(ids[idx]);
 }
 document.addEventListener('keydown', e => {
-  if(e.ctrlKey&&e.shiftKey&&e.key==='F'){e.preventDefault();toggleSearch()}
   if(e.ctrlKey&&!e.shiftKey&&(e.key==='='||e.key==='+')){e.preventDefault();zoomIn()}
   if(e.ctrlKey&&!e.shiftKey&&e.key==='-'){e.preventDefault();zoomOut()}
   if(e.key==='F11'){e.preventDefault();toggleFullscreen()}
