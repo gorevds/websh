@@ -6,6 +6,7 @@ import json
 import os
 import selectors
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -2095,6 +2096,96 @@ class TestIntEnv(unittest.TestCase):
 
     def test_missing(self):
         self.assertEqual(server._int_env("_TEST_MISSING_XYZ", "99"), 99)
+
+
+class TestBoundedThreadPool(unittest.TestCase):
+    """The Server class refuses new requests with 503 once the worker
+    semaphore is exhausted, instead of unbounded thread spawn."""
+
+    def setUp(self):
+        self._orig_max = server.MAX_THREADS
+
+    def tearDown(self):
+        server.MAX_THREADS = self._orig_max
+
+    def _make_server(self, max_threads):
+        server.MAX_THREADS = max_threads
+        # Port 0 → OS picks a free port; we never call serve_forever().
+        srv = server.Server(("127.0.0.1", 0), server.Handler)
+        self.addCleanup(srv.server_close)
+        return srv
+
+    def test_at_capacity_responds_503_and_no_thread(self):
+        srv = self._make_server(max_threads=1)
+        # Exhaust the only slot — exactly mirrors the run-time state when
+        # MAX_THREADS active requests are mid-flight.
+        srv._req_sem.acquire()
+
+        # Stub finish_request: if we ever call it, the bound failed.
+        finish_called = [False]
+        srv.finish_request = lambda *a, **k: finish_called.__setitem__(0, True)
+
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        srv.process_request(a, ("1.2.3.4", 5555))
+
+        b.settimeout(2.0)
+        data = b.recv(2048)
+        self.assertIn(b"503 Service Unavailable", data)
+        self.assertIn(b'{"error":"busy"}', data)
+        self.assertFalse(finish_called[0],
+                         "no worker thread should have been spawned")
+
+    def test_under_capacity_runs_worker_and_releases(self):
+        srv = self._make_server(max_threads=2)
+
+        ran = threading.Event()
+
+        def _fake_finish(request, client_address):
+            ran.set()
+
+        srv.finish_request = _fake_finish
+
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        srv.process_request(a, ("1.2.3.4", 5555))
+
+        self.assertTrue(ran.wait(timeout=2),
+                        "worker should have run finish_request")
+
+        # Slot must be released; subsequent acquire should succeed
+        # without blocking (we hold 1 in flight via the worker's
+        # finally — but the fake finish returns immediately, so by
+        # now the release has happened).
+        for _ in range(20):
+            if srv._req_sem.acquire(blocking=False):
+                srv._req_sem.release()
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("worker did not release semaphore slot")
+
+    def test_capacity_recovers_after_one_drain(self):
+        srv = self._make_server(max_threads=1)
+        srv._req_sem.acquire()   # exhaust
+        # First call: refused.
+        a1, b1 = socket.socketpair()
+        self.addCleanup(a1.close)
+        self.addCleanup(b1.close)
+        srv.process_request(a1, ("1.2.3.4", 1))
+        b1.settimeout(2.0)
+        self.assertIn(b"503", b1.recv(2048))
+        # Operator-side release: next call should succeed.
+        srv._req_sem.release()
+        ran = threading.Event()
+        srv.finish_request = lambda *a, **k: ran.set()
+        a2, b2 = socket.socketpair()
+        self.addCleanup(a2.close)
+        self.addCleanup(b2.close)
+        srv.process_request(a2, ("1.2.3.4", 2))
+        self.assertTrue(ran.wait(timeout=2))
 
 
 class TestPerIpMisconfigWarn(unittest.TestCase):
