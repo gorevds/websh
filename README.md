@@ -321,28 +321,31 @@ session once it has been unattached for `WEBSH_TMUX_IDLE_TTL` seconds
 refresh the clock each poll, so long-running work doesn't get reaped
 just because you had a brief disconnect.
 
-**Per-connect tmux options (Options panel).** Three toggles in the
-Options panel ride along on every persistent connect via
-`tmux new-session … \; set -g …` and are also pushed into running
-panes the moment you change them, so the new behaviour takes effect
-without a reconnect:
+**Per-connect tmux options.** Every persistent connect runs
+`tmux new-session … \; set -g …` so a small set of tmux options is
+applied uniformly regardless of what's on the target host. Mouse mode
+is baked in unconditionally; two toggles in the Options panel are
+user-configurable and also pushed into running panes the moment you
+change them, so the new behaviour takes effect without a reconnect:
 
-- **Mouse** — wheel scrolls tmux scrollback in shell; alt-screen
-  apps (vim, less, htop) get raw mouse events. Hold Shift to bypass
-  tmux selection and use the browser's native text selection instead.
-- **Auto-copy** — `set-clipboard on`. tmux copy-mode selections are
-  pushed to the system clipboard via OSC52 (xterm.js ships them on).
-- **Scrollback** — `history-limit` (default 100 000). How many lines
-  per pane tmux retains.
+- **Mouse** (always on, no toggle) — `set -g mouse on`. Wheel scrolls
+  tmux scrollback in shell; alt-screen apps (vim, less, htop) get raw
+  mouse events. Hold Shift to bypass tmux selection and use the
+  browser's native text selection instead.
+- **Auto-copy** (toggle) — `set-clipboard on`. tmux copy-mode
+  selections are pushed to the system clipboard via OSC52 (xterm.js
+  ships them on).
+- **Scrollback** (number) — `history-limit` (default 100 000). How
+  many lines per pane tmux retains.
 
-The server accepts these only via a fixed allow-list (`mouse`,
-`set-clipboard`, `history-limit` clamped to 100..10 M); anything else
-is silently dropped, so an out-of-date or hostile client can't
-inject extra `set -g` lines.
+The server accepts user-configurable options only via a fixed
+allow-list (`set-clipboard`, `history-limit` clamped to 100..10 M);
+anything else — including a legacy `tmux_mouse` field from older
+clients — is silently dropped, so an out-of-date or hostile client
+can't inject extra `set -g` lines. Mouse stays on regardless.
 
-These `set -g` lines run after the target's own `~/.tmux.conf` and
-therefore override matching options there. Untick the toggles in the
-Options panel if you'd rather your host-side config win.
+The `set -g` lines run after the target's own `~/.tmux.conf` and
+therefore override matching options there.
 
 ## Configuration
 
