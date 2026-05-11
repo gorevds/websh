@@ -604,6 +604,57 @@ test("SSE 'open' event does not mark body as arrived", async () => {
   cleanup(env);
 });
 
+// fitPaneWhenStable runs an async settle loop and is called from
+// multiple places (createPane, applySettings, the 1 s drift watchdog,
+// kickPanesAfterAbsence). An earlier iteration had a self-feeding
+// listener that called it from xterm's onCharSizeChange event, which
+// the function itself fires synchronously via its fontFamily round-
+// trip — exponential Promise pile-up froze the JS event loop and
+// blocked SSE delivery. The `p._fitInFlight` guard prevents any
+// future re-entry from rebuilding that runaway. This test simulates
+// rapid re-entry: ten calls in tight succession produce one in-flight
+// chain, not ten, and the flag releases cleanly on completion.
+test('fitPaneWhenStable bails on re-entry while in flight', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  let fitCount = 0;
+  const p = {
+    id: 'p1',
+    fitAddon: { fit() { fitCount++; } },
+    term: {
+      cols: 80,
+      options: { fontFamily: 'monospace' },
+      _core: { _charSizeService: { measure() {}, width: 9 } },
+    },
+    sid: null,
+  };
+  win._tp = p;
+  win.eval(`panes['p1'] = window._tp;`);
+
+  // Fire 10 calls back-to-back. Without the guard each would queue
+  // its own settle-loop RAF chain; with the guard the first call
+  // claims `_fitInFlight` and the other nine bail synchronously.
+  for (let i = 0; i < 10; i++) win.fitPaneWhenStable(p);
+  ok(p._fitInFlight === true,
+     'first call took the in-flight flag; got ' + p._fitInFlight);
+
+  // Let the awaited Promise.resolve() and the settle RAFs run.
+  await sleep(200);
+
+  ok(p._fitInFlight === false,
+     'flag releases after settle completes; got ' + p._fitInFlight);
+  // The mock Terminal returns cols=80 every fit, so the settle loop
+  // converges in two iterations: iter 1 sees -1 → 80 (continue), iter
+  // 2 sees 80 === 80 (exit). Without the guard, ten chains would each
+  // do the same — 20 fit() calls. The guard collapses to one chain.
+  ok(fitCount >= 1 && fitCount <= 4,
+     `single chain expected (1-4 fit calls), got ${fitCount}`);
+
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
