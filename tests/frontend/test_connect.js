@@ -23,10 +23,22 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 function makeFakes(win) {
   win.Terminal = class {
-    constructor() { this.cols = 80; this.rows = 24; }
-    loadAddon() {} open() {} focus() {} reset() {}
+    constructor() {
+      this.cols = 80; this.rows = 24;
+      this._focusCalls = 0; this._blurCalls = 0;
+      this._cursorMoveCbs = [];
+    }
+    loadAddon() {} open() {} reset() {}
+    focus() { this._focusCalls++; }
+    blur() { this._blurCalls++; }
     write() {} dispose() {}
     onData() {} onBinary() {} onResize() {} onSelectionChange() {} onBell() {}
+    onCursorMove(cb) {
+      this._cursorMoveCbs.push(cb);
+      let self = this;
+      return { dispose() { self._cursorMoveCbs = self._cursorMoveCbs.filter(c => c !== cb); } };
+    }
+    _fireCursorMove() { this._cursorMoveCbs.slice().forEach(cb => cb()); }
     get buffer() { return {active: {length: 0, getLine: () => null}}; }
     get unicode() { return {activeVersion: '11'}; }
   };
@@ -652,6 +664,151 @@ test('fitPaneWhenStable bails on re-entry while in flight', async () => {
   ok(fitCount >= 1 && fitCount <= 4,
      `single chain expected (1-4 fit calls), got ${fitCount}`);
 
+  cleanup(env);
+});
+
+// SELECTION_TRIM regression tests — three coupled mechanisms must stay
+// aligned: (1) drag-blur on mousedown via term.blur(), (2) deferred
+// term.focus() restore via onCursorMove + 500ms timer, (3) trimDragTail
+// dropping the trailing tmux cursor-cell char from clipboard payloads.
+test('SELECTION_TRIM: trimDragTail drops trailing char while drag-blurred', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  // Synthesize a minimal pane with the SELECTION_TRIM state fields.
+  const p = { _dragBlurred: true, _recentDragSelectAt: 0 };
+  ok(win.trimDragTail(p, 'abcd') === 'abc',
+     'drops trailing char when _dragBlurred');
+  // Length-≤1 short-circuit: never trim to empty.
+  ok(win.trimDragTail(p, 'a') === 'a',
+     'preserves single-char payloads (no trim to empty)');
+  // Outside window AND not blurred → identity.
+  p._dragBlurred = false;
+  p._recentDragSelectAt = 0;
+  ok(win.trimDragTail(p, 'abcd') === 'abcd',
+     'no trim when neither blurred nor recently dragged');
+  // Inside trim window → trim.
+  p._recentDragSelectAt = Date.now() - 100;
+  ok(win.trimDragTail(p, 'abcd') === 'abc',
+     'trims inside DRAG_TRIM_WINDOW_MS');
+  // Outside trim window → no trim.
+  p._recentDragSelectAt = Date.now() - 5000;
+  ok(win.trimDragTail(p, 'abcd') === 'abcd',
+     'no trim outside DRAG_TRIM_WINDOW_MS');
+  cleanup(env);
+});
+
+test('SELECTION_TRIM: mousedown blurs xterm, mousemove sets _dragMoved', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  // Drive the existing pane-creation path via splitPane → form would be
+  // overkill; create a pane directly via the exported helper.
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  ok(p._dragBlurred === false, 'fresh pane starts not drag-blurred');
+  ok(p.term._blurCalls === 0, 'no blur calls yet');
+  // Synthesize mousedown at (100,100) — left button.
+  const md = new win.MouseEvent('mousedown', {button: 0, clientX: 100,
+                                              clientY: 100, bubbles: true});
+  p.el.dispatchEvent(md);
+  ok(p._dragBlurred === true, 'mousedown sets _dragBlurred');
+  ok(p.term._blurCalls >= 1, 'mousedown called term.blur()');
+  ok(p._dragMoved === false, 'no movement yet, _dragMoved=false');
+  // Movement < threshold → still false.
+  p.el.dispatchEvent(new win.MouseEvent('mousemove', {clientX: 101,
+                                                       clientY: 101,
+                                                       buttons: 1,
+                                                       bubbles: true}));
+  ok(p._dragMoved === false, '<3px movement does not flip _dragMoved');
+  // Movement > threshold → true.
+  p.el.dispatchEvent(new win.MouseEvent('mousemove', {clientX: 110,
+                                                       clientY: 100,
+                                                       buttons: 1,
+                                                       bubbles: true}));
+  ok(p._dragMoved === true, '>3px movement flips _dragMoved');
+  cleanup(env);
+});
+
+test('SELECTION_TRIM: drag mouseup arms onCursorMove + timer; cursor-move restores focus', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  // Simulate a drag: mousedown → mousemove past threshold → mouseup.
+  p.el.dispatchEvent(new win.MouseEvent('mousedown', {button: 0,
+                                                       clientX: 0, clientY: 0,
+                                                       bubbles: true}));
+  p.el.dispatchEvent(new win.MouseEvent('mousemove', {clientX: 50,
+                                                       clientY: 0,
+                                                       buttons: 1,
+                                                       bubbles: true}));
+  ok(p._dragMoved === true && p._dragBlurred === true,
+     'pre-mouseup: dragged + blurred');
+  const focusBefore = p.term._focusCalls;
+  win.document.dispatchEvent(new win.MouseEvent('mouseup', {bubbles: true}));
+  // After mouseup: still blurred (deferred), trim-window timestamp set,
+  // disposer + timer armed.
+  ok(p._dragBlurred === true, 'mouseup defers — still blurred');
+  ok(p._recentDragSelectAt > 0, 'mouseup recorded _recentDragSelectAt');
+  ok(p._selDisp !== null, 'onCursorMove disposer armed');
+  ok(p._selTimer !== null, 'fallback timer armed');
+  // Fire cursor-move (tmux's copy-pipe-and-cancel signal) → restore.
+  p.term._fireCursorMove();
+  ok(p._dragBlurred === false, 'cursor-move restored');
+  ok(p._selDisp === null, 'disposer cleared');
+  ok(p._selTimer === null, 'timer cleared');
+  ok(p.term._focusCalls > focusBefore, 'term.focus() called on restore');
+  cleanup(env);
+});
+
+test('SELECTION_TRIM: bare click (no movement) restores immediately, no trim arm', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.el.dispatchEvent(new win.MouseEvent('mousedown', {button: 0,
+                                                       clientX: 0, clientY: 0,
+                                                       bubbles: true}));
+  ok(p._dragBlurred === true, 'mousedown blurred');
+  // No mousemove → _dragMoved stays false.
+  win.document.dispatchEvent(new win.MouseEvent('mouseup', {bubbles: true}));
+  ok(p._dragBlurred === false, 'bare click restores immediately');
+  ok(p._selDisp === null && p._selTimer === null,
+     'no defer arm for bare click');
+  ok(p._recentDragSelectAt === 0,
+     'no trim window arm for bare click (timestamp untouched)');
+  cleanup(env);
+});
+
+test('SELECTION_TRIM: _destroyPane cancels pending onCursorMove subscription', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.el.dispatchEvent(new win.MouseEvent('mousedown', {button: 0,
+                                                       clientX: 0, clientY: 0,
+                                                       bubbles: true}));
+  p.el.dispatchEvent(new win.MouseEvent('mousemove', {clientX: 50, clientY: 0,
+                                                       buttons: 1,
+                                                       bubbles: true}));
+  win.document.dispatchEvent(new win.MouseEvent('mouseup', {bubbles: true}));
+  ok(p._selDisp !== null, 'pre-destroy: disposer armed');
+  // Take an internal reference to verify the disposer is purged from
+  // the term's listener list on destroy.
+  const cbsBefore = p.term._cursorMoveCbs.length;
+  ok(cbsBefore >= 1, 'term has at least one cursor-move listener');
+  win._destroyPane(p.id, false);
+  ok(p.term._cursorMoveCbs.length < cbsBefore,
+     'destroy disposed the subscription');
   cleanup(env);
 });
 
