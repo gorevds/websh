@@ -14,6 +14,9 @@ Environment variables:
     WEBSH_CONFIG          — path to websh.json config file (optional)
     TRUSTED_PROXIES       — comma-separated IPs to trust X-Forwarded-For from (default: 127.0.0.1)
     MAX_BG_SESSIONS       — max background SSH sessions for file transfer (default: 50)
+    WEBSH_MAX_THREADS     — max concurrent HTTP worker threads; new requests
+                            past this get 503 immediately (default:
+                            4*(MAX_SESSIONS+MAX_BG_SESSIONS)+64 = 464)
     RATE_LIMIT_MAX        — max /api/connect attempts per IP per window (default: 50)
     RATE_LIMIT_WINDOW     — rate-limit window in seconds (default: 60)
     WEBSH_TMUX_IDLE_TTL   — seconds a detached persistent tmux session may idle
@@ -65,8 +68,7 @@ import urllib.parse
 import uuid
 from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from socketserver import ThreadingMixIn
-from threading import Thread, Lock, Event
+from threading import Thread, Lock, Event, BoundedSemaphore
 
 __version__ = "0.2.0"
 
@@ -93,6 +95,15 @@ MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
 # an abuser holding N sessions does not care about the classification.
 MAX_SESSIONS_PER_IP = _int_env("MAX_SESSIONS_PER_IP", "0")
 MAX_BG_SESSIONS = _int_env("MAX_BG_SESSIONS", "50")
+# Bound on concurrent HTTP worker threads. ThreadingMixIn would spawn a
+# thread per request without limit — a glitchy client that reconnects
+# /api/stream in a tight loop could explode the thread count before any
+# session-cap triggers. Default leaves room for every active session's
+# SSE worker (and a long-poll fallback worker on each) plus headroom
+# for short requests. When the bound is hit the new request gets a
+# 503 immediately instead of queuing.
+MAX_THREADS = _int_env(
+    "WEBSH_MAX_THREADS", str(4 * (MAX_SESSIONS + MAX_BG_SESSIONS) + 64))
 # Hard cap on a single binary upload via /api/upload (bytes).
 MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 # Hard cap on a single binary download via /api/download (bytes). The
@@ -3117,9 +3128,65 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
 
-class Server(ThreadingMixIn, HTTPServer):
+_BUSY_RESPONSE = (
+    b"HTTP/1.1 503 Service Unavailable\r\n"
+    b"Content-Type: application/json\r\n"
+    b"Content-Length: 17\r\n"
+    b"Connection: close\r\n"
+    b"\r\n"
+    b'{"error":"busy"}\n'
+)
+
+
+class Server(HTTPServer):
+    """Threaded HTTP server with a hard cap on concurrent workers.
+
+    Drop-in replacement for socketserver.ThreadingMixIn+HTTPServer. The
+    plain mixin spawns a thread per request without limit; under a
+    glitchy client that reconnects /api/stream in a tight loop, or a
+    coordinated DoS, the thread count would explode before any of the
+    session/IP caps trigger.
+
+    We hold a BoundedSemaphore sized to WEBSH_MAX_THREADS (env). The
+    semaphore is acquired non-blocking in process_request; if it's
+    exhausted the request gets an immediate 503 and the socket is shut
+    down — better than queuing, which would create the same back-pressure
+    failure mode with a longer fuse. Worker slot is released in a finally
+    so a handler exception can't leak it.
+    """
+
     allow_reuse_address = True
     daemon_threads = True
+
+    def __init__(self, *args, **kwargs):
+        HTTPServer.__init__(self, *args, **kwargs)
+        # BoundedSemaphore (not plain Semaphore) so an over-release would
+        # raise instead of silently inflating capacity — defends against
+        # a refactor accidentally double-releasing on the error path.
+        self._req_sem = BoundedSemaphore(MAX_THREADS)
+
+    def process_request(self, request, client_address):
+        if not self._req_sem.acquire(blocking=False):
+            try:
+                request.sendall(_BUSY_RESPONSE)
+            except OSError:
+                # Client already gone — nothing to report.
+                pass
+            self.shutdown_request(request)
+            return
+        t = Thread(target=self._run_under_semaphore,
+                   args=(request, client_address),
+                   daemon=True)
+        t.start()
+
+    def _run_under_semaphore(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            self.shutdown_request(request)
+            self._req_sem.release()
 
 
 def _warn_per_ip_misconfig():
