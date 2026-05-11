@@ -223,9 +223,8 @@ function createPane(container) {
     label:'', resizeTimer:null, upload:null, download:null,
     // Last (cols,rows) we POSTed to the server — used to skip duplicate
     // /api/resize calls when several refit triggers fire in the same
-    // tick (applySettings RAF + waitForFontThenRefresh inner RAF;
-    // visibility recovery + ResizeObserver; held-key zoom autorepeat
-    // landing on the cap value).
+    // tick (settle-loop iterations + ResizeObserver echo; visibility
+    // recovery; held-key zoom autorepeat landing on the cap value).
     lastSentCols:0, lastSentRows:0,
     // Connection identity — set once per connect, used for save/restore/reconnect.
     host:'', port:22, user:'', connection:null,
@@ -238,9 +237,11 @@ function createPane(container) {
     _recentDragSelectAt:0
   };
   panes[id] = p;
-  // Schedule a font-load-aware refit after registration so the helper
-  // can guard its RAF against pane teardown via panes[id] lookup.
-  waitForFontThenRefresh(term, fit, p);
+  // Schedule a font-load-aware settle-loop refit after registration so
+  // the helper can guard its RAFs against pane teardown via panes[id].
+  // (Do not re-add a charSizeChange listener here — recursion via the
+  // settle-loop fontFamily round-trip; see commit 292eace.)
+  fitPaneWhenStable(p);
 
   // SELECTION_TRIM: focus tracking + drag-blur for cursor hiding.
   // Blur the xterm terminal on left-mousedown so the cursor cell that
@@ -347,7 +348,7 @@ function createPane(container) {
   // Resize observer fires immediately on observe() with the current
   // container size, so the initial fit happens automatically. The
   // older setTimeout(fit, 50) fallback is now redundant: ResizeObserver
-  // covers the cold-layout case and waitForFontThenRefresh covers the
+  // covers the cold-layout case and fitPaneWhenStable covers the
   // webfont-load case.
   new ResizeObserver(() => { fit.fit() }).observe(termEl);
 
@@ -518,6 +519,15 @@ function _destroyPane(id, terminate) {
   // SELECTION_TRIM: drop any pending onCursorMove subscription / timer
   // pointing at the term we're about to dispose.
   _cancelDragBlurArm(p);
+  // fitPaneWhenStable safety-valve timer. Without clearing it here, a
+  // pane closed mid-settle keeps the 10 s closure (and its `p` ref)
+  // alive until the timer fires — harmless because `panes[p.id] !== p`
+  // bails on each step, but a leak under rapid open/close churn.
+  if (p._stuckTimer) {
+    clearTimeout(p._stuckTimer);
+    p._stuckTimer = null;
+  }
+  p._fitInFlight = false;
   // Disconnect main session
   if (p.sid) {
     p.polling = false;
@@ -883,22 +893,18 @@ function closeStream(p) {
 function kickPanesAfterAbsence() {
   Object.values(panes).forEach(p => {
     if (!p || !p.sid || !p.polling) return;
-    // Defer to the next frame so:
-    //   1) the refit reads fresh cell metrics (background tabs don't
-    //      run layout, so xterm and the webfont rasteriser may need a
-    //      fresh paint pass);
-    //   2) the post-fit /api/resize lands BEFORE the new SSE stream
-    //      opens, so the server's PTY is the right size when the
-    //      shell next prints.
-    requestAnimationFrame(() => {
-      if (panes[p.id] !== p) return;
-      try { p.fitAddon.fit(); } catch(e){}
-      flushPaneResize(p);
+    // Settle-loop refit covers the case where the webfont finished
+    // loading while the tab was hidden (xterm's measurement was made
+    // against the fallback). The onSettled callback chains the SSE
+    // reconnect after /api/resize lands, preserving the original
+    // server-side ordering guarantee: PTY is resized before the
+    // shell next prints into the new stream.
+    fitPaneWhenStable(p, { onSettled: (p) => {
       if (p.sseDisabled) return;
       closeStream(p);
       clearRetryClock(p);
       startOutput(p);
-    });
+    }});
   });
 }
 
@@ -2378,9 +2384,9 @@ function zoomOut(){ settings.fontSize=Math.max(settings.fontSize-2,8); fontSize=
 //
 // Dedup guard: skip the POST when (cols,rows) matches the last value
 // the server has confirmed receiving. Two real cases hit this:
-//   - applySettings schedules its own RAF AND waitForFontThenRefresh
-//     schedules an inner RAF. Both call this. The second is a no-op
-//     because dims have settled.
+//   - fitPaneWhenStable iterates the settle loop up to 8 times — once
+//     cols stops changing the final flushPaneResize would re-POST the
+//     same value the last successful iteration already sent.
 //   - held Ctrl+= autorepeat past the fontSize cap (32) — fontSize
 //     stops changing, dims stop changing, every additional keystroke
 //     would otherwise re-POST the same value 30 times/sec.
@@ -2438,50 +2444,173 @@ function applySettings(opts){
     t.options.fontWeightBold = Math.min(900, settings.fontWeight + 300);
     t.options.lineHeight = settings.lineHeight;
     if (t.options.fontFamily !== stack) t.options.fontFamily = stack;
-    waitForFontThenRefresh(t, p.fitAddon, forceFlush ? p : null);
-    requestAnimationFrame(() => {
-      // closePane / disconnect can run between scheduling and firing;
-      // bail if the pane object was replaced or removed so we don't
-      // touch a disposed terminal or post to a freed sid.
-      if (panes[k] !== p) return;
-      try { p.fitAddon.fit(); } catch(e){}
-      if (forceFlush) flushPaneResize(p);
-    });
+    // Single fit path: the settle loop inside fitPaneWhenStable does
+    // both the font-load wait AND the multi-frame convergence check,
+    // replacing the old "immediate-RAF fit AND a deferred refit after
+    // document.fonts.load" pair that was racing.
+    fitPaneWhenStable(p, { flush: forceFlush });
   });
 }
-// Schedule a refit once the current settings.font's webfont is loaded.
-// Pass `p` (optional) to also force-flush /api/resize after the refit
-// — pass null when the caller doesn't want to bypass the debounce
-// (slider drag) or doesn't have a pane object yet (initial createPane).
-function waitForFontThenRefresh(term, fit, p){
+// Refit a pane with a font-load gate and a settle loop.
+//
+// Why a settle loop (not just one RAF deferral): the previous version
+// did `document.fonts.load → fontFamily round-trip → 1 × RAF → fit`.
+// That works most of the time, but on slow renderers (low-end mobile,
+// throttled background tabs, or parallel font-face loads) the cycle
+// `JS → style recalc → layout → paint` does not always complete in
+// one animation frame. `document.fonts.load(...)` resolves once the
+// FontFace is registered, NOT once it has been applied to the
+// measurement <span> xterm uses for CharSizeService — that
+// application happens on the next style/layout pass. Result: fit
+// reads a cell-width that was computed with the fallback font, cols
+// is wrong, glyphs render with the (wider) webfont and overflow the
+// pane on the right, selection drifts by one cell. The only reliable
+// signal we have for "the cell-width xterm now caches is the one it
+// will use to render" is: two consecutive fits return the same cols.
+// So we iterate fit-once-per-RAF until cols stabilises (or hit a
+// safety cap of 8 attempts — at most ~130 ms total, imperceptible).
+function fitPaneWhenStable(p, opts){
+  if (!p || !panes[p.id] || !p.fitAddon) return;
+  // Re-entry guard: settle-loop forceMeasure() and the fontFamily
+  // round-trip both cause xterm to fire its own change events. If a
+  // second fitPaneWhenStable call races in before the first finishes
+  // (watchdog tick, settings change, any future event-driven caller),
+  // they pile up async Promises that each trigger the same xterm
+  // chain, exponentially saturating the event loop. Skip cleanly —
+  // the in-flight call will land on the latest values anyway.
+  if (p._fitInFlight) return;
+  p._fitInFlight = true;
+  // Stuck-timer safety. If the font load hangs (CDN unreachable,
+  // captive portal, document.fonts.ready waiting on an unrelated
+  // never-completing face) the flag would stay true forever and every
+  // subsequent fitPaneWhenStable call — including the 1 s watchdog —
+  // would silently bail. After 10 s, force-release the flag; the
+  // settle-loop checks p._fitInFlight at every iteration and exits
+  // cleanly if the timer fired mid-flight (no double-fit, no leak).
+  // Store the handle on `p` so _destroyPane can cancel it. Without that,
+  // a pane closed mid-settle keeps the timer's closure-captured `p`
+  // alive for up to 10 s.
+  let stuckTimer = setTimeout(() => {
+    p._fitInFlight = false;
+    p._stuckTimer = null;
+  }, 10000);
+  p._stuckTimer = stuckTimer;
+  let shouldFlush = !opts || opts.flush !== false;
+  let onSettled = (opts && opts.onSettled) || null;
+  let release = () => {
+    clearTimeout(stuckTimer);
+    if (p._stuckTimer === stuckTimer) p._stuckTimer = null;
+    p._fitInFlight = false;
+  };
   let f = FONTS[settings.font];
   let webfont = f && f[1];
-  if (!webfont || !document.fonts || !document.fonts.load) return;
-  document.fonts.load(`${settings.fontWeight} ${settings.fontSize}px '${webfont}'`)
-    .then(() => {
-      // Bail before any DOM/xterm writes if the pane was torn down
-      // while we were waiting on the font face to load. Without this
-      // guard the slow-CDN / fast-close case would write to a
-      // disposed terminal via the fontFamily round-trip below.
-      if (p && panes[p.id] !== p) return;
-      // xterm caches glyph metrics — bump fontFamily through a throwaway
-      // value so CharSizeService.measure re-runs once the webfont face
-      // is actually available at the requested size. xterm's setter
-      // invalidates the metric cache on every assignment regardless of
-      // value, so a no-op round-trip forces a re-measure.
-      let ff = term.options.fontFamily;
-      term.options.fontFamily = 'monospace';
-      term.options.fontFamily = ff;
-      // Same RAF rationale as applySettings: defer fit one frame so
-      // layout settles after the fontFamily round-trip and the webfont
-      // is rasterised at the new size before fit reads cell metrics.
-      requestAnimationFrame(() => {
-        if (p && panes[p.id] !== p) return;
-        try { fit && fit.fit(); } catch(e){}
-        if (p) flushPaneResize(p);
-      });
-    }).catch(()=>{});
+  // `document.fonts.load(spec)` actively triggers the load AND resolves
+  // when that face is registered. Chaining `document.fonts.ready` adds
+  // a global "all currently-loading fonts done" gate — needed because
+  // load(spec) resolves before the FontFace is applied to any laid-out
+  // <span>, and we measure via offsetWidth which depends on layout.
+  let waitFont = (webfont && document.fonts && document.fonts.load)
+    ? document.fonts.load(
+        `${settings.fontWeight} ${settings.fontSize}px '${webfont}'`)
+        .then(() => document.fonts.ready)
+    : Promise.resolve();
+  waitFont.then(() => {
+    if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
+    // Invalidate xterm's CharSizeService cache via a no-op fontFamily
+    // round-trip. xterm v5's options setter has a value-equality
+    // short-circuit (`rawOptions[k] !== v && fire(k)`), so the
+    // intermediate value MUST differ from the original — otherwise
+    // both setters get filtered out and no re-measure happens. Pair
+    // the canonical fallback families ('monospace' / 'serif') so the
+    // sentinel is guaranteed to differ from the user's actual stack.
+    let ff = p.term.options.fontFamily;
+    let invalidator = (ff === 'monospace' ? 'serif' : 'monospace');
+    p.term.options.fontFamily = invalidator;
+    p.term.options.fontFamily = ff;
+    // Belt-and-suspenders: directly invoke xterm's internal measurement
+    // service. The options round-trip is supposed to trigger this via
+    // its options-change listener, but the actual measure() reads
+    // offsetWidth from a hidden <span> that must have been laid out
+    // with the new font face. Calling it again from each settle
+    // iteration guarantees the cached width can't pin the loop at a
+    // wrong-cols fixed point.
+    let forceMeasure = () => {
+      try { p.term._core._charSizeService.measure(); } catch(e){}
+    };
+    // Settle loop: fit, observe cols, fit again next frame until two
+    // consecutive iterations agree, or we hit the cap of 8 attempts
+    // (~130 ms total, imperceptible).
+    let attempts = 0, lastCols = -1;
+    let step = () => {
+      if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
+      forceMeasure();
+      try { p.fitAddon.fit(); } catch(e){}
+      let cols = p.term.cols;
+      if (cols === lastCols || attempts >= 8) {
+        release();
+        if (shouldFlush) flushPaneResize(p);
+        if (onSettled) onSettled(p);
+        return;
+      }
+      lastCols = cols;
+      attempts++;
+      requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }).catch(() => { release(); });
 }
+
+// Periodic drift watchdog. Even with the settle loop, edge cases can
+// leave a pane with a cached cell-width that disagrees with what xterm
+// actually renders: a webfont may finish loading well after every
+// fit-triggering event fired, or a re-measure may have been called
+// before layout applied the new font face. Once every PANE_DRIFT_*
+// interval, compare what xterm thinks it can fit (cols × cellWidth)
+// against the parent container's actual content area. If the visible
+// glyphs overflow by more than a few sub-pixel-rounding pixels — or
+// underflow by a full cell — trigger a settle-loop fit to correct it.
+const PANE_DRIFT_CHECK_MS = 1000;
+const PANE_DRIFT_TOLERANCE_PX = 3;
+// Named so the tick can be invoked synchronously from tests against
+// stubbed getComputedStyle / charSizeService. Returns true when the
+// drift crossed a refit threshold (negative past tolerance, or
+// positive over one cell + tolerance), false otherwise. Catches any
+// xterm-internals reshuffle and bails quietly.
+function _driftWatchdogTick(p) {
+  if (!p || !p.term || !p.term.element || !p.term.element.parentElement) {
+    return false;
+  }
+  try {
+    let cs = p.term._core && p.term._core._charSizeService;
+    if (!cs || !cs.width) return false;
+    let parent = p.term.element.parentElement;
+    let parentCss = window.getComputedStyle(parent);
+    let parentWidth = parseInt(parentCss.getPropertyValue('width'), 10);
+    let elCss = window.getComputedStyle(p.term.element);
+    let pad = parseInt(elCss.getPropertyValue('padding-left'), 10)
+            + parseInt(elCss.getPropertyValue('padding-right'), 10);
+    let available = parentWidth - pad;
+    let rendered = p.term.cols * cs.width;
+    let drift = available - rendered;
+    // Negative drift (rendered > available) is the user-visible bug:
+    // right-edge glyphs spill past the pane. Tolerate a few pixels of
+    // sub-pixel rounding. Positive drift over one cell means we're
+    // wasting a column of space — also worth a refit.
+    if (drift < -PANE_DRIFT_TOLERANCE_PX
+        || drift > cs.width + PANE_DRIFT_TOLERANCE_PX) {
+      fitPaneWhenStable(p);
+      return true;
+    }
+  } catch (e) { /* xterm internals shifted — bail quietly */ }
+  return false;
+}
+
+setInterval(() => {
+  // Skip when no panes are open — no panes means no terminals to fit,
+  // and getComputedStyle / Object.values churn every second is silly.
+  if (!Object.keys(panes).length) return;
+  Object.values(panes).forEach(_driftWatchdogTick);
+}, PANE_DRIFT_CHECK_MS);
 
 // ── Options dialog ─────────────────────────────────────────────────
 const OPT_PREVIEW = [
