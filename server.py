@@ -233,13 +233,8 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     no user-controlled data is ever evaluated as shell.
     """
     tname = "websh-" + slot_id
-    # `set -g mouse on` is appended unconditionally — mouse mode is
-    # always enabled (no longer a user-facing toggle) so wheel-scroll-
-    # history and click-in-vim/htop work out of the box. `\;` chains
-    # the option in the same tmux invocation, applying it regardless
-    # of whether the session was newly created or re-attached via -A.
     attach = (tmux_cmd + " new-session -A -D -s " + tname
-              + ' -- "$SHELL" -l \\; set -g mouse on')
+              + ' -- "$SHELL" -l')
     # Per-connect tmux options. Tuples are pre-validated against an
     # allow-list (see _validate_tmux_options) so direct interpolation
     # below is shell- and tmux-injection-safe. `\;` chains commands in
@@ -294,7 +289,7 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
 # tmux options the client may request per session. Strict allow-list:
 # any value not listed here is rejected, so the strings end up
 # interpolated into the tmux command line without escaping risk.
-_TMUX_BOOL_OPTS = ("set-clipboard",)
+_TMUX_BOOL_OPTS = ("mouse", "set-clipboard")
 _TMUX_INT_OPTS = (("history-limit", 100, 10_000_000),)
 
 
@@ -2696,8 +2691,8 @@ class Handler(BaseHTTPRequestHandler):
     def _tmux_options(self):
         """POST /api/tmux_options — push tmux options live into a
         running persistent session via the ControlMaster side-channel.
-        Body shape mirrors /api/connect: tmux_set_clipboard /
-        tmux_history_limit. Anything else is silently ignored by the
+        Body shape mirrors /api/connect: tmux_mouse / tmux_set_clipboard
+        / tmux_history_limit. Anything else is silently ignored by the
         same allow-list used at connect time."""
         try:
             body = json.loads(self._body().decode("utf-8"))
