@@ -201,6 +201,15 @@ python3 server.py
 }
 ```
 
+Принимаются только опции «формы подключения» (политика host-ключей,
+прыжок через bastion, таймауты, алгоритмы). Директивы, превращающие
+`ssh -o` в выполнение локальных команд — `ProxyCommand`, `LocalCommand`,
+`PermitLocalCommand`, `KnownHostsCommand`, `Include`, `Match`,
+`IdentityAgent` — отбрасываются на старте сессии с WARN в server-логе.
+Если они нужны — клади их в системный `ssh_config` на хосте websh, а не
+в `websh.json` (у которого шире trust-профиль — FTP-доступ на shared
+hosting, восстановление из бэкапов и т. п.).
+
 ### Типы подключений: Ready и Prompt
 
 Каждая запись `connections[]` относится к одному из двух типов —
