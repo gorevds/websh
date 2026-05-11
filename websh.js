@@ -2466,7 +2466,7 @@ function fitPaneWhenStable(p, opts){
 // against the parent container's actual content area. If the visible
 // glyphs overflow by more than a few sub-pixel-rounding pixels — or
 // underflow by a full cell — trigger a settle-loop fit to correct it.
-const PANE_DRIFT_CHECK_MS = 5000;
+const PANE_DRIFT_CHECK_MS = 1000;
 const PANE_DRIFT_TOLERANCE_PX = 3;
 setInterval(() => {
   Object.values(panes).forEach(p => {
