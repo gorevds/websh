@@ -47,9 +47,6 @@
     .panel-title .logo{font-size:18px}
     .panel-title .slogan{font-size:12px;color:var(--dim)}
     .brand{display:block;width:24px;height:24px;flex-shrink:0}
-    .brand-light{display:none}
-    [data-theme="light"] .brand-dark{display:none}
-    [data-theme="light"] .brand-light{display:block}
 
     /* ── Saved / server connections ── */
     .saved-section{margin-bottom:20px}
@@ -190,7 +187,6 @@
     .opt-preview{margin-top:6px;margin-bottom:16px;border:1px solid var(--bd);border-radius:var(--radius);overflow:hidden}
     .opt-preview-hd{padding:5px 10px;background:var(--bg);border-bottom:1px solid var(--bd);font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px}
     .opt-preview-body{padding:12px 14px;background:#0d1117;color:#e6edf3;white-space:pre;overflow-x:auto;max-height:200px}
-    [data-theme="light"] .opt-preview-body{background:#f6f8fa;color:#1f2328}
     .opt-preview .c-green{color:#3fb950}.opt-preview .c-blue{color:#58a6ff}.opt-preview .c-red{color:#ff7b72}
     .opt-preview .c-yel{color:#e3b341}.opt-preview .c-dim{color:#7d8590}
     .opt-actions{display:flex;justify-content:space-between;gap:8px;margin-top:8px}
@@ -198,7 +194,6 @@
     .opt-btn:hover{background:rgba(255,255,255,.05);border-color:var(--ac)}
     .opt-btn.primary{background:var(--ac);border-color:var(--ac);color:#fff}
     .opt-btn.primary:hover{background:var(--ach);border-color:var(--ach)}
-    [data-theme="light"] .opt-btn:hover{background:rgba(0,0,0,.04)}
 
     /* ── File browser modal ── */
     .fb-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;width:560px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
@@ -209,7 +204,6 @@
     .fb-list{flex:1;overflow-y:auto;padding:4px 0;min-height:180px}
     .fb-row{display:flex;align-items:center;gap:8px;padding:7px 14px;cursor:pointer;font-size:13px;transition:.1s}
     .fb-row:hover{background:rgba(255,255,255,.05)}
-    [data-theme="light"] .fb-row:hover{background:rgba(0,0,0,.04)}
     .fb-ic{font-size:14px;flex-shrink:0;width:20px;text-align:center}
     .fb-nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
     .fb-sz{font-size:11px;color:var(--dim);flex-shrink:0;min-width:64px;text-align:right;font-family:'JetBrains Mono',ui-monospace,monospace}
@@ -219,10 +213,6 @@
     .fb-inp{flex:1;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font-size:13px;font-family:'JetBrains Mono',ui-monospace,monospace}
     .fb-inp:focus{outline:none;border-color:var(--ac)}
     .fb-inp::placeholder{color:var(--dim);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
-
-    /* ── Light theme ── */
-    [data-theme="light"]{--bg:#fff;--sf:#f6f8fa;--bd:#d0d7de;--tx:#1f2328;--dim:#656d76;--ac:#0969da;--ach:#0550ae;--dg:#cf222e;--ok:#1a7f37;--wn:#9a6700}
-    [data-theme="light"] .xterm{--xterm-bg:#fff}
   </style>
 </head>
 <body>
@@ -230,8 +220,7 @@
 <!-- Top bar -->
 <div class="top">
   <div class="top-l">
-    <img class="brand brand-dark" src="assets/websh-logo.svg" alt="" width="24" height="24">
-    <img class="brand brand-light" src="assets/websh-logo-light.svg" alt="" width="24" height="24">
+    <img class="brand" src="assets/websh-logo.svg" alt="" width="24" height="24">
     <span class="logo">websh</span>
     <span class="top-slogan">Lite but powerful web terminal</span>
   </div>
@@ -239,7 +228,6 @@
     <button class="tbtn" onclick="zoomIn()" title="Zoom in (Ctrl+Plus)" aria-label="Zoom in">A+</button>
     <button class="tbtn" onclick="zoomOut()" title="Zoom out (Ctrl+Minus)" aria-label="Zoom out">A-</button>
     <button class="tbtn" onclick="exportTerminal()" title="Export terminal" aria-label="Export terminal">&#x1F4CB;</button>
-    <button class="tbtn" onclick="toggleTheme()" title="Toggle theme" aria-label="Toggle theme" id="btnTheme">&#x25D1;</button>
     <button class="tbtn" onclick="openOptions()" title="Options" aria-label="Options">&#x2699;</button>
     <button class="tbtn" onclick="toggleFullscreen()" title="Fullscreen (F11)" aria-label="Fullscreen">&#x26F6;</button>
   </div>
@@ -312,8 +300,7 @@
   <div class="panel">
     <button id="btnCancel" class="panel-close h" onclick="cancelConnect()" title="Cancel" aria-label="Cancel">&times;</button>
     <div class="panel-title with-logo">
-      <img class="brand brand-dark" src="assets/websh-logo.svg" alt="" width="24" height="24">
-      <img class="brand brand-light" src="assets/websh-logo-light.svg" alt="" width="24" height="24">
+      <img class="brand" src="assets/websh-logo.svg" alt="" width="24" height="24">
       <span class="logo">websh</span>
       <span class="slogan">Lite but powerful web terminal</span>
     </div>
