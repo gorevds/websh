@@ -2395,15 +2395,11 @@ function fitPaneWhenStable(p, opts){
   let onSettled = (opts && opts.onSettled) || null;
   let f = FONTS[settings.font];
   let webfont = f && f[1];
-  // `document.fonts.load(spec)` actively triggers the load AND resolves
-  // when that face is registered. Chaining `document.fonts.ready` adds
-  // a global "all currently-loading fonts done" gate — needed because
-  // load(spec) resolves before the FontFace is applied to any laid-out
-  // <span>, and we measure via offsetWidth which depends on layout.
+  // Promise.resolve() for the no-webfont path keeps the call shape
+  // identical for system fonts — same settle loop, same cancel guards.
   let waitFont = (webfont && document.fonts && document.fonts.load)
     ? document.fonts.load(
         `${settings.fontWeight} ${settings.fontSize}px '${webfont}'`)
-        .then(() => document.fonts.ready)
     : Promise.resolve();
   waitFont.then(() => {
     if (panes[p.id] !== p) return;
@@ -2412,25 +2408,14 @@ function fitPaneWhenStable(p, opts){
     let ff = p.term.options.fontFamily;
     p.term.options.fontFamily = 'monospace';
     p.term.options.fontFamily = ff;
-    // Belt-and-suspenders: directly invoke xterm's internal measurement
-    // service. The options round-trip is supposed to trigger this via
-    // its onMultipleOptionChange listener, but the actual measure()
-    // reads offsetWidth from a hidden <span> that must have been laid
-    // out with the new font face. Calling it again from each settle
-    // iteration guarantees the cached width can't pin the loop at a
-    // wrong-cols fixed point.
-    let forceMeasure = () => {
-      try { p.term._core._charSizeService.measure(); } catch(e){}
-    };
     // Settle loop: fit, observe cols, fit again next frame until two
     // consecutive iterations agree, or we hit the cap.
     let attempts = 0, lastCols = -1;
     let step = () => {
       if (panes[p.id] !== p) return;
-      forceMeasure();
       try { p.fitAddon.fit(); } catch(e){}
       let cols = p.term.cols;
-      if (cols === lastCols || attempts >= 8) {
+      if (cols === lastCols || attempts >= 4) {
         if (shouldFlush) flushPaneResize(p);
         if (onSettled) onSettled(p);
         return;
@@ -2442,46 +2427,6 @@ function fitPaneWhenStable(p, opts){
     requestAnimationFrame(step);
   }).catch(() => {});
 }
-
-// Periodic drift watchdog. Even with the settle loop, edge cases can
-// leave a pane with a cached cell-width that disagrees with what xterm
-// actually renders: a webfont may finish loading well after every
-// fit-triggering event fired, or a re-measure may have been called
-// before layout applied the new font face. Once every PANE_DRIFT_*
-// interval, compare what xterm thinks it can fit (cols × cellWidth)
-// against the parent container's actual content area. If the visible
-// glyphs overflow by more than a few sub-pixel-rounding pixels — or
-// underflow by a full cell — trigger a settle-loop fit to correct it.
-const PANE_DRIFT_CHECK_MS = 5000;
-const PANE_DRIFT_TOLERANCE_PX = 3;
-setInterval(() => {
-  Object.values(panes).forEach(p => {
-    if (!p || !p.term || !p.term.element || !p.term.element.parentElement) {
-      return;
-    }
-    try {
-      let cs = p.term._core && p.term._core._charSizeService;
-      if (!cs || !cs.width) return;
-      let parent = p.term.element.parentElement;
-      let parentCss = window.getComputedStyle(parent);
-      let parentWidth = parseInt(parentCss.getPropertyValue('width'), 10);
-      let elCss = window.getComputedStyle(p.term.element);
-      let pad = parseInt(elCss.getPropertyValue('padding-left'), 10)
-              + parseInt(elCss.getPropertyValue('padding-right'), 10);
-      let available = parentWidth - pad;
-      let rendered = p.term.cols * cs.width;
-      let drift = available - rendered;
-      // Negative drift (rendered > available) is the user-visible bug:
-      // right-edge glyphs spill past the pane. Tolerate a few pixels of
-      // sub-pixel rounding. Positive drift over one cell means we're
-      // wasting a column of space — also worth a refit.
-      if (drift < -PANE_DRIFT_TOLERANCE_PX
-          || drift > cs.width + PANE_DRIFT_TOLERANCE_PX) {
-        fitPaneWhenStable(p);
-      }
-    } catch (e) { /* xterm internals shifted — bail quietly */ }
-  });
-}, PANE_DRIFT_CHECK_MS);
 
 // ── Options dialog ─────────────────────────────────────────────────
 const OPT_PREVIEW = [
