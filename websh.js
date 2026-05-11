@@ -164,18 +164,6 @@ const darkTheme = {
   brightYellow:'#e3b341',brightBlue:'#79c0ff',brightMagenta:'#d2a8ff',
   brightCyan:'#56d364',brightWhite:'#f0f6fc'
 };
-const lightTheme = {
-  background:'#ffffff',foreground:'#1f2328',cursor:'#0969da',cursorAccent:'#ffffff',
-  selectionBackground:'rgba(9,105,218,0.2)',
-  black:'#24292f',red:'#cf222e',green:'#1a7f37',yellow:'#9a6700',
-  blue:'#0969da',magenta:'#8250df',cyan:'#1b7c83',white:'#6e7781',
-  brightBlack:'#57606a',brightRed:'#a40e26',brightGreen:'#2da44e',
-  brightYellow:'#bf8700',brightBlue:'#218bff',brightMagenta:'#a475f9',
-  brightCyan:'#3192aa',brightWhite:'#8c959f'
-};
-function currentTheme() {
-  return document.documentElement.getAttribute('data-theme') === 'light' ? lightTheme : darkTheme;
-}
 
 function createPane(container) {
   let id = 'p' + (++paneCounter);
@@ -219,7 +207,7 @@ function createPane(container) {
     fontWeight: settings.fontWeight,
     fontWeightBold: Math.min(900, settings.fontWeight + 300),
     lineHeight: settings.lineHeight,
-    theme: currentTheme(),
+    theme: darkTheme,
     allowProposedApi:true, scrollback:50000
   });
   term.loadAddon(fit);
@@ -2722,15 +2710,6 @@ function toggleFullscreen(){
   else document.exitFullscreen();
 }
 
-// ── Theme ───────────────────────────────────────────────────────────
-function toggleTheme(){
-  let isLight=document.documentElement.getAttribute('data-theme')==='light';
-  document.documentElement.setAttribute('data-theme',isLight?'dark':'light');
-  let t=isLight?darkTheme:lightTheme;
-  Object.keys(panes).forEach(k => {panes[k].term.options.theme=t});
-  localStorage.setItem('websh_theme',isLight?'dark':'light');
-}
-
 // ── Split handle drag resize (mouse + touch) ───────────────────────
 (function(){
   let dragging=null;
@@ -2939,11 +2918,6 @@ function tryRestoreSessions() {
 }
 
 // ── Init ────────────────────────────────────────────────────────────
-(function(){
-  let saved=localStorage.getItem('websh_theme');
-  if(saved==='light') document.documentElement.setAttribute('data-theme','light');
-})();
-
 // No pane is created eagerly. loadServerConfig drives next step:
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
 // set to 'initial' and the user sees the login form on an empty canvas.
