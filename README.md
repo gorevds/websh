@@ -1,4 +1,4 @@
-# <picture><source media="(prefers-color-scheme: dark)" srcset="assets/websh-logo.svg"><source media="(prefers-color-scheme: light)" srcset="assets/websh-logo-light.svg"><img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"></picture> websh
+# <img src="assets/websh-logo.svg" alt="" width="56" height="56" align="absmiddle"> websh
 
 **English** | [Русский](README.ru.md)
 
@@ -50,7 +50,6 @@ Real xterm.js — copy-on-select, right-click paste, scrollback search (`Ctrl+Sh
 
 - Split panes, horizontal or vertical, with draggable dividers
 - Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab`
-- Dark and light themes (persisted)
 - Font picker (⚙) with live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono, Source Code Pro, Inconsolata, or system default. Custom size, line-height, weight
 
 ### 🔁 Persistent sessions
@@ -125,7 +124,7 @@ A typical shared hosting directory structure:
         websh.js            <- frontend logic
         api.php             <- PHP proxy
         server.py           <- backend (auto-started by api.php)
-        assets/             <- brand SVGs (logo, light/dark variants)
+        assets/             <- brand SVGs (logo)
 ```
 
 **Steps:**
@@ -615,10 +614,10 @@ in one `write(2)` call and stays safe to view in a terminal.
 
 ```
 index.html                Frontend — xterm.js terminal + connection UI
-websh.js                  Frontend logic — pane management, file transfer, themes
+websh.js                  Frontend logic — pane management, file transfer
 api.php                   PHP proxy — forwards browser requests to backend (optional)
 server.py                 Python backend — manages SSH sessions via PTY, serves frontend
-assets/                   Brand SVGs (logo light/dark variants) loaded by index.html
+assets/                   Brand SVG (logo) loaded by index.html
 websh.json.example        Example server-side config
 test_server.py            Backend tests (unit + integration)
 tests/frontend/           jsdom-based frontend tests

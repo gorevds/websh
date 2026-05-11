@@ -338,7 +338,6 @@ _STATIC_FILES = {
     "/index.html": ("index.html", "text/html; charset=utf-8"),
     "/websh.js": ("websh.js", "application/javascript; charset=utf-8"),
     "/assets/websh-logo.svg": ("assets/websh-logo.svg", "image/svg+xml"),
-    "/assets/websh-logo-light.svg": ("assets/websh-logo-light.svg", "image/svg+xml"),
 }
 
 
