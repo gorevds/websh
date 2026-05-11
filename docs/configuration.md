@@ -12,6 +12,7 @@ Environment variables for `server.py`:
 | `WEBSH_CONFIG` | *(auto-detected)* | Path to `websh.json` config file |
 | `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
 | `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |
+| `WEBSH_MAX_THREADS` | `4 × (MAX_SESSIONS + MAX_BG_SESSIONS) + 64` (`464` at defaults) | Hard cap on concurrent HTTP worker threads. New requests past the cap get an immediate `503 {"error":"busy"}`. Values below `1` are clamped to `1` with a startup WARN; there is no "unlimited" mode by design. |
 | `RATE_LIMIT_MAX` | `50` | Max `/api/connect` attempts per IP per window |
 | `RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds |
 | `SCAN_PATTERN_THRESHOLD` | `0` | One IP that probes at least N distinct deny-listed targets in `SCAN_PATTERN_WINDOW` seconds gets `result=scan_pattern` events emitted starting on the Nth probe; `0` disables. ANY successful connect from the same IP clears state, so legitimate users never accumulate. |
