@@ -648,6 +648,391 @@ test('SELECTION_TRIM: trimDragTail drops trailing char while drag-blurred', asyn
   cleanup(env);
 });
 
+// fitPaneWhenStable runs an async settle loop and is called from
+// multiple places (createPane, applySettings, the 1 s drift watchdog,
+// kickPanesAfterAbsence). An earlier iteration had a self-feeding
+// listener that called it from xterm's onCharSizeChange event, which
+// the function itself fires synchronously via its fontFamily round-
+// trip — exponential Promise pile-up froze the JS event loop and
+// blocked SSE delivery. The `p._fitInFlight` guard prevents any
+// future re-entry from rebuilding that runaway. This test simulates
+// rapid re-entry: ten calls in tight succession produce one in-flight
+// chain, not ten, and the flag releases cleanly on completion.
+test('fitPaneWhenStable bails on re-entry while in flight', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  let fitCount = 0;
+  const p = {
+    id: 'p1',
+    fitAddon: { fit() { fitCount++; } },
+    term: {
+      cols: 80,
+      options: { fontFamily: 'monospace' },
+      _core: { _charSizeService: { measure() {}, width: 9 } },
+    },
+    sid: null,
+  };
+  win._tp = p;
+  win.eval(`panes['p1'] = window._tp;`);
+
+  // Fire 10 calls back-to-back. Without the guard each would queue
+  // its own settle-loop RAF chain; with the guard the first call
+  // claims `_fitInFlight` and the other nine bail synchronously.
+  for (let i = 0; i < 10; i++) win.fitPaneWhenStable(p);
+  ok(p._fitInFlight === true,
+     'first call took the in-flight flag; got ' + p._fitInFlight);
+
+  // Let the awaited Promise.resolve() and the settle RAFs run.
+  await sleep(200);
+
+  ok(p._fitInFlight === false,
+     'flag releases after settle completes; got ' + p._fitInFlight);
+  // The mock Terminal returns cols=80 every fit, so the settle loop
+  // converges in exactly two iterations: iter 1 sees lastCols=-1 → 80
+  // (continue), iter 2 sees 80 === 80 (exit). Pin to 2 — a wider range
+  // (1-4) would pass even on a partial regression where the guard
+  // succeeds only 50 % of the time. Without the guard, all ten chains
+  // run their two iterations each → fitCount=20.
+  ok(fitCount === 2,
+     `single chain expected (exactly 2 fit calls — one settle pair), got ${fitCount}`);
+
+  cleanup(env);
+});
+
+// 10 s stuck-timer: when document.fonts.ready never resolves (CDN
+// blocked / captive portal / unrelated webfont hung), the in-flight
+// flag would stay true forever and every subsequent refit — including
+// the 1 s drift watchdog — would silently bail. The setTimeout(…, 10000)
+// safety valve clears the flag after the timeout. We don't actually
+// wait 10 s in the test; we hijack window.setTimeout to capture the
+// 10 s callback and invoke it manually.
+test('fitPaneWhenStable: 10s stuck-timer clears _fitInFlight when fonts hang', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  // Stub document.fonts.load / .ready to never resolve — simulates a
+  // CDN block. waitFont will stay pending; nothing past it will run.
+  win.document.fonts = {
+    load: () => new Promise(() => {}),
+    ready: new Promise(() => {}),
+  };
+
+  // Capture the stuck-timer callback. The implementation calls
+  // setTimeout(release, 10000); we trap that one specifically and let
+  // every other setTimeout fall through to the real timer.
+  let stuckCb = null;
+  const realSetTimeout = win.setTimeout;
+  win.setTimeout = function (cb, ms) {
+    if (ms === 10000) { stuckCb = cb; return 12345; }
+    return realSetTimeout.call(win, cb, ms);
+  };
+
+  const p = {
+    id: 'p1',
+    fitAddon: { fit() {} },
+    term: { cols: 80,
+            options: { fontFamily: 'monospace' },
+            _core: { _charSizeService: { measure() {}, width: 9 } } },
+    sid: null,
+  };
+  win._tp = p;
+  win.eval(`panes['p1'] = window._tp;`);
+
+  win.fitPaneWhenStable(p);
+  ok(p._fitInFlight === true,
+     'flag taken on initial call; got ' + p._fitInFlight);
+  ok(stuckCb !== null, 'stuck-timer was scheduled');
+
+  // While the font hangs, re-entry must bail (in-flight guard).
+  win.fitPaneWhenStable(p);
+  ok(p._fitInFlight === true,
+     're-entry left flag intact; got ' + p._fitInFlight);
+
+  // Fire the 10 s callback synchronously — simulates wallclock advance.
+  stuckCb();
+  ok(p._fitInFlight === false,
+     'stuck-timer released the flag; got ' + p._fitInFlight);
+
+  cleanup(env);
+});
+
+// Paired sentinel for the fontFamily invalidator. xterm v5's options
+// setter has a value-equality short-circuit (`rawOptions[k] !== v &&
+// fire(k)`), so the *intermediate* value must differ from the
+// canonical one — otherwise no re-measure fires. We pair 'monospace'
+// with 'serif'; if the user's fontFamily *is* the literal 'monospace'
+// the intermediate flips to 'serif', otherwise to 'monospace'. Both
+// branches must work.
+test('fitPaneWhenStable: sentinel flips serif↔monospace to defeat value-equality short-circuit', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  win.document.fonts = {
+    load: () => Promise.resolve(),
+    ready: Promise.resolve(),
+  };
+
+  function makePane(initial) {
+    let ff = initial;
+    const writes = [];
+    const p = {
+      id: 'pX',
+      fitAddon: { fit() {} },
+      term: {
+        cols: 80,
+        get options() { return this._opts; },
+        _opts: {
+          get fontFamily() { return ff; },
+          set fontFamily(v) { writes.push(v); ff = v; },
+        },
+        _core: { _charSizeService: { measure() {}, width: 9 } },
+      },
+      sid: null,
+    };
+    return {p, writes};
+  }
+
+  // Case 1: original 'monospace' → invalidator must be 'serif'.
+  const c1 = makePane('monospace');
+  win._tp = c1.p;
+  win.eval(`panes['pX'] = window._tp;`);
+  win.fitPaneWhenStable(c1.p);
+  await sleep(60);
+  // writes: [invalidator, original-restored]
+  ok(c1.writes[0] === 'serif',
+     "'monospace' → invalidator 'serif'; got " + c1.writes[0]);
+  ok(c1.writes[1] === 'monospace',
+     "restore to original 'monospace'; got " + c1.writes[1]);
+  win.eval(`delete panes['pX'];`);
+
+  // Case 2: original anything-else → invalidator must be 'monospace'.
+  const c2 = makePane("'JetBrains Mono', monospace");
+  win._tp = c2.p;
+  win.eval(`panes['pX'] = window._tp;`);
+  win.fitPaneWhenStable(c2.p);
+  await sleep(60);
+  ok(c2.writes[0] === 'monospace',
+     "'…Mono, monospace' → invalidator 'monospace'; got " + c2.writes[0]);
+  ok(c2.writes[1] === "'JetBrains Mono', monospace",
+     "restore to original; got " + c2.writes[1]);
+  // Sanity: the two writes must differ — that's the entire point of
+  // the pairing. If they ever match, xterm filters both and no
+  // re-measure fires.
+  ok(c2.writes[0] !== c2.writes[1],
+     'invalidator and original must differ (value-equality bypass)');
+  cleanup(env);
+});
+
+// Happy path: document.fonts.load + .ready resolve cleanly, the
+// settle loop iterates, _charSizeService.measure() is called at
+// least once on each iteration, and the in-flight flag releases.
+// The other tests in this PR all *interrupt* the happy path
+// (re-entry guard, stuck-timer, paired sentinel under isolated
+// stubs); none drive the full chain through. In jsdom
+// document.fonts is undefined by default, so the production
+// `webfont && document.fonts && document.fonts.load` branch
+// always falls into the no-op Promise.resolve() — without this
+// test, the entire fonts.load → fonts.ready → forceMeasure
+// pipeline has zero coverage in our test suite.
+test('fitPaneWhenStable: happy path drives forceMeasure() + sentinel + release', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  win.document.fonts = {
+    load: () => Promise.resolve(),
+    ready: Promise.resolve(),
+  };
+
+  let measureCalls = 0;
+  let writes = [];
+  let ff = "'JetBrains Mono', monospace";  // default settings.font
+  const p = {
+    id: 'pHP',
+    fitAddon: { fit() {} },
+    term: {
+      cols: 80,
+      get options() { return this._opts; },
+      _opts: {
+        get fontFamily() { return ff; },
+        set fontFamily(v) { writes.push(v); ff = v; },
+      },
+      _core: {
+        _charSizeService: {
+          measure() { measureCalls++; },
+          width: 9,
+        },
+      },
+    },
+    sid: null,
+  };
+  win._tp = p;
+  win.eval(`panes['pHP'] = window._tp;`);
+
+  win.fitPaneWhenStable(p);
+  // Allow: microtasks for fonts.load() → fonts.ready chain, plus
+  // the RAF-spaced settle loop (jsdom RAF ≈16 ms, two iterations).
+  await sleep(120);
+
+  ok(p._fitInFlight === false,
+     'flag released after happy-path settle; got ' + p._fitInFlight);
+  ok(writes.length === 2,
+     'sentinel fired exactly two fontFamily writes (invalidate + restore); got ' +
+     writes.length);
+  ok(writes[1] === "'JetBrains Mono', monospace",
+     'fontFamily restored to original after sentinel; got ' + writes[1]);
+  ok(measureCalls >= 1,
+     '_charSizeService.measure() called at least once per settle iteration; got ' +
+     measureCalls);
+  cleanup(env);
+});
+
+// _destroyPane must clear the in-flight stuck-timer so a pane closed
+// mid-settle does not hold a 10 s closure reference to a disposed
+// pane. Plant a pane, kick fitPaneWhenStable so a stuck-timer is
+// armed, intercept setTimeout(…, 10000) to capture the handle, then
+// call _destroyPane and assert clearTimeout fired on that handle.
+test('_destroyPane clears the fitPaneWhenStable stuck-timer', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  // Hang fonts so the settle path stays in flight when we destroy.
+  win.document.fonts = {
+    load: () => new Promise(() => {}),
+    ready: new Promise(() => {}),
+  };
+  // Capture the 10 s setTimeout handle so we can verify clearTimeout
+  // was called on it during destroy.
+  let stuckHandle = null;
+  let clearedHandles = [];
+  const realSetTimeout = win.setTimeout;
+  const realClearTimeout = win.clearTimeout;
+  win.setTimeout = function (cb, ms) {
+    const h = realSetTimeout.call(win, cb, ms);
+    if (ms === 10000) stuckHandle = h;
+    return h;
+  };
+  win.clearTimeout = function (h) {
+    clearedHandles.push(h);
+    return realClearTimeout.call(win, h);
+  };
+
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  win.fitPaneWhenStable(p);
+  ok(p._stuckTimer !== null && p._stuckTimer !== undefined,
+     '_stuckTimer recorded on pane');
+  ok(stuckHandle !== null, '10 s setTimeout captured');
+
+  win._destroyPane(p.id, false);
+  ok(clearedHandles.indexOf(stuckHandle) !== -1,
+     'clearTimeout called on the stuck-timer handle during destroy');
+  ok(p._stuckTimer === null,
+     '_stuckTimer nulled after destroy; got ' + p._stuckTimer);
+  ok(p._fitInFlight === false,
+     '_fitInFlight cleared after destroy; got ' + p._fitInFlight);
+  cleanup(env);
+});
+
+// Drift watchdog trigger thresholds. _driftWatchdogTick is the named
+// extracted body of the setInterval — easier to test synchronously
+// against a stubbed getComputedStyle and a stubbed charSizeService.
+// Three boundary cases: negative drift past tolerance (refit),
+// positive drift over a full cell + tolerance (refit), drift inside
+// the band (no refit).
+function _makeDriftPane(win, cols, charWidth, parentWidth, padding) {
+  const p = {
+    id: 'pD',
+    fitAddon: {},
+    term: {
+      cols: cols,
+      element: { parentElement: {} },
+      _core: { _charSizeService: { width: charWidth } },
+    },
+    sid: null,
+  };
+  // Patch getComputedStyle to return parentWidth on the parent and
+  // padding on the element. We branch by whether the queried object
+  // is term.element.parentElement or term.element.
+  const origGCS = win.window.getComputedStyle;
+  win.window.getComputedStyle = function (el) {
+    if (el === p.term.element.parentElement) {
+      return { getPropertyValue: k => k === 'width' ? String(parentWidth) : '0' };
+    }
+    if (el === p.term.element) {
+      return {
+        getPropertyValue: k => {
+          if (k === 'padding-left' || k === 'padding-right') {
+            return String(padding / 2);
+          }
+          return '0';
+        },
+      };
+    }
+    return origGCS.call(win.window, el);
+  };
+  return p;
+}
+
+test('drift watchdog: negative drift past tolerance triggers refit', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  // cols=100 × cw=10 = 1000 rendered, parent=800 - pad=0 = 800 available
+  // → drift = -200, well past -PANE_DRIFT_TOLERANCE_PX (-3). Should fire.
+  const p = _makeDriftPane(win, 100, 10, 800, 0);
+  let calls = 0;
+  win.fitPaneWhenStable = () => { calls++; };
+
+  const triggered = win._driftWatchdogTick(p);
+  ok(triggered === true,
+     'should return true on negative drift past tolerance');
+  ok(calls === 1, 'fitPaneWhenStable called once; got ' + calls);
+  cleanup(env);
+});
+
+test('drift watchdog: positive drift over one cell + tolerance triggers refit', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  // cols=10 × cw=10 = 100 rendered, parent=200 → drift=100, over
+  // cs.width (10) + tolerance (3) = 13. Should fire.
+  const p = _makeDriftPane(win, 10, 10, 200, 0);
+  let calls = 0;
+  win.fitPaneWhenStable = () => { calls++; };
+
+  const triggered = win._driftWatchdogTick(p);
+  ok(triggered === true,
+     'should return true on positive drift over cell + tolerance');
+  ok(calls === 1, 'fitPaneWhenStable called once; got ' + calls);
+  cleanup(env);
+});
+
+test('drift watchdog: drift inside tolerance band leaves pane alone', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                               connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  // cols=10 × cw=10 = 100 rendered, parent=102 → drift=2. Inside
+  // both bounds (−3 < 2 < 10+3). Must NOT fire.
+  const p = _makeDriftPane(win, 10, 10, 102, 0);
+  let calls = 0;
+  win.fitPaneWhenStable = () => { calls++; };
+
+  const triggered = win._driftWatchdogTick(p);
+  ok(triggered === false,
+     'should return false on drift inside tolerance');
+  ok(calls === 0, 'fitPaneWhenStable not called; got ' + calls);
+  cleanup(env);
+});
+
 test('SELECTION_TRIM: mousedown blurs xterm, mousemove sets _dragMoved', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false,
                                                 connections: []}}];
