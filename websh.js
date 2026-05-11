@@ -201,20 +201,14 @@ function createPane(container) {
   // Schedule a font-load-aware settle-loop refit after registration so
   // the helper can guard its RAFs against pane teardown via panes[id].
   fitPaneWhenStable(p);
-  // Event-driven safety: xterm's CharSizeService re-measures whenever
-  // the underlying char metrics change (most commonly: the webfont
-  // finally arrives and renders wider than the fallback). When it
-  // does, refit immediately — without this listener the visible cols
-  // stay at the fallback-derived value until the next external
-  // trigger (resize / settings change / 5 s drift-watchdog tick).
-  try {
-    let cs = term._core && term._core._charSizeService;
-    if (cs && cs.onCharSizeChange) {
-      cs.onCharSizeChange(() => {
-        if (panes[id] === p) fitPaneWhenStable(p);
-      });
-    }
-  } catch (e) { /* xterm internals shifted — fall back to polling */ }
+  // (We previously also subscribed to `_charSizeService.onCharSizeChange`
+  // here to trigger an immediate refit when xterm internally re-
+  // measured. That created a runaway: fitPaneWhenStable's own
+  // fontFamily round-trip causes xterm to re-measure synchronously,
+  // which fires onCharSizeChange, which our listener handled by
+  // calling fitPaneWhenStable again — exponential Promise growth
+  // that froze the event loop and blocked SSE delivery. The 1 s
+  // drift watchdog catches the same case without self-feedback.)
 
   // Focus tracking
   el.addEventListener('mousedown', () => { activatePane(id) });
@@ -2405,8 +2399,18 @@ function applySettings(opts){
 // safety cap of 4 attempts — at most ~80 ms total, imperceptible).
 function fitPaneWhenStable(p, opts){
   if (!p || !panes[p.id] || !p.fitAddon) return;
+  // Re-entry guard: settle-loop forceMeasure() and the fontFamily
+  // round-trip both cause xterm to fire its own change events. If a
+  // second fitPaneWhenStable call races in before the first finishes
+  // (watchdog tick, settings change, any future event-driven caller),
+  // they pile up async Promises that each trigger the same xterm
+  // chain, exponentially saturating the event loop. Skip cleanly —
+  // the in-flight call will land on the latest values anyway.
+  if (p._fitInFlight) return;
+  p._fitInFlight = true;
   let shouldFlush = !opts || opts.flush !== false;
   let onSettled = (opts && opts.onSettled) || null;
+  let release = () => { p._fitInFlight = false; };
   let f = FONTS[settings.font];
   let webfont = f && f[1];
   // `document.fonts.load(spec)` actively triggers the load AND resolves
@@ -2420,7 +2424,7 @@ function fitPaneWhenStable(p, opts){
         .then(() => document.fonts.ready)
     : Promise.resolve();
   waitFont.then(() => {
-    if (panes[p.id] !== p) return;
+    if (panes[p.id] !== p) { release(); return; }
     // Invalidate xterm's CharSizeService cache via a no-op fontFamily
     // round-trip — the setter triggers re-measure regardless of value.
     let ff = p.term.options.fontFamily;
@@ -2440,11 +2444,12 @@ function fitPaneWhenStable(p, opts){
     // consecutive iterations agree, or we hit the cap.
     let attempts = 0, lastCols = -1;
     let step = () => {
-      if (panes[p.id] !== p) return;
+      if (panes[p.id] !== p) { release(); return; }
       forceMeasure();
       try { p.fitAddon.fit(); } catch(e){}
       let cols = p.term.cols;
       if (cols === lastCols || attempts >= 8) {
+        release();
         if (shouldFlush) flushPaneResize(p);
         if (onSettled) onSettled(p);
         return;
@@ -2454,7 +2459,7 @@ function fitPaneWhenStable(p, opts){
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }).catch(() => {});
+  }).catch(() => { release(); });
 }
 
 // Periodic drift watchdog. Even with the settle loop, edge cases can
