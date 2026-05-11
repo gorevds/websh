@@ -761,6 +761,84 @@ test('SELECTION_TRIM: _destroyPane cancels pending onCursorMove subscription', a
   cleanup(env);
 });
 
+// Right-click on an inactive pane must activate it before
+// stopPropagation runs — otherwise the subsequent contextmenu paste
+// lands in the previously-active pane (the bubble-phase activatePane
+// listener on the parent .pane element never fires because we stop
+// propagation in capture phase on termEl).
+test('button=2 mousedown on inactive pane activates it (then stops propagation)', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  // Create two panes; pA stays active, pB will receive the right-click.
+  const pA = win.createPane(root);
+  const pB = win.createPane(root);
+  win.activatePane(pA.id);
+  ok(pA.el.classList.contains('active'),
+     'pre: pA has .active');
+  ok(!pB.el.classList.contains('active'),
+     'pre: pB does not have .active');
+
+  const termB = pB.el.querySelector('.pane-term');
+  termB.dispatchEvent(new win.MouseEvent('mousedown',
+    {button: 2, clientX: 50, clientY: 50,
+     bubbles: true, cancelable: true}));
+
+  // Active class is the observable contract of activatePane(id).
+  ok(pB.el.classList.contains('active'),
+     'pB gained .active after right-click — activatePane fired before stopPropagation');
+  ok(!pA.el.classList.contains('active'),
+     'pA lost .active');
+  cleanup(env);
+});
+
+// Spy-based pin: this is the *real* regression test for the PR. The
+// previous "active class" test passes even if the capture-phase
+// listener is removed entirely (the parent .pane's bubble-phase
+// activatePane still fires). Here we install a counter on bubble-phase
+// at the parent level and assert it does NOT see the button=2
+// mousedown — which only holds if the capture-phase listener on
+// termEl actually fired and called stopPropagation. Left-click on
+// the same termEl must still bubble so we don't over-suppress.
+test('button=2 stopPropagation: parent bubble-phase listener does not see right-click on termEl', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+
+  let rightClicksBubbled = 0;
+  let leftClicksBubbled = 0;
+  p.el.addEventListener('mousedown', e => {
+    if (e.button === 2) rightClicksBubbled++;
+    if (e.button === 0) leftClicksBubbled++;
+  });
+
+  const term = p.el.querySelector('.pane-term');
+  term.dispatchEvent(new win.MouseEvent('mousedown',
+    {button: 2, clientX: 10, clientY: 10,
+     bubbles: true, cancelable: true}));
+  ok(rightClicksBubbled === 0,
+     'parent .pane bubble-phase listener did NOT see button=2 — ' +
+     'capture-phase stopPropagation on termEl held; got count=' +
+     rightClicksBubbled);
+
+  // Sanity: left-click is NOT over-suppressed. If a future refactor
+  // accidentally widens the capture-phase guard (e.g. drops the
+  // `e.button === 2` gate), this catches it.
+  term.dispatchEvent(new win.MouseEvent('mousedown',
+    {button: 0, clientX: 10, clientY: 10,
+     bubbles: true, cancelable: true}));
+  ok(leftClicksBubbled === 1,
+     'parent .pane bubble-phase listener DID see button=0 ' +
+     '(left-click must still bubble); got count=' + leftClicksBubbled);
+
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

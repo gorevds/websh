@@ -336,7 +336,23 @@ function createPane(container) {
     el.classList.remove('bell'); void el.offsetWidth; el.classList.add('bell');
   });
 
-  // Right-click paste
+  // Right-click paste. Also swallow button-2 mousedown at capture phase
+  // so xterm.js never forwards it to the remote — otherwise tmux (with
+  // `mouse on`) catches MouseDown3Pane and pops its own menu, which
+  // competes with our paste UX.
+  //
+  // activatePane(id) is called explicitly before stopPropagation: the
+  // bubble-phase listener on the parent .pane element (`el.mousedown
+  // → activatePane(id)`) won't fire once we stop propagation, so
+  // right-clicking an inactive pane would leave the previously-active
+  // pane focused and the subsequent contextmenu paste would land in
+  // the wrong pane.
+  termEl.addEventListener('mousedown', e => {
+    if (e.button === 2) {
+      activatePane(id);
+      e.stopPropagation();
+    }
+  }, true);
   termEl.addEventListener('contextmenu', e => {
     e.preventDefault();
     if(navigator.clipboard && navigator.clipboard.readText){
