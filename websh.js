@@ -19,6 +19,149 @@ function api(action, opts) {
   return fetch(url, init).then(r => { return r.json() });
 }
 
+// ── Mobile modifier bar ─────────────────────────────────────────────
+// Touch keyboards on iOS/Android omit Esc, Ctrl, Alt, Tab, arrows and a
+// few common symbols. The bar at the bottom of the screen (rendered in
+// index.html, gated on a coarse pointer below) provides them. Two
+// kinds of keys:
+//
+//   - Direct keys (Esc, Tab, arrows, |, ~, /…) carry a `data-seq`
+//     attribute whose value is sent straight to the active pane.
+//   - Sticky modifiers (Ctrl, Alt) carry `data-mod`. Tap → highlighted
+//     → next keystroke from the soft keyboard is interpreted with the
+//     modifier and the sticky releases. Tap again to cancel.
+//
+// applyStickyModifiers() is the chokepoint: every byte that leaves
+// term.onData passes through it before reaching the wire, so the
+// modifier applies whether the user typed from the soft keyboard,
+// from a paired Bluetooth keyboard, or from the bar itself.
+let _pendingMods = {ctrl:false, alt:false};
+
+function _syncStickyVisual(){
+  const bar = document.getElementById('modBar');
+  if (!bar) return;
+  ['ctrl','alt'].forEach(k => {
+    const b = bar.querySelector(`[data-mod="${k}"]`);
+    if (b) b.classList.toggle('mb-on', _pendingMods[k]);
+  });
+}
+
+// Pure function: take whatever was about to be sent to the remote and
+// apply any pending sticky modifiers. Exported on `window` for tests.
+function applyStickyModifiers(data){
+  if (!_pendingMods.ctrl && !_pendingMods.alt) return data;
+  if (typeof data !== 'string' || data.length !== 1) {
+    // Multi-byte input (paste, IME) — release the modifier and
+    // pass through unchanged. Applying Ctrl to a paste blob would
+    // mangle text in surprising ways.
+    if (_pendingMods.ctrl || _pendingMods.alt) {
+      _pendingMods.ctrl = _pendingMods.alt = false;
+      _syncStickyVisual();
+    }
+    return data;
+  }
+  let out = data;
+  if (_pendingMods.ctrl) {
+    if (/^[a-zA-Z]$/.test(out)) {
+      out = String.fromCharCode(out.toUpperCase().charCodeAt(0) - 64);
+    } else if (out === ' ') {
+      out = '\x00';
+    }
+    // For other chars (digits, punctuation) Ctrl is a no-op on most
+    // terminals — release silently and send the char unchanged.
+    _pendingMods.ctrl = false;
+  }
+  if (_pendingMods.alt) {
+    // Meta = ESC prefix. Works for letters (Alt+b backward-word etc.)
+    // and stays harmless for other chars.
+    out = '\x1b' + out;
+    _pendingMods.alt = false;
+  }
+  _syncStickyVisual();
+  return out;
+}
+window.applyStickyModifiers = applyStickyModifiers;
+
+function _sendModKey(seq){
+  const p = activeId ? panes[activeId] : null;
+  if (!p || !p.sid) return;
+  // Apply pending sticky modifiers to the bar-emitted byte too —
+  // e.g. tapping Ctrl then ↑ should send Ctrl+↑ (an alternate
+  // history navigation in some shells). Direct sequences > 1 byte
+  // bypass the sticky guard in applyStickyModifiers, so reapply
+  // the Alt prefix manually for those.
+  let data = seq;
+  if (_pendingMods.ctrl && data.length === 1 && /^[a-zA-Z]$/.test(data)) {
+    data = String.fromCharCode(data.toUpperCase().charCodeAt(0) - 64);
+    _pendingMods.ctrl = false;
+  }
+  if (_pendingMods.alt) {
+    data = '\x1b' + data;
+    _pendingMods.alt = false;
+  }
+  _syncStickyVisual();
+  queueInput(p, data);
+  // Return focus to the active terminal so the soft keyboard stays
+  // up — otherwise iOS dismisses it when the bar button takes focus.
+  p.term.focus();
+}
+
+function _onModBarClick(e){
+  const btn = e.target.closest('.mb-key');
+  if (!btn) return;
+  e.preventDefault();
+  const mod = btn.dataset.mod;
+  if (mod) {
+    _pendingMods[mod] = !_pendingMods[mod];
+    _syncStickyVisual();
+    return;
+  }
+  const seq = btn.dataset.seq;
+  if (seq) _sendModKey(seq);
+}
+
+// visualViewport binding: on iOS Safari, window.innerHeight stays
+// constant while the on-screen keyboard pushes the viewport up.
+// position:fixed; bottom:0 then puts the bar behind the keyboard.
+// We re-pin the bar to the bottom of the visible viewport instead.
+function _placeModBar(){
+  const bar = document.getElementById('modBar');
+  if (!bar || !window.visualViewport) return;
+  const vv = window.visualViewport;
+  const offset = window.innerHeight - vv.height - vv.offsetTop;
+  bar.style.bottom = Math.max(offset, 0) + 'px';
+}
+
+function initMobileModBar(){
+  const bar = document.getElementById('modBar');
+  if (!bar) return;
+  // Show only on touch devices. matchMedia is the right test —
+  // (pointer:coarse) survives DevTools "Toggle device toolbar"
+  // and only matches real touch input on the actual phone.
+  // (jsdom and older browsers without matchMedia silently bail.)
+  if (typeof window.matchMedia !== 'function') return;
+  const touch = window.matchMedia('(pointer: coarse), (max-width: 768px)').matches;
+  if (!touch) return;
+  document.body.classList.add('mod-bar-visible');
+  bar.setAttribute('aria-hidden', 'false');
+  // Use mousedown/touchstart instead of click so the active pane
+  // does not lose focus from the soft keyboard hide flicker.
+  bar.addEventListener('mousedown', e => e.preventDefault());
+  bar.addEventListener('click', _onModBarClick);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', _placeModBar);
+    window.visualViewport.addEventListener('scroll', _placeModBar);
+  }
+  _placeModBar();
+}
+if (typeof window !== 'undefined') {
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initMobileModBar);
+  } else {
+    initMobileModBar();
+  }
+}
+
 // ── Pane management ─────────────────────────────────────────────────
 const panes = {};
 let activeId = null;
@@ -275,6 +418,7 @@ function createPane(container) {
   // Terminal events
   term.onData(d => {
     if (!p.sid) return;
+    d = applyStickyModifiers(d);
     queueInput(p, d);
   });
   term.onBinary(d => { if(p.sid) queueInput(p,d) });
