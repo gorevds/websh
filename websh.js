@@ -1220,19 +1220,31 @@ function closeStream(p) {
 // since the window may have changed size while we were hidden.
 function kickPanesAfterAbsence() {
   Object.values(panes).forEach(p => {
-    if (!p || !p.sid || !p.polling) return;
-    // Settle-loop refit covers the case where the webfont finished
-    // loading while the tab was hidden (xterm's measurement was made
-    // against the fallback). The onSettled callback chains the SSE
-    // reconnect after /api/resize lands, preserving the original
-    // server-side ordering guarantee: PTY is resized before the
-    // shell next prints into the new stream.
-    fitPaneWhenStable(p, { onSettled: (p) => {
-      if (p.sseDisabled) return;
-      closeStream(p);
-      clearRetryClock(p);
-      startOutput(p);
-    }});
+    if (!p) return;
+    if (p.sid && p.polling) {
+      // Settle-loop refit covers the case where the webfont finished
+      // loading while the tab was hidden (xterm's measurement was made
+      // against the fallback). The onSettled callback chains the SSE
+      // reconnect after /api/resize lands, preserving the original
+      // server-side ordering guarantee: PTY is resized before the
+      // shell next prints into the new stream.
+      fitPaneWhenStable(p, { onSettled: (p) => {
+        if (p.sseDisabled) return;
+        closeStream(p);
+        clearRetryClock(p);
+        startOutput(p);
+      }});
+      return;
+    }
+    // Pane was fully disconnected while the tab slept (mobile browsers
+    // freeze background JS, so keepalive POSTs stop arriving and nginx
+    // tears down the upstream stream — by the time the tab wakes the
+    // pane has p.sid=null and the reconnect bar is showing). Auto-fire
+    // the same path the user's manual "Reconnect" click takes, so
+    // persistent panes silently rejoin their tmux slot on return.
+    if (!p.sid && (p.host || p.connection) && !p.connecting) {
+      reconnectPane(p.id);
+    }
   });
 }
 
