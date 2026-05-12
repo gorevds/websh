@@ -639,6 +639,49 @@ function createPane(container) {
     }
   });
 
+  // ── Touch-scroll for terminal scrollback ──────────────────────────
+  // tmux mouse-on captures touch as mouse drag and tries to start a
+  // selection — so on mobile the user has no way to scroll back. We
+  // intercept vertical swipes inside the normal (non-alt) screen and
+  // route them to term.scrollLines, bypassing tmux. In the alternate
+  // screen (vim / less / htop) we let touches through so those apps'
+  // own mouse handling still works.
+  //
+  // Threshold (16 px ≈ one line at default font) keeps short taps
+  // from being treated as scrolls — those still reach xterm/tmux for
+  // selection and clicks.
+  let _touchY = null, _touchScrolling = false;
+  termEl.addEventListener('touchstart', e => {
+    if (e.touches.length !== 1) return;
+    _touchY = e.touches[0].clientY;
+    _touchScrolling = false;
+  }, {passive: true});
+  termEl.addEventListener('touchmove', e => {
+    if (e.touches.length !== 1 || _touchY === null) return;
+    if (term.buffer.active.type === 'alternate') return;
+    const dy = e.touches[0].clientY - _touchY;
+    if (!_touchScrolling && Math.abs(dy) < 16) return;
+    _touchScrolling = true;
+    // Approximate line height — xterm exposes _core but it's private.
+    // Falling back to fontSize × lineHeight is close enough; off-by-one
+    // line of scroll per gesture is invisible against ~10-line swipes.
+    const lh = (settings.fontSize || 14) * (settings.lineHeight || 1.0);
+    const lines = Math.round(dy / lh);
+    if (lines !== 0) {
+      term.scrollLines(-lines);
+      _touchY = e.touches[0].clientY;
+    }
+    e.preventDefault();
+  }, {passive: false});
+  termEl.addEventListener('touchend', () => {
+    _touchY = null;
+    _touchScrolling = false;
+  }, {passive: true});
+  termEl.addEventListener('touchcancel', () => {
+    _touchY = null;
+    _touchScrolling = false;
+  }, {passive: true});
+
   // Resize observer fires immediately on observe() with the current
   // container size, so the initial fit happens automatically. The
   // older setTimeout(fit, 50) fallback is now redundant: ResizeObserver
