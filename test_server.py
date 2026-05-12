@@ -4775,8 +4775,10 @@ class TestListDir(unittest.TestCase):
         self.assertIn("next.txt", names)
 
     def test_remote_cmd_uses_nul_terminator(self):
-        """Regression: the find -printf format must end with \\0 so that
-        embedded newlines in filenames don't corrupt the listing."""
+        """Regression: each entry row must end with \\0 so embedded
+        newlines in filenames don't corrupt the listing. The remote
+        loop is POSIX-portable (no GNU `find -printf`); the contract
+        is the NUL-separated rows, not any specific format-string."""
         s = self._fake_session(control_path="/tmp/fake.sock")
         captured = {}
         def fake_run(cmd, **kw):
@@ -4788,8 +4790,13 @@ class TestListDir(unittest.TestCase):
         with unittest.mock.patch("os.path.exists", return_value=True), \
              unittest.mock.patch("subprocess.run", side_effect=fake_run):
             s.list_dir("~")
-        self.assertIn(r'%y\t%s\t%Ts\t%f\0', captured["remote"])
-        self.assertNotIn(r'%y\t%s\t%Ts\t%f\n', captured["remote"])
+        cmd = captured["remote"]
+        # Row terminator: per-entry printf must end with \0, not \n.
+        self.assertIn(r'\t%s\0', cmd)
+        self.assertNotIn(r'\t%s\n', cmd)
+        # Portability marker: the loop must NOT rely on `find -printf`
+        # (BusyBox/Alpine/dash targets don't have it).
+        self.assertNotIn('-printf', cmd)
 
     def test_dirs_sorted_before_files(self):
         s = self._fake_session(control_path="/tmp/fake.sock")
