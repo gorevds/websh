@@ -655,6 +655,103 @@ test('fitPaneWhenStable bails on re-entry while in flight', async () => {
   cleanup(env);
 });
 
+// ─── Bell-triggered notifications ────────────────────────────────────
+// Title + favicon flash on bell when the user is elsewhere; silent
+// no-op when the user is looking at the tab; auto-reset on focus.
+
+function _setHidden(win, hidden) {
+  Object.defineProperty(win.document, 'hidden', {value: hidden, configurable: true});
+  Object.defineProperty(win.document, 'visibilityState',
+    {value: hidden ? 'hidden' : 'visible', configurable: true});
+}
+function _setHasFocus(win, focused) {
+  win.document.hasFocus = () => focused;
+}
+
+test('notifyPaneIdle: user is looking at tab → silent no-op', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  _setHidden(win, false);
+  _setHasFocus(win, true);
+  const origTitle = win.document.title;
+  win.notifyPaneIdle({id: 'p1', label: 'staging'});
+  ok(win.document.title === origTitle,
+     'title unchanged when tab is focused; got ' + win.document.title);
+  cleanup(env);
+});
+
+test('notifyPaneIdle: tab hidden → title flashes with pane label', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  _setHidden(win, true);
+  _setHasFocus(win, false);
+  win.notifyPaneIdle({id: 'p1', label: 'build'});
+  ok(win.document.title.includes('build'),
+     'title carries pane label; got ' + win.document.title);
+  ok(win.document.title.indexOf('●') === 0,
+     'title starts with bullet; got ' + win.document.title);
+  cleanup(env);
+});
+
+test('notifyPaneIdle: favicon swapped to red-dot SVG when hidden', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  _setHidden(win, true);
+  _setHasFocus(win, false);
+  win.notifyPaneIdle({id: 'p1', label: 'x'});
+  const href = win.document.querySelector('link[rel="icon"]').href;
+  ok(href.includes('da3633'), 'favicon swapped to red-dot; got ' + href);
+  cleanup(env);
+});
+
+test('notifyPaneIdle: visibilitychange resets title + favicon', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  _setHidden(win, true);
+  _setHasFocus(win, false);
+  win.notifyPaneIdle({id: 'p1', label: 'x'});
+  ok(win.document.title.indexOf('●') === 0, 'flashed before return');
+  // User returns — flip hidden → false, dispatch visibilitychange.
+  _setHidden(win, false);
+  _setHasFocus(win, true);
+  win.document.dispatchEvent(new win.Event('visibilitychange'));
+  await sleep(10);
+  ok(win.document.title.indexOf('●') !== 0,
+     'title reset after focus; got ' + win.document.title);
+  const href = win.document.querySelector('link[rel="icon"]').href;
+  ok(!href.includes('da3633'), 'favicon reset; got ' + href);
+  cleanup(env);
+});
+
+test('toggleNotifyOnBell: flips pane flag and updates button visual', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  // Plant a stub pane with a button — createPane spawns the real one
+  // but it's tied to a network connect we don't want to run here.
+  const el = win.document.createElement('div');
+  const btn = win.document.createElement('button');
+  btn.setAttribute('data-notify-btn', 'p1');
+  el.appendChild(btn);
+  win._tp = {id: 'p1', el: el, notifyOnBell: false};
+  win.eval('panes["p1"] = window._tp;');
+
+  win.toggleNotifyOnBell('p1');
+  ok(win._tp.notifyOnBell === true, 'flag flipped on');
+  ok(btn.classList.contains('on'), 'button got .on class');
+  ok(btn.getAttribute('aria-pressed') === 'true', 'aria-pressed=true');
+
+  win.toggleNotifyOnBell('p1');
+  ok(win._tp.notifyOnBell === false, 'flag flipped off');
+  ok(!btn.classList.contains('on'), 'button lost .on class');
+  ok(btn.getAttribute('aria-pressed') === 'false', 'aria-pressed=false');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
