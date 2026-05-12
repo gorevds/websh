@@ -127,6 +127,8 @@
     .pane-btn:hover{color:var(--tx);background:rgba(255,255,255,.08)}
     .pane-btn:disabled{opacity:.3;cursor:default;pointer-events:none}
     .pane-btn.close:hover{color:var(--dg)}
+    /* Bell-notify toggle: dim by default, brighten when armed. */
+    .pane-btn.bell-toggle.on{color:var(--wn);background:rgba(210,153,34,.15)}
     .upload-progress{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
     .upload-progress-track{flex:1;height:14px;background:var(--bg);border-radius:7px;border:1px solid var(--bd);overflow:hidden;position:relative}
     .upload-progress-bar{height:100%;background:var(--ac);border-radius:7px;transition:width .15s;width:0%}

@@ -162,6 +162,122 @@ if (typeof window !== 'undefined') {
   }
 }
 
+// ── Bell-triggered notifications ───────────────────────────────────
+// When a pane is opted into bell-notify (toggle on its toolbar) and
+// the user is NOT looking at the tab, a BEL byte (0x07) from the
+// shell raises three signals so the user notices something is done:
+//   1. Document title becomes "● done — websh" — shows up in the
+//      browser's taskbar / tab strip even from another window.
+//   2. Favicon flashes to a red dot — visible at a glance in the
+//      tab bar.
+//   3. A system desktop notification (HTML5 Notification API) if
+//      the user previously granted permission.
+//
+// All three auto-reset when the tab regains focus or visibility.
+//
+// The actual BEL comes from the shell — we don't try to regex out
+// "command finished". Users opt in by adding a line to ~/.bashrc:
+//   PROMPT_COMMAND='printf "\\a"; '"$PROMPT_COMMAND"
+// See docs/notifications.md for the cookbook.
+
+let _notifPerm = (typeof Notification !== 'undefined')
+  ? Notification.permission : 'denied';
+let _flashActive = false;  // a flash is currently in effect
+
+function _baseTitle(){ return 'websh — Lite but powerful web terminal'; }
+function _baseFavicon(){
+  return "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='3' y='23' font-family='monospace' font-size='20' font-weight='bold' fill='%2358a6ff'>&gt;_</text></svg>";
+}
+const _ALERT_FAVICON =
+  "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23da3633'/></svg>";
+
+function _userIsLookingAtTab(){
+  // Both flags matter: document.hidden catches "tab in another tab",
+  // document.hasFocus catches "browser window in the background".
+  if (typeof document === 'undefined') return true;
+  if (document.hidden) return false;
+  if (typeof document.hasFocus === 'function' && !document.hasFocus()) return false;
+  return true;
+}
+
+function _resetFlash(){
+  if (!_flashActive) return;
+  document.title = _baseTitle();
+  const link = document.querySelector('link[rel="icon"]');
+  if (link) link.href = _baseFavicon();
+  _flashActive = false;
+  document.removeEventListener('visibilitychange', _onAnyFocus);
+  window.removeEventListener('focus', _onAnyFocus);
+}
+function _onAnyFocus(){ if (_userIsLookingAtTab()) _resetFlash(); }
+
+function _flashIdle(label){
+  document.title = '● ' + (label || 'done') + ' — websh';
+  const link = document.querySelector('link[rel="icon"]');
+  if (link) link.href = _ALERT_FAVICON;
+  if (_flashActive) return;
+  _flashActive = true;
+  document.addEventListener('visibilitychange', _onAnyFocus);
+  window.addEventListener('focus', _onAnyFocus);
+}
+
+function requestNotifPerm(){
+  if (typeof Notification === 'undefined') return Promise.resolve('denied');
+  if (Notification.permission !== 'default') {
+    _notifPerm = Notification.permission;
+    return Promise.resolve(_notifPerm);
+  }
+  return Notification.requestPermission().then(p => {
+    _notifPerm = p;
+    return p;
+  });
+}
+
+function notifyPaneIdle(p){
+  // Only fire when the user is genuinely elsewhere — beeping the
+  // window the user is staring at is rude.
+  if (_userIsLookingAtTab()) return;
+  const label = (p && p.label) ? p.label : 'pane';
+  _flashIdle(label);
+  if (_notifPerm === 'granted' && typeof Notification !== 'undefined') {
+    try {
+      const n = new Notification('websh: ' + label + ' done', {
+        body: 'Activity finished — switch back to the tab.',
+        tag: 'websh-' + (p ? p.id : 'x'),  // collapse duplicate fires
+        icon: 'assets/websh-logo.svg',
+        silent: false,
+      });
+      n.onclick = () => { window.focus(); n.close(); };
+      // Desktops auto-close after 5s; Android keeps it pinned — that's fine.
+      setTimeout(() => { try { n.close(); } catch(e){} }, 5000);
+    } catch(e) {
+      // Some browsers throw on Notification() without a service worker.
+      // Title + favicon are still flashing, which is the universal
+      // fallback.
+    }
+  }
+}
+window.notifyPaneIdle = notifyPaneIdle;
+window.requestNotifPerm = requestNotifPerm;
+
+// Toggle bell-notify for a pane. Inline onclick handler in the
+// pane-bar reaches this through the global window binding (websh.js
+// is loaded as a top-level <script>, so function declarations attach
+// to window).
+function toggleNotifyOnBell(id){
+  const p = panes[id];
+  if (!p) return;
+  p.notifyOnBell = !p.notifyOnBell;
+  const btn = p.el.querySelector('[data-notify-btn]');
+  if (btn) {
+    btn.classList.toggle('on', p.notifyOnBell);
+    btn.setAttribute('aria-pressed', p.notifyOnBell ? 'true' : 'false');
+    btn.setAttribute('title', p.notifyOnBell
+      ? 'Notify on bell (enabled)' : 'Notify on bell');
+  }
+  if (p.notifyOnBell) requestNotifPerm();
+}
+
 // ── Pane management ─────────────────────────────────────────────────
 const panes = {};
 let activeId = null;
@@ -325,6 +441,7 @@ function createPane(container) {
       `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>&#x2B06;</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
       `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>&#x2B07;</button>` +
+      `<button class="pane-btn bell-toggle" onclick="toggleNotifyOnBell('${id}')" title="Notify on bell" aria-label="Notify on bell" aria-pressed="false" data-notify-btn="${id}">&#x1F514;</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">&#x2194;</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">&#x2195;</button>` +
       `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">&#x2715;</button>` +
@@ -377,7 +494,8 @@ function createPane(container) {
     // SELECTION_TRIM: per-pane drag-blur state (see trimDragTail header)
     _dragBlurred:false, _selDisp:null, _selTimer:null,
     _dragStartX:0, _dragStartY:0, _dragMoved:false,
-    _recentDragSelectAt:0
+    _recentDragSelectAt:0,
+    notifyOnBell:false // toggle on pane-bar; see toggleNotifyOnBell
   };
   panes[id] = p;
   // Schedule a font-load-aware settle-loop refit after registration so
@@ -485,6 +603,7 @@ function createPane(container) {
   }
   term.onBell(() => {
     el.classList.remove('bell'); void el.offsetWidth; el.classList.add('bell');
+    if (p.notifyOnBell) notifyPaneIdle(p);
   });
 
   // Right-click paste. Also swallow button-2 mousedown at capture phase
