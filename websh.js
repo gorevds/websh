@@ -183,6 +183,17 @@ if (typeof window !== 'undefined') {
 let _notifPerm = (typeof Notification !== 'undefined')
   ? Notification.permission : 'denied';
 let _flashActive = false;  // a flash is currently in effect
+let _swReg = null;         // service worker registration (mobile Chrome
+                           // requires it for showNotification — see sw.js).
+
+if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+  // Register lazily; failures are non-fatal — the title/favicon flash
+  // still works as a fallback, and on desktop browsers the bare
+  // Notification() constructor still works without an SW.
+  navigator.serviceWorker.register('sw.js').then(reg => {
+    _swReg = reg;
+  }).catch(() => { /* user is on file:// or quirky CSP — skip silently */ });
+}
 
 function _baseTitle(){ return 'websh — Lite but powerful web terminal'; }
 function _baseFavicon(){
@@ -239,21 +250,29 @@ function notifyPaneIdle(p){
   if (_userIsLookingAtTab()) return;
   const label = (p && p.label) ? p.label : 'pane';
   _flashIdle(label);
-  if (_notifPerm === 'granted' && typeof Notification !== 'undefined') {
-    try {
-      const n = new Notification('websh: ' + label + ' done', {
-        body: 'Activity finished — switch back to the tab.',
-        tag: 'websh-' + (p ? p.id : 'x'),  // collapse duplicate fires
-        icon: 'assets/websh-logo.svg',
-        silent: false,
-      });
-      n.onclick = () => { window.focus(); n.close(); };
-      // Desktops auto-close after 5s; Android keeps it pinned — that's fine.
-      setTimeout(() => { try { n.close(); } catch(e){} }, 5000);
-    } catch(e) {
-      // Some browsers throw on Notification() without a service worker.
-      // Title + favicon are still flashing, which is the universal
-      // fallback.
+  if (_notifPerm === 'granted') {
+    const title = 'websh: ' + label + ' done';
+    const opts = {
+      body: 'Activity finished — switch back to the tab.',
+      tag: 'websh-' + (p ? p.id : 'x'),  // collapse duplicate fires
+      icon: 'assets/websh-logo.svg',
+      silent: false,
+    };
+    // Prefer the service worker path — mobile Chrome refuses the
+    // bare Notification() constructor with "Illegal constructor",
+    // which our try/catch was silently swallowing. Falls back to
+    // the constructor on browsers/contexts without an SW (e.g.
+    // running websh from file:// during local dev).
+    if (_swReg && typeof _swReg.showNotification === 'function') {
+      _swReg.showNotification(title, opts).catch(() => {});
+    } else if (typeof Notification !== 'undefined') {
+      try {
+        const n = new Notification(title, opts);
+        n.onclick = () => { window.focus(); n.close(); };
+        setTimeout(() => { try { n.close(); } catch(e){} }, 5000);
+      } catch(e) {
+        // Title + favicon are still flashing — universal fallback.
+      }
     }
   }
 }

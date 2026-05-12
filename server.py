@@ -462,6 +462,7 @@ _STATIC_FILES = {
     "/websh.js": ("websh.js", "application/javascript; charset=utf-8"),
     "/assets/websh-logo.svg": ("assets/websh-logo.svg", "image/svg+xml"),
     "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+    "/sw.js": ("sw.js", "application/javascript; charset=utf-8"),
 }
 
 
