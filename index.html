@@ -2,9 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <!-- Allow pinch-zoom for a11y; viewport-fit=cover lets us use
+       safe-area insets under iPhone notches. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#0d1117">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>websh — Lite but powerful web terminal</title>
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%230d1117'/><text x='3' y='23' font-family='monospace' font-size='20' font-weight='bold' fill='%2358a6ff'>&gt;_</text></svg>">
+  <link rel="manifest" href="manifest.webmanifest">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -16,7 +23,11 @@
       --ac:#58a6ff;--ach:#79c0ff;--dg:#f85149;--ok:#3fb950;--wn:#d29922;
       --radius:8px;
     }
-    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--tx);height:100vh;display:flex;flex-direction:column;overflow:hidden}
+    /* 100vh on iOS misreports while the on-screen keyboard is up,
+       leaving content under the keyboard. 100dvh tracks the actually-
+       visible viewport on iOS 15.4+ / Chrome 108+. The 100vh stays
+       as a fallback for older browsers. */
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;background:var(--bg);color:var(--tx);height:100vh;height:100dvh;display:flex;flex-direction:column;overflow:hidden}
 
     /* ── Top bar ── */
     .top{display:flex;align-items:center;justify-content:space-between;padding:6px 16px;background:var(--sf);border-bottom:1px solid var(--bd);flex-shrink:0;min-height:40px}
@@ -213,6 +224,88 @@
     .fb-inp{flex:1;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:6px 10px;font-size:13px;font-family:'JetBrains Mono',ui-monospace,monospace}
     .fb-inp:focus{outline:none;border-color:var(--ac)}
     .fb-inp::placeholder{color:var(--dim);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
+
+    /* ─── Mobile modifier bar ──────────────────────────────────────
+       Bar pinned above the on-screen keyboard, providing keys that
+       are absent from mobile system keyboards (Esc, Ctrl, Alt, Tab,
+       arrows) plus frequently-mistapped symbols. Hidden on desktop
+       via the .mod-bar-visible body class (set by JS only on touch
+       devices) — using `display:none` directly here so a desktop
+       user with a touch screen plugged in doesn't get an extra row. */
+    .mod-bar{position:fixed;left:0;right:0;bottom:0;z-index:90;background:rgba(13,17,23,.97);border-top:1px solid var(--bd);padding:4px 6px calc(4px + env(safe-area-inset-bottom));overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch;scrollbar-width:none;display:none}
+    .mod-bar::-webkit-scrollbar{display:none}
+    body.mod-bar-visible .mod-bar{display:block}
+    /* Leave room at the bottom of the workspace so terminal scroll
+       isn't hidden behind the bar. */
+    body.mod-bar-visible #panes{padding-bottom:46px}
+    .mb-key{display:inline-block;min-width:42px;height:36px;margin:0 2px;padding:0 10px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;color:var(--tx);font-size:14px;font-family:inherit;cursor:pointer;touch-action:manipulation;user-select:none;vertical-align:middle;line-height:34px}
+    .mb-key:active{background:var(--bd)}
+    .mb-key.mb-on{background:var(--ac);border-color:var(--ac);color:#fff}
+
+    /* ─── Mobile / touch ───────────────────────────────────────────
+       (max-width:768px) catches phones; (pointer:coarse) catches
+       finger-driven tablets (iPad) at any width. The two are OR'd
+       so a Surface-style hybrid in tablet mode picks up touch
+       layout regardless of window size. */
+    @media (max-width: 768px), (pointer: coarse) {
+      /* Top bar: hide slogan, enlarge buttons for finger tapping.
+         Horizontal scroll on the right cluster so a long row of
+         icons stays usable on narrow screens. */
+      .top-slogan{display:none}
+      .top{padding:6px 10px;min-height:44px}
+      .top-r{overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;gap:2px}
+      .top-r::-webkit-scrollbar{display:none}
+      .tbtn{min-width:40px;min-height:40px;padding:6px 8px;font-size:17px;touch-action:manipulation}
+
+      /* Connect / options / file-browser overlays: fullscreen modal
+         instead of a centered box so the on-screen keyboard does not
+         push half the form offscreen. */
+      .ov{align-items:flex-start;padding:0}
+      .panel,.tm-panel,.fb-panel{width:100vw;max-width:100vw;height:100dvh;max-height:100dvh;border-radius:0;border-left:none;border-right:none;padding-top:calc(20px + env(safe-area-inset-top));padding-bottom:calc(20px + env(safe-area-inset-bottom))}
+      .panel-close{top:calc(10px + env(safe-area-inset-top));right:12px;font-size:26px;padding:8px 12px;min-width:44px;min-height:44px}
+
+      /* Inputs and selects: iOS auto-zooms when font-size < 16px on
+         a focused form input — anti-feature. 16px keeps the page in
+         place. */
+      .fg input,.fg textarea,.opt-select,.opt-ctl input[type=number],.fb-inp{font-size:16px}
+
+      /* Saved-list rows: bigger tap targets. */
+      .saved-list{max-height:50dvh}
+      .sv{padding:12px 14px;min-height:48px}
+      .sv-btn{padding:8px 12px;font-size:13px;min-height:36px}
+
+      /* Split handle: visually still a 3px line, but a transparent
+         hit-zone gives fingers something to grab. The negative margin
+         offsets the padding so the handle's apparent width is
+         unchanged. */
+      .split-h>.split-handle{width:3px;padding:0 9px;margin:0 -9px;background-clip:content-box}
+      .split-v>.split-handle{height:3px;padding:9px 0;margin:-9px 0;background-clip:content-box}
+
+      /* Pane header buttons: bigger tap area. */
+      .pane-bar{gap:4px;padding:3px 6px}
+      .pane-btn{padding:6px 8px;min-width:32px;min-height:32px;font-size:14px}
+
+      /* Safe-area inset under the home indicator on iPhone X+. */
+      body{padding-bottom:env(safe-area-inset-bottom)}
+
+      /* Options panel rows: stack label/control on narrow screens so
+         long select widgets don't overflow. */
+      .opt-row{flex-wrap:wrap}
+      .opt-ctl{width:100%;justify-content:flex-start}
+      .opt-ctl input[type=range]{max-width:none}
+      .opt-select{min-width:0;width:100%}
+
+      /* tm-panel button row often holds 2-3 buttons — let them wrap
+         and grow on narrow screens. */
+      .tm-row{flex-wrap:wrap}
+      .tm-row .btn{flex:1;min-width:120px;padding:10px 14px;font-size:14px}
+    }
+
+    /* Standalone (added to home screen as a PWA) — drop the body
+       padding because the OS already reserves the safe area. */
+    @media (display-mode: standalone) {
+      body{padding-bottom:0}
+    }
   </style>
 </head>
 <body>
@@ -235,6 +328,30 @@
 
 <!-- Pane container -->
 <div id="panes"></div>
+
+<!-- Mobile modifier bar (touch only — JS toggles .mod-bar-visible
+     on <body> after detecting a coarse pointer). Each .mb-key has
+     either `data-seq` (send a literal byte sequence to the active
+     pane) or `data-mod` (toggle a sticky modifier). Sticky modifiers
+     auto-release after one keypress. -->
+<div class="mod-bar" id="modBar" aria-hidden="true">
+  <button class="mb-key" data-mod="ctrl" aria-label="Ctrl">Ctrl</button>
+  <button class="mb-key" data-mod="alt" aria-label="Alt">Alt</button>
+  <button class="mb-key" data-seq="&#x1b;" aria-label="Escape">Esc</button>
+  <button class="mb-key" data-seq="&#x09;" aria-label="Tab">Tab</button>
+  <button class="mb-key" data-seq="&#x1b;[A" aria-label="Up arrow">&uarr;</button>
+  <button class="mb-key" data-seq="&#x1b;[B" aria-label="Down arrow">&darr;</button>
+  <button class="mb-key" data-seq="&#x1b;[D" aria-label="Left arrow">&larr;</button>
+  <button class="mb-key" data-seq="&#x1b;[C" aria-label="Right arrow">&rarr;</button>
+  <button class="mb-key" data-seq="&#x1b;[H" aria-label="Home">Home</button>
+  <button class="mb-key" data-seq="&#x1b;[F" aria-label="End">End</button>
+  <button class="mb-key" data-seq="&#x1b;[5~" aria-label="Page up">PgUp</button>
+  <button class="mb-key" data-seq="&#x1b;[6~" aria-label="Page down">PgDn</button>
+  <button class="mb-key" data-seq="|" aria-label="Pipe">|</button>
+  <button class="mb-key" data-seq="~" aria-label="Tilde">~</button>
+  <button class="mb-key" data-seq="/" aria-label="Slash">/</button>
+  <button class="mb-key" data-seq="-" aria-label="Dash">-</button>
+</div>
 
 <!-- Options overlay -->
 <div id="ovOpt" class="ov h" onclick="if(event.target===this)closeOptions()">

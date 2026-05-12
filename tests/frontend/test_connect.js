@@ -89,6 +89,7 @@ const EXPOSE = `
     set: v => { currentConnectRun = v; },
     configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
+  Object.defineProperty(window, '_pendingMods', {get: () => _pendingMods, configurable: true});
 })();`;
 
 async function mkEnv(plan) {
@@ -809,6 +810,106 @@ test('SELECTION_TRIM: _destroyPane cancels pending onCursorMove subscription', a
   win._destroyPane(p.id, false);
   ok(p.term._cursorMoveCbs.length < cbsBefore,
      'destroy disposed the subscription');
+  cleanup(env);
+});
+
+// ─── Mobile modifier bar — applyStickyModifiers logic ────────────────
+// The chokepoint that converts soft-keyboard input + a pending sticky
+// modifier into the right byte sequence. Pure function, easy to
+// pin down in isolation from the DOM. _pendingMods is mutable shared
+// state; each test sets it, calls applyStickyModifiers, and checks
+// the released-by-side-effect state too.
+
+test('applyStickyModifiers: no pending → identity', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win._pendingMods.ctrl = false;
+  win._pendingMods.alt = false;
+  ok(win.applyStickyModifiers('c') === 'c', "plain 'c' passes through");
+  ok(win.applyStickyModifiers('hello') === 'hello',
+     'multi-byte unchanged');
+  ok(win.applyStickyModifiers('') === '',
+     'empty string unchanged');
+  cleanup(env);
+});
+
+test('applyStickyModifiers: Ctrl+letter → ASCII control', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win._pendingMods.ctrl = true;
+  const out = win.applyStickyModifiers('c');
+  ok(out === '\x03', "Ctrl+c → 0x03 (got " + out.charCodeAt(0) + ")");
+  ok(win._pendingMods.ctrl === false, 'sticky Ctrl released after use');
+  // Uppercase too — many users tap Caps Lock or Shift mid-flight.
+  win._pendingMods.ctrl = true;
+  ok(win.applyStickyModifiers('D').charCodeAt(0) === 4,
+     'Ctrl+D (uppercase input) → 0x04');
+  cleanup(env);
+});
+
+test('applyStickyModifiers: Ctrl+space → NUL', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win._pendingMods.ctrl = true;
+  ok(win.applyStickyModifiers(' ').charCodeAt(0) === 0,
+     'Ctrl+Space → 0x00 (NUL)');
+  cleanup(env);
+});
+
+test('applyStickyModifiers: Ctrl+digit → no transform, sticky still releases', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win._pendingMods.ctrl = true;
+  // Ctrl+1 is a no-op on most terminals — send '1' literally and
+  // release the modifier rather than silently swallowing the press.
+  ok(win.applyStickyModifiers('1') === '1', "Ctrl+1 sends '1'");
+  ok(win._pendingMods.ctrl === false, 'sticky still released');
+  cleanup(env);
+});
+
+test('applyStickyModifiers: Alt+letter → ESC prefix', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win._pendingMods.alt = true;
+  const out = win.applyStickyModifiers('b');
+  ok(out === '\x1bb', "Alt+b → '\\x1b b' (got " + JSON.stringify(out) + ")");
+  ok(win._pendingMods.alt === false, 'sticky Alt released after use');
+  cleanup(env);
+});
+
+test('applyStickyModifiers: Ctrl+Alt+letter combines both', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win._pendingMods.ctrl = true;
+  win._pendingMods.alt = true;
+  const out = win.applyStickyModifiers('c');
+  // Ctrl first folds 'c' to 0x03, then Alt prefixes ESC.
+  ok(out === '\x1b\x03',
+     "Ctrl+Alt+c → ESC + 0x03 (got " + JSON.stringify(out) + ")");
+  ok(win._pendingMods.ctrl === false && win._pendingMods.alt === false,
+     'both modifiers released');
+  cleanup(env);
+});
+
+test('applyStickyModifiers: multi-byte input (paste) releases modifier without applying', async () => {
+  const env = await mkEnv([{action: 'config',
+                            response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win._pendingMods.ctrl = true;
+  // Applying Ctrl to a paste blob would mangle text in surprising
+  // ways — guard releases the modifier and passes the blob through
+  // unchanged.
+  const blob = 'sudo apt update';
+  ok(win.applyStickyModifiers(blob) === blob,
+     'paste blob unchanged');
+  ok(win._pendingMods.ctrl === false,
+     'sticky released so the next single keystroke is normal');
   cleanup(env);
 });
 
