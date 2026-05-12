@@ -235,6 +235,23 @@
     [data-theme="light"]{--bg:#fff;--sf:#f6f8fa;--bd:#d0d7de;--tx:#1f2328;--dim:#656d76;--ac:#0969da;--ach:#0550ae;--dg:#cf222e;--ok:#1a7f37;--wn:#9a6700}
     [data-theme="light"] .xterm{--xterm-bg:#fff}
 
+    /* ─── Mobile modifier bar ──────────────────────────────────────
+       Bar pinned above the on-screen keyboard, providing keys that
+       are absent from mobile system keyboards (Esc, Ctrl, Alt, Tab,
+       arrows) plus frequently-mistapped symbols. Hidden on desktop
+       via the .mod-bar-visible body class (set by JS only on touch
+       devices) — using `display:none` directly here so a desktop
+       user with a touch screen plugged in doesn't get an extra row. */
+    .mod-bar{position:fixed;left:0;right:0;bottom:0;z-index:90;background:rgba(13,17,23,.97);border-top:1px solid var(--bd);padding:4px 6px calc(4px + env(safe-area-inset-bottom));overflow-x:auto;white-space:nowrap;-webkit-overflow-scrolling:touch;scrollbar-width:none;display:none}
+    .mod-bar::-webkit-scrollbar{display:none}
+    body.mod-bar-visible .mod-bar{display:block}
+    /* Leave room at the bottom of the workspace so terminal scroll
+       isn't hidden behind the bar. */
+    body.mod-bar-visible #panes{padding-bottom:46px}
+    .mb-key{display:inline-block;min-width:42px;height:36px;margin:0 2px;padding:0 10px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;color:var(--tx);font-size:14px;font-family:inherit;cursor:pointer;touch-action:manipulation;user-select:none;vertical-align:middle;line-height:34px}
+    .mb-key:active{background:var(--bd)}
+    .mb-key.mb-on{background:var(--ac);border-color:var(--ac);color:#fff}
+
     /* ─── Mobile / touch ───────────────────────────────────────────
        (max-width:768px) catches phones; (pointer:coarse) catches
        finger-driven tablets (iPad) at any width. The two are OR'd
@@ -323,6 +340,30 @@
 
 <!-- Pane container -->
 <div id="panes"></div>
+
+<!-- Mobile modifier bar (touch only — JS toggles .mod-bar-visible
+     on <body> after detecting a coarse pointer). Each .mb-key has
+     either `data-seq` (send a literal byte sequence to the active
+     pane) or `data-mod` (toggle a sticky modifier). Sticky modifiers
+     auto-release after one keypress. -->
+<div class="mod-bar" id="modBar" aria-hidden="true">
+  <button class="mb-key" data-mod="ctrl" aria-label="Ctrl">Ctrl</button>
+  <button class="mb-key" data-mod="alt" aria-label="Alt">Alt</button>
+  <button class="mb-key" data-seq="&#x1b;" aria-label="Escape">Esc</button>
+  <button class="mb-key" data-seq="&#x09;" aria-label="Tab">Tab</button>
+  <button class="mb-key" data-seq="&#x1b;[A" aria-label="Up arrow">&uarr;</button>
+  <button class="mb-key" data-seq="&#x1b;[B" aria-label="Down arrow">&darr;</button>
+  <button class="mb-key" data-seq="&#x1b;[D" aria-label="Left arrow">&larr;</button>
+  <button class="mb-key" data-seq="&#x1b;[C" aria-label="Right arrow">&rarr;</button>
+  <button class="mb-key" data-seq="&#x1b;[H" aria-label="Home">Home</button>
+  <button class="mb-key" data-seq="&#x1b;[F" aria-label="End">End</button>
+  <button class="mb-key" data-seq="&#x1b;[5~" aria-label="Page up">PgUp</button>
+  <button class="mb-key" data-seq="&#x1b;[6~" aria-label="Page down">PgDn</button>
+  <button class="mb-key" data-seq="|" aria-label="Pipe">|</button>
+  <button class="mb-key" data-seq="~" aria-label="Tilde">~</button>
+  <button class="mb-key" data-seq="/" aria-label="Slash">/</button>
+  <button class="mb-key" data-seq="-" aria-label="Dash">-</button>
+</div>
 
 <!-- Options overlay -->
 <div id="ovOpt" class="ov h" onclick="if(event.target===this)closeOptions()">
