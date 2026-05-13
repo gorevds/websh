@@ -203,12 +203,12 @@ const _ALERT_FAVICON =
   "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><circle cx='8' cy='8' r='7' fill='%23da3633'/></svg>";
 
 function _userIsLookingAtTab(){
-  // Both flags matter: document.hidden catches "tab in another tab",
-  // document.hasFocus catches "browser window in the background".
+  // Only document.hidden — document.hasFocus() is unreliable on mobile
+  // Chrome (lies when the screen is off or the page sits behind a soft
+  // keyboard). visibilityState is the reliable signal across desktop
+  // and mobile.
   if (typeof document === 'undefined') return true;
-  if (document.hidden) return false;
-  if (typeof document.hasFocus === 'function' && !document.hasFocus()) return false;
-  return true;
+  return !document.hidden;
 }
 
 function _resetFlash(){
@@ -245,11 +245,13 @@ function requestNotifPerm(){
 }
 
 function notifyPaneIdle(p){
-  // Only fire when the user is genuinely elsewhere — beeping the
-  // window the user is staring at is rude.
-  if (_userIsLookingAtTab()) return;
   const label = (p && p.label) ? p.label : 'pane';
-  _flashIdle(label);
+  // Title/favicon flash only when the tab is actually hidden — staring
+  // at the foreground tab + flashing its title would be redundant nag.
+  // System notifications fire unconditionally: mobile OS suppresses the
+  // toast when the app is foreground, and the user explicitly opted in
+  // per pane by tapping the bell button.
+  if (!_userIsLookingAtTab()) _flashIdle(label);
   if (_notifPerm === 'granted') {
     const title = 'websh: ' + label + ' done';
     const opts = {
@@ -644,39 +646,51 @@ function createPane(container) {
   });
 
   // ── Touch-scroll for terminal scrollback ──────────────────────────
-  // tmux mouse-on captures touch as mouse drag and tries to start a
-  // selection — so on mobile the user has no way to scroll back. We
-  // intercept vertical swipes inside the normal (non-alt) screen and
-  // route them to term.scrollLines, bypassing tmux. In the alternate
-  // screen (vim / less / htop) we let touches through so those apps'
-  // own mouse handling still works.
-  //
-  // Threshold (16 px ≈ one line at default font) keeps short taps
-  // from being treated as scrolls — those still reach xterm/tmux for
-  // selection and clicks.
+  // Touch devices have no wheel events, so neither xterm's local
+  // scrollback (normal screen) nor remote mouse-tracking apps (tmux
+  // mouse-on, vim mouse=a, less -G in mouse mode) can be scrolled
+  // without help. We intercept vertical swipes and:
+  //   - if the remote enabled mouse tracking: emit SGR mouse-wheel
+  //     escape sequences directly to the PTY, so tmux/vim/less scroll
+  //     their own buffers as if a real wheel was used;
+  //   - else (plain bash on normal screen): call term.scrollLines on
+  //     xterm's local scrollback.
+  // 16 px threshold keeps short taps reaching xterm for selection/clicks.
+  // Capture phase ensures we win over xterm's mouse-event synthesis,
+  // which would otherwise convert the touch into a fake mouse-drag.
   let _touchY = null, _touchScrolling = false;
   termEl.addEventListener('touchstart', e => {
     if (e.touches.length !== 1) return;
     _touchY = e.touches[0].clientY;
     _touchScrolling = false;
-  }, {passive: true});
+  }, {passive: true, capture: true});
   termEl.addEventListener('touchmove', e => {
     if (e.touches.length !== 1 || _touchY === null) return;
-    if (term.buffer.active.type === 'alternate') return;
     const dy = e.touches[0].clientY - _touchY;
     if (!_touchScrolling && Math.abs(dy) < 16) return;
     _touchScrolling = true;
-    // Approximate line height — xterm exposes _core but it's private.
-    // Falling back to fontSize × lineHeight is close enough; off-by-one
-    // line of scroll per gesture is invisible against ~10-line swipes.
     const lh = (settings.fontSize || 14) * (settings.lineHeight || 1.0);
     const lines = Math.round(dy / lh);
     if (lines !== 0) {
-      term.scrollLines(-lines);
+      const mt = term.modes && term.modes.mouseTrackingMode;
+      const mouseTrack = mt && mt !== 'none';
+      if (mouseTrack && p.sid) {
+        // SGR mouse-wheel: button 64=up (finger down → older content),
+        // 65=down. Coords (col=1,row=1) don't matter for tmux's single
+        // pane. Cap ticks at 10 per move so a fast flick doesn't flood
+        // the pty with hundreds of events.
+        const code = lines > 0 ? 64 : 65;
+        const ticks = Math.min(Math.abs(lines), 10);
+        let buf = '';
+        for (let i = 0; i < ticks; i++) buf += '\x1b[<' + code + ';1;1M';
+        queueInput(p, buf);
+      } else if (term.buffer.active.type !== 'alternate') {
+        term.scrollLines(-lines);
+      }
       _touchY = e.touches[0].clientY;
     }
     e.preventDefault();
-  }, {passive: false});
+  }, {passive: false, capture: true});
   termEl.addEventListener('touchend', () => {
     _touchY = null;
     _touchScrolling = false;
