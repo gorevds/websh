@@ -47,6 +47,7 @@ API endpoints:
 """
 
 import base64
+import binascii
 import datetime
 import fcntl
 import ipaddress
@@ -68,7 +69,31 @@ import urllib.parse
 import uuid
 from collections import OrderedDict
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from threading import Thread, Lock, Event, BoundedSemaphore
+from threading import Thread, Lock, RLock, Event, BoundedSemaphore
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.exceptions import InvalidTag
+    HAS_CRYPTOGRAPHY = True
+except ImportError:  # pragma: no cover - exercised by the no-deps CI job
+    AESGCM = None
+    InvalidTag = Exception
+    HAS_CRYPTOGRAPHY = False
+
+# Operator opt-in until the client-side PR (PR-C) lands. Default off
+# so a server upgrade does not advertise endpoints the bundled client
+# does not know how to call. Will become the default once PR-C ships.
+WEBSH_VAULT_ENABLE = os.environ.get("WEBSH_VAULT_ENABLE") == "1"
+
+# Operator opt-in to the future v1.0.0 default. With this set, any
+# plaintext credential in websh.json blocks startup with an actionable
+# message. Without it, plaintext still works and emits a WARN once.
+WEBSH_REQUIRE_VAULT = os.environ.get("WEBSH_REQUIRE_VAULT") == "1"
+
+# Runtime trap: flipped True when the on-disk creds file is unreadable
+# (unsupported schema version, etc) to refuse-to-write rather than
+# silently overwrite. Cleared only by process restart.
+_vault_disabled = False
 
 __version__ = "0.2.0"
 
@@ -210,6 +235,11 @@ _SLOT_ID_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
 # "~/.local/bin/tmux". Rejects shell metacharacters so it's safe to
 # interpolate into the remote-command string without escaping.
 _TMUX_CMD_RE = re.compile(r'^[A-Za-z0-9_./~-]{1,128}$')
+
+# Vault and connection IDs are 26-character base32 strings (e.g. ulid-style).
+# Named separately so the format can diverge independently in the future.
+_VAULT_ID_RE = re.compile(r"^[A-Z2-7]{26}$")
+_CONN_ID_RE  = re.compile(r"^[A-Z2-7]{26}$")
 
 # ─── Persistent-session TTL watchdog ─────────────────────────────────
 #
@@ -908,6 +938,22 @@ def load_config():
             c["allowed_users"] = _normalize_user_list(c.get("allowed_users"))
             c["denied_users"] = _normalize_user_list(c.get("denied_users"))
 
+        flagged = []
+        for c in conns:
+            if c.get("password") or c.get("key") or c.get("key_pass"):
+                flagged.append(c.get("name") or c.get("host") or "?")
+        if flagged:
+            msg = ("websh.json contains plaintext credentials on "
+                   "{} entr{}: {} — see docs/encryption.md to "
+                   "migrate").format(
+                       len(flagged),
+                       "ies" if len(flagged) > 1 else "y",
+                       ", ".join(flagged))
+            if WEBSH_REQUIRE_VAULT:
+                _log("ERROR", msg)
+                raise SystemExit(1)
+            _log("WARN", msg)
+
         denied_host_set, denied_net_list = _parse_denied_hosts(
             cfg.get("denied_hosts"))
         result = {
@@ -923,6 +969,180 @@ def load_config():
     except Exception as e:
         _log("WARN", "failed to load config: {}".format(e))
         return _CONFIG_EMPTY
+
+
+# ── Credential vault (websh.creds.json) ─────────────────────────────
+
+_creds_cache = None
+_creds_cache_key = (0, 0)   # (mtime, size); bare mtime is 1s on some FS
+_CREDS_EMPTY = {"version": 1, "vaults": {}}
+_CREDS_SCHEMA_VERSION = 1
+
+# Cap incoming bodies for vault endpoints. Legitimate payloads are well
+# under 4 KB (small JSON + 12-byte iv + ~200-byte ct, base64'd). 16 KB
+# leaves headroom for ssh_options/host strings and stops a misuser from
+# filling the on-disk store via repeated multi-MB ct fields.
+_MAX_VAULT_REQUEST_BYTES = 16 * 1024
+# Keys that are ALLOW-listed for connections from websh.json but
+# REJECTED inside vault-stored ssh_options: a browser-side write to the
+# vault could otherwise point ssh at an arbitrary file path and use the
+# ssh parse-error timing as a read-oracle for files readable by the
+# websh uid. Operator-managed websh.json is the trusted source for
+# file-path options.
+_VAULT_DENY_SSH_OPTIONS = frozenset({"identityfile"})
+
+
+def _creds_path():
+    """Path to websh.creds.json.
+
+    Honors WEBSH_CREDS_PATH explicitly; otherwise sits next to
+    WEBSH_CONFIG when set, else cwd.
+    """
+    env = os.environ.get("WEBSH_CREDS_PATH", "").strip()
+    if env:
+        return env
+    cfg = os.environ.get("WEBSH_CONFIG", "").strip()
+    if cfg:
+        return os.path.join(os.path.dirname(os.path.abspath(cfg)),
+                            "websh.creds.json")
+    return os.path.abspath("websh.creds.json")
+
+
+def _load_creds():
+    """Load websh.creds.json with (mtime, size) caching.
+
+    Returns a fresh empty store dict when the file is missing,
+    unparseable, malformed, or carries an unsupported schema version.
+    Unsupported version also sets `_vault_disabled` so the writer can
+    refuse-to-write and config_public flips vault_enabled off until
+    process restart.
+    """
+    global _creds_cache, _creds_cache_key, _vault_disabled
+    path = _creds_path()
+    if not os.path.isfile(path):
+        return dict(_CREDS_EMPTY, vaults={})
+    try:
+        st = os.stat(path)
+        key = (st.st_mtime, st.st_size)
+        if _creds_cache is not None and key == _creds_cache_key:
+            return _creds_cache
+        with open(path, "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        _log("WARN", "failed to load creds: {}".format(e))
+        return dict(_CREDS_EMPTY, vaults={})
+    if not isinstance(data, dict):
+        # Operator typo or partial write from an external tool produced
+        # a JSON array/string/number at the root. Treat as empty store.
+        _log("WARN", "creds file {}: root is not an object; "
+             "treating as empty".format(path))
+        return dict(_CREDS_EMPTY, vaults={})
+    if data.get("version") != _CREDS_SCHEMA_VERSION:
+        if not _vault_disabled:
+            _log("WARN",
+                 "websh.creds.json schema version={} unsupported "
+                 "(this build expects {}) — vault disabled until "
+                 "operator action".format(
+                     data.get("version"), _CREDS_SCHEMA_VERSION))
+        _vault_disabled = True
+        return dict(_CREDS_EMPTY, vaults={})
+    if not isinstance(data.get("vaults"), dict):
+        _log("WARN", "creds file {}: missing or non-object 'vaults'; "
+             "treating as empty".format(path))
+        return dict(_CREDS_EMPTY, vaults={})
+    _creds_cache = data
+    _creds_cache_key = key
+    return _creds_cache
+
+
+def _save_creds_atomic(data):
+    """Persist `data` to websh.creds.json via tmp + fsync + rename.
+
+    Acquires _creds_lock around the whole RMW so concurrent writes
+    serialize. Mode 0600. Updates the in-process cache so the next
+    _load_creds() returns the just-written value without re-reading.
+
+    Refuses to write when _vault_disabled is set (an unsupported schema
+    version file is on disk and we must not overwrite it). Callers
+    should also check the flag and respond 501 before computing the
+    payload — the RuntimeError raised here is a backstop.
+    """
+    if _vault_disabled:
+        raise RuntimeError("vault disabled — refusing to write")
+    global _creds_cache, _creds_cache_key
+    path = _creds_path()
+    parent = os.path.dirname(path) or "."
+    with _creds_lock:
+        fd, tmp = tempfile.mkstemp(prefix=".websh.creds.", suffix=".tmp",
+                                   dir=parent)
+        # If anything between mkstemp and the successful replace raises
+        # (chmod EACCES, replace cross-device, OOM serialising) we must
+        # unlink the tmp file ourselves — mkstemp doesn't autoclean and
+        # repeated failures would otherwise accumulate hidden files in
+        # the operator's config dir.
+        ok = False
+        try:
+            try:
+                os.write(fd, json.dumps(data, separators=(",", ":")).encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            ok = True
+        finally:
+            if not ok:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        # fsync the parent dir so the rename is durable across crash.
+        try:
+            dir_fd = os.open(parent, os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            # Some filesystems (tmpfs in CI) don't support O_DIRECTORY
+            # or fsync on dirs. Best-effort.
+            pass
+        _creds_cache = data
+        try:
+            st = os.stat(path)
+            _creds_cache_key = (st.st_mtime, st.st_size)
+        except OSError:
+            _creds_cache_key = (0, 0)
+
+
+def _decrypt_credential(key_bytes, iv_b64, ct_b64, vault_id, conn_id):
+    """Decrypt one stored blob.
+
+    Raises ValueError on malformed inputs (wrong key length, bad
+    base64, wrong IV length, ct too short, non-string iv/ct). Raises
+    InvalidTag when authentication fails — callers map that to 400
+    vault_decrypt_failed.
+
+    AAD = utf8(vault_id + ":" + conn_id) so blobs cannot be moved
+    between slots even by an operator with shell access to the file.
+    """
+    if not HAS_CRYPTOGRAPHY:
+        raise RuntimeError("cryptography not installed")
+    if not isinstance(key_bytes, (bytes, bytearray)) or len(key_bytes) != 32:
+        raise ValueError("key must be 32 bytes")
+    if not isinstance(iv_b64, str) or not isinstance(ct_b64, str):
+        raise ValueError("iv/ct must be base64 strings")
+    try:
+        iv = base64.b64decode(iv_b64, validate=True)
+        ct = base64.b64decode(ct_b64, validate=True)
+    except (binascii.Error, ValueError, TypeError) as e:
+        raise ValueError("invalid base64: {}".format(e))
+    if len(iv) != 12:
+        raise ValueError("iv must be 12 bytes")
+    if len(ct) < 17:
+        raise ValueError("ct too short for GCM tag")
+    aad = ("{}:{}".format(vault_id, conn_id)).encode("utf-8")
+    return AESGCM(bytes(key_bytes)).decrypt(iv, ct, aad)
 
 
 def config_public():
@@ -949,6 +1169,7 @@ def config_public():
         "isolate_storage": cfg.get("isolate_storage", False),
         "session_timeout": SESSION_TIMEOUT,
         "version": __version__,
+        "vault_enabled": HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled,
     }
 
 
@@ -1023,6 +1244,10 @@ def clamp(value, lo, hi, default):
 
 sessions = OrderedDict()
 sessions_lock = Lock()
+# Reentrant so handlers can do `with _creds_lock: ... _save_creds_atomic(...)`.
+# _save_creds_atomic reacquires the same lock internally; without RLock that
+# self-acquisition would deadlock.
+_creds_lock = RLock()
 
 
 class SSHSession(object):
@@ -2207,6 +2432,8 @@ class Handler(BaseHTTPRequestHandler):
             self._upload_cancel()
         elif action == "tmux_options":
             self._tmux_options()
+        elif action == "save":
+            self._save_credential()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -2231,6 +2458,13 @@ class Handler(BaseHTTPRequestHandler):
             self._ls()
         elif action == "download":
             self._download()
+        else:
+            self._json({"error": "not found"}, 404)
+
+    def do_DELETE(self):
+        action = self._resolve_action()
+        if action == "save":
+            self._delete_credential()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -2269,6 +2503,139 @@ class Handler(BaseHTTPRequestHandler):
 
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
+
+    # ── Vault save / delete ─────────────────────────────────────────
+
+    def _save_credential(self):
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            _access_log_emit("save", ip, result="rate_limited")
+            self._json({"error": "too many requests"}, 429)
+            return
+        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
+                and not _vault_disabled):
+            self._json({"error": "credential vault unavailable "
+                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                        "set / websh.creds.json schema unsupported — "
+                        "see server log)"}, 501)
+            return
+        try:
+            content_length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            content_length = 0
+        if content_length > _MAX_VAULT_REQUEST_BYTES:
+            self._json({"error": "request body too large"}, 413)
+            return
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return
+        vault_id = (body.get("vault_id") or "").strip()
+        conn_id  = (body.get("conn_id") or "").strip()
+        host     = (body.get("host") or "").strip()
+        port     = clamp(body.get("port"), MIN_PORT, MAX_PORT, 22)
+        username = (body.get("username") or "").strip()
+        iv_b64   = body.get("iv") or ""
+        ct_b64   = body.get("ct") or ""
+
+        def _bad(detail):
+            self._json({"error": "vault_input_invalid",
+                        "detail": detail}, 400)
+
+        if not _VAULT_ID_RE.match(vault_id):
+            return _bad("invalid vault_id")
+        if not _CONN_ID_RE.match(conn_id):
+            return _bad("invalid conn_id")
+        if not host or not username:
+            return _bad("host and username are required")
+        if host.startswith("-") or username.startswith("-"):
+            return _bad("host and username must not start with '-'")
+        try:
+            iv = base64.b64decode(iv_b64, validate=True)
+            ct = base64.b64decode(ct_b64, validate=True)
+        except (binascii.Error, ValueError):
+            return _bad("iv/ct must be base64")
+        if len(iv) != 12:
+            return _bad("iv must be 12 bytes")
+        if len(ct) < 17:
+            return _bad("ct too short for GCM tag")
+        raw_opts = body.get("ssh_options", {})
+        if raw_opts is not None and not isinstance(raw_opts, dict):
+            return _bad("ssh_options must be an object")
+        ssh_options, dropped = _filter_ssh_options(raw_opts or {})
+        # Reject vault-side identityfile (read-oracle via ssh parse timing).
+        for k in list(ssh_options.keys()):
+            if isinstance(k, str) and k.lower() in _VAULT_DENY_SSH_OPTIONS:
+                dropped.append(k)
+                del ssh_options[k]
+        if dropped:
+            _log("WARN", "save dropped ssh_options keys: {}".format(dropped))
+
+        rec = {"host": host, "port": port, "username": username,
+               "iv": iv_b64, "ct": ct_b64}
+        if ssh_options:
+            rec["ssh_options"] = ssh_options
+
+        with _creds_lock:
+            # RMW must be atomic — without the outer lock, a concurrent save
+            # to a different (vault_id, conn_id) slot could read the same
+            # pre-state and clobber our update on its own save.
+            data = _load_creds()
+            new_vaults = dict(data.get("vaults", {}))
+            slot = dict(new_vaults.get(vault_id, {}))
+            slot[conn_id] = rec
+            new_vaults[vault_id] = slot
+            new_data = {"version": _CREDS_SCHEMA_VERSION, "vaults": new_vaults}
+            _save_creds_atomic(new_data)
+
+        _access_log_emit("save", self._client_ip(),
+                         result="ok", vault_id=vault_id, conn_id=conn_id,
+                         iv_len=len(iv), ct_len=len(ct))
+        self._json({})
+
+    def _delete_credential(self):
+        ip = self._client_ip()
+        if not _check_rate_limit(ip):
+            _access_log_emit("save_delete", ip, result="rate_limited")
+            self._json({"error": "too many requests"}, 429)
+            return
+        if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
+                and not _vault_disabled):
+            self._json({"error": "credential vault unavailable "
+                        "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                        "set / websh.creds.json schema unsupported — "
+                        "see server log)"}, 501)
+            return
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        vault_id = (params.get("vault_id", [""])[0] or "").strip()
+        conn_id  = (params.get("conn_id",  [""])[0] or "").strip()
+        if not _VAULT_ID_RE.match(vault_id) or not _CONN_ID_RE.match(conn_id):
+            self._json({"error": "vault_input_invalid",
+                        "detail": "invalid vault_id or conn_id"}, 400)
+            return
+        with _creds_lock:
+            data = _load_creds()
+            slot = dict(data.get("vaults", {}).get(vault_id, {}))
+            if conn_id not in slot:
+                self._json({"error": "not found"}, 404)
+                return
+            slot.pop(conn_id)
+            new_vaults = dict(data.get("vaults", {}))
+            if slot:
+                new_vaults[vault_id] = slot
+            else:
+                # Reap empty vault entry so iteration stays cheap.
+                new_vaults.pop(vault_id, None)
+            new_data = {"version": _CREDS_SCHEMA_VERSION,
+                        "vaults": new_vaults}
+            _save_creds_atomic(new_data)
+        _access_log_emit("save_delete", self._client_ip(),
+                         result="ok", vault_id=vault_id, conn_id=conn_id)
+        # 204 No Content
+        self.send_response(204)
+        self.end_headers()
 
     # ── Connect ─────────────────────────────────────────────────────
 
@@ -2312,10 +2679,108 @@ class Handler(BaseHTTPRequestHandler):
             return
         tmux_options = _validate_tmux_options(body) if persistent else []
 
-        # Resolve credentials: by config connection name, or from request body
+        # Resolve credentials: saved vault card, named connection, or manual body.
         conn_name = body.get("connection", "").strip()
+        sv_vault = (body.get("vault_id") or "").strip()
+        sv_conn  = (body.get("conn_id")  or "").strip()
+        sv_vkey  = body.get("vault_key") or ""
+        is_saved = bool(sv_vault or sv_conn or sv_vkey)
         ssh_options = {}
-        if conn_name:
+        if is_saved:
+            # ── Saved-variant: resolve host/username/password from vault ──
+            if not (HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE
+                    and not _vault_disabled):
+                self._json({"error": "credential vault unavailable "
+                            "(cryptography missing / WEBSH_VAULT_ENABLE not "
+                            "set / websh.creds.json schema unsupported — "
+                            "see server log)"}, 501)
+                return
+            if not _VAULT_ID_RE.match(sv_vault) or not _CONN_ID_RE.match(sv_conn):
+                self._json({"error": "vault_input_invalid",
+                            "detail": "invalid vault_id or conn_id"}, 400)
+                return
+            try:
+                vault_key_bytes = base64.b64decode(sv_vkey, validate=True)
+            except (binascii.Error, ValueError):
+                self._json({"error": "vault_input_invalid",
+                            "detail": "vault_key must be base64"}, 400)
+                return
+            if len(vault_key_bytes) != 32:
+                self._json({"error": "vault_input_invalid",
+                            "detail": "vault_key must be 32 bytes"}, 400)
+                return
+            data = _load_creds()
+            rec = data.get("vaults", {}).get(sv_vault, {}).get(sv_conn)
+            if rec is None:
+                _access_log_emit("connect", ip, result="cred_not_found",
+                                 vault_id=sv_vault, conn_id=sv_conn)
+                self._json({"error": "saved entry not found"}, 404)
+                return
+            try:
+                plaintext = _decrypt_credential(
+                    vault_key_bytes, rec.get("iv", ""), rec.get("ct", ""),
+                    sv_vault, sv_conn)
+            except InvalidTag:
+                _access_log_emit("connect", ip,
+                                 result="cred_decrypt_failed",
+                                 vault_id=sv_vault, conn_id=sv_conn)
+                # 400 not 401 — avoid upstream auth re-prompt loops.
+                self._json({"error": "vault_decrypt_failed"}, 400)
+                return
+            except (ValueError, RuntimeError) as e:
+                self._json({"error": "vault_input_invalid",
+                            "detail": str(e)}, 400)
+                return
+            try:
+                creds = json.loads(plaintext.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                self._json({"error": "vault_decrypt_failed",
+                            "detail": "blob plaintext is not JSON"}, 400)
+                return
+            if not isinstance(creds, dict):
+                # AAD-bound blob decrypted cleanly but plaintext isn't a
+                # JSON object — hand-edited file, or a vault payload from
+                # a future schema. Cannot extract password/key safely.
+                self._json({"error": "vault_decrypt_failed",
+                            "detail": "blob plaintext is not a JSON object"}, 400)
+                return
+            host = (rec.get("host") or "").strip()
+            port = clamp(rec.get("port"), MIN_PORT, MAX_PORT, 22)
+            username = (rec.get("username") or "").strip()
+            ssh_options = rec.get("ssh_options") or {}
+            if isinstance(ssh_options, dict):
+                # Drop vault-side identityfile entries even if a prior version
+                # stored them; the operator config (websh.json) is the trusted
+                # source for file-path options.
+                ssh_options = {k: v for k, v in ssh_options.items()
+                               if isinstance(k, str)
+                               and k.lower() not in _VAULT_DENY_SSH_OPTIONS}
+            else:
+                ssh_options = {}
+            password = creds.get("password") or ""
+            key = creds.get("key") or ""
+            if not isinstance(password, str) or not isinstance(key, str):
+                self._json({"error": "vault_decrypt_failed",
+                            "detail": "non-string credential field"}, 400)
+                return
+            # key_pass is in the plaintext for forward-compat but the
+            # current SSHSession ctor doesn't accept it — drop silently.
+            # Best-effort scrub of bytearrays. Python str copies in
+            # `password`/`key` linger until GC; hardened deploy recipe
+            # is what actually closes the read window.
+            try:
+                pa = bytearray(plaintext)
+                for i in range(len(pa)):
+                    pa[i] = 0
+            except TypeError:
+                pass
+            try:
+                ka = bytearray(vault_key_bytes)
+                for i in range(len(ka)):
+                    ka[i] = 0
+            except TypeError:
+                pass
+        elif conn_name:
             entry = find_config_connection(conn_name)
             if not entry:
                 self._json({"error": "connection not found"}, 404)
@@ -3358,6 +3823,12 @@ def main():
         __version__, HOST, PORT))
     if ACCESS_LOG_PATH:
         _log("INFO", "access log: {}".format(ACCESS_LOG_PATH))
+    if not HAS_CRYPTOGRAPHY:
+        _log("INFO", "credential vault: disabled (install cryptography to enable)")
+    elif not WEBSH_VAULT_ENABLE:
+        _log("INFO", "credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)")
+    else:
+        _log("INFO", "credential vault: enabled")
     server.serve_forever()
 
 
