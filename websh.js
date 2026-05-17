@@ -188,6 +188,7 @@ function createPane(container) {
     `</div>` +
     `<div class="reconnect-bar h" data-reconnect="${id}">` +
       `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
+      `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
       `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
     `</div>` +
     `<div class="pane-term"></div>`;
@@ -529,6 +530,10 @@ function closePane(id) {
 function _destroyPane(id, terminate) {
   let p = panes[id];
   if (!p) return;
+  // Drop any sessionStorage secrets first — the pane is going away,
+  // and so should its plaintext SSH credentials. Vault panes have no
+  // entry here; the call is a no-op for them.
+  _deletePaneSecret(id);
   // Cancel active transfers
   if (p.upload) { p.upload.cancelled = true; closeUploadSession(p.upload); }
   if (p.download) { p.download.cancelled = true; if (p.download.abort) p.download.abort(); }
@@ -609,18 +614,89 @@ function stopKeepalive(p) {
   if(p.keepaliveTimer){ clearInterval(p.keepaliveTimer); p.keepaliveTimer=null }
 }
 
+// ── Pane secret storage (sessionStorage, manual/named panes) ────────
+// localStorage[websh_panes] persists layout + non-secret pane metadata
+// across browser restarts. SSH plaintext (passwords, key PEMs, key
+// passphrases) for manual or prompt-kind connections lives in
+// sessionStorage instead — it survives F5 within a tab but doesn't
+// land in long-term profile storage (browser-history sync, FDE
+// snapshots) and is gone after a tab close. See docs/encryption.md
+// for the precise property ("never in long-term profile storage; brief
+// crash-recovery shadow during a live session"). Vault-backed panes
+// don't use this map; their credentials live on the server.
+const SS_PANE_SECRETS_KEY = 'websh_panes_session';
+function _loadPaneSecrets() {
+  try { return JSON.parse(sessionStorage.getItem(storageKey(SS_PANE_SECRETS_KEY)) || '{}'); }
+  catch (e) { return {}; }
+}
+function _savePaneSecrets(map) {
+  try { sessionStorage.setItem(storageKey(SS_PANE_SECRETS_KEY), JSON.stringify(map)); }
+  catch (e) {}
+}
+function _setPaneSecret(uuid, secrets) {
+  // No-op if nothing to store — avoid creating empty rows that later
+  // F5 would re-read as "secrets exist but are empty."
+  if (!secrets || (!secrets.password && !secrets.key && !secrets.key_pass)) {
+    return _deletePaneSecret(uuid);
+  }
+  let m = _loadPaneSecrets();
+  m[uuid] = secrets;
+  _savePaneSecrets(m);
+}
+function _getPaneSecret(uuid) { return _loadPaneSecrets()[uuid] || null; }
+function _deletePaneSecret(uuid) {
+  let m = _loadPaneSecrets();
+  if (!(uuid in m)) return;
+  delete m[uuid];
+  _savePaneSecrets(m);
+}
+
 // ── Reconnect ────────────────────────────────────────────────────────
+// For manual / named panes whose in-memory password was lost (fresh-tab
+// F5 with empty sessionStorage, or _maybeAutoDropLegacy on the source
+// saved card before they cliked reconnect), we expose an inline password
+// input on the bar so the user can recover in place without opening the
+// full connect form. Vault-backed panes follow the "no_vault_key" path
+// instead (their fix is sign-in, not a typed password). Key-auth panes
+// fall back to "Reconnect" only (a multi-line key blob doesn't fit a bar
+// input; user opens a new pane to re-enter the key).
+function _needsReconnectPwInput(p, reason) {
+  if (!p || reason === 'no_vault_key') return false;
+  if (p.conn_id) return false;             // vault-backed: different recovery
+  if (p.auth === 'key') return false;      // key auth: bar input too narrow
+  if (p.password || p.key) return false;   // creds already in memory
+  return !!(p.host || p.connection);
+}
 function showReconnectBar(p, reason) {
   let bar = p.el.querySelector('[data-reconnect]');
   if (!bar) return;
   let msg = bar.querySelector('span');
+  let pwInput = bar.querySelector('input[type=password]');
+  let showInput = _needsReconnectPwInput(p, reason);
   if (msg) {
     if (reason === 'auth_failed') {
-      msg.textContent = 'Authentication failed';
+      msg.textContent = showInput ? 'Authentication failed — type password' : 'Authentication failed';
       msg.style.color = 'var(--dg)';
+    } else if (reason === 'no_vault_key') {
+      // Distinct from auth-fail (creds rejected): the encryption key
+      // that wraps this pane's saved creds is missing in this browser.
+      // Clicking "Reconnect" loops back into connectPane which will
+      // hit the same guard and re-show this bar — that's intentional;
+      // the user needs to sign in again on this browser to recover.
+      msg.textContent = 'Vault key missing — sign in again to recover';
+      msg.style.color = 'var(--wn)';
     } else {
-      msg.textContent = 'Disconnected';
+      msg.textContent = showInput ? 'Disconnected — type password to reconnect' : 'Disconnected';
       msg.style.color = 'var(--dim)';
+    }
+  }
+  if (pwInput) {
+    pwInput.classList.toggle('h', !showInput);
+    if (showInput) {
+      pwInput.value = '';
+      // Auto-focus when the bar is revealing the input for the first
+      // time so the user can start typing immediately.
+      setTimeout(() => { try { pwInput.focus(); } catch(e){} }, 0);
     }
   }
   bar.classList.remove('h');
@@ -631,6 +707,18 @@ function hideReconnectBar(p) {
 }
 function reconnectPane(id) {
   let p = panes[id]; if (!p || (!p.host && !p.connection)) return;
+  let bar = p.el.querySelector('[data-reconnect]');
+  let pwInput = bar && bar.querySelector('input[type=password]');
+  // Inline password recovery: if the input is showing and the user
+  // typed something, feed it into connectPane as opts.password.
+  // Empty input → focus and wait for them to type.
+  if (pwInput && !pwInput.classList.contains('h')) {
+    let typed = pwInput.value || '';
+    if (!typed) { try { pwInput.focus(); } catch(e){} return; }
+    hideReconnectBar(p);
+    connectPane(p, {label: p.label, resume: p.persistent, password: typed});
+    return;
+  }
   hideReconnectBar(p);
   connectPane(p, {label: p.label, resume: p.persistent});
 }
@@ -650,29 +738,72 @@ function slotIdFor(user, host, port) {
 }
 
 function paneRecord(p) {
-  // Flat, self-contained record persisted per open pane. Has everything
-  // needed to rebuild the wire request — no lookups at restore time.
-  if (!p.host && !p.connection) return null;
-  return {
+  // Disk-safe per-pane record persisted into localStorage. Vault panes
+  // store conn_id + display-hint metadata, no key bytes — F5 restore
+  // re-derives vault_key from IDB. Manual and named panes still inline
+  // plaintext for backward compatibility (manual moves to
+  // sessionStorage in the next task).
+  if (!p.host && !p.connection && !p.conn_id) return null;
+  let rec = {
     label:      p.label || '',
-    host:       p.host || '',
-    port:       p.port || 22,
-    user:       p.user || '',
-    connection: p.connection || null,
-    auth:       p.auth || (p.key ? 'key' : 'pw'),
-    password:   p.password || '',
-    key:        p.key || '',
-    key_pass:   p.keyPass || '',
     persistent: !!p.persistent,
     slot_id:    p.slotId || null,
     tmux_cmd:   p.tmuxCmd || 'tmux',
     cols:       p.term.cols,
-    rows:       p.term.rows
+    rows:       p.term.rows,
   };
+  if (p.conn_id) {
+    rec.via = 'vault';
+    rec.conn_id = p.conn_id;
+    // host/port/user persisted as UX hints (badge text + slot id);
+    // server fetches the real values from the stored vault record.
+    rec.host = p.host || '';
+    rec.port = p.port || 22;
+    rec.user = p.user || '';
+  } else if (p.connection) {
+    rec.via = 'named';
+    rec.connection = p.connection;
+    rec.user = p.user || '';
+    rec.auth = p.auth || (p.key ? 'key' : 'pw');
+    // Plaintext lives in sessionStorage (_setPaneSecret on materialise,
+    // _getPaneSecret on restore). Only prompt-kind named connections
+    // need a password client-side anyway; ready-kind connections rely
+    // on websh.json server-side.
+  } else {
+    rec.via = 'manual';
+    rec.host = p.host;
+    rec.port = p.port;
+    rec.user = p.user;
+    rec.auth = p.auth || (p.key ? 'key' : 'pw');
+    // Plaintext moved to sessionStorage — see _setPaneSecret().
+  }
+  return rec;
 }
 
 function buildConnectBody(rec, termCols, termRows) {
   // Translate a pane record into the shape server.py /api/connect wants.
+  // Saved-variant: ship the vault tuple; server pulls host/username
+  // from the stored record, decrypts the blob with vault_key, and
+  // proceeds with ssh. Cols/rows/persistent/slot_id/tmux options still
+  // flow through (server-side they apply identically to manual mode).
+  if (rec.vault_id && rec.conn_id && rec.vault_key) {
+    let b = {
+      vault_id: rec.vault_id,
+      conn_id:  rec.conn_id,
+      vault_key: rec.vault_key,
+      cols: termCols || rec.cols || 80,
+      rows: termRows || rec.rows || 24,
+    };
+    if (rec.persistent) {
+      b.persistent = true;
+      b.slot_id = rec.slot_id || slotIdFor(rec.user, rec.host, rec.port);
+      b.tmux_set_clipboard = !!settings.tmuxClipboard;
+      let hl = parseInt(settings.tmuxHistory, 10);
+      if (Number.isFinite(hl) && hl >= 100) b.tmux_history_limit = hl;
+    }
+    if (rec.tmux_cmd && rec.tmux_cmd !== 'tmux') b.tmux_cmd = rec.tmux_cmd;
+    return b;
+  }
   let b = {
     username: rec.user,
     cols: termCols || rec.cols || 80,
@@ -846,20 +977,174 @@ function saveTextAs(filename, text) {
   URL.revokeObjectURL(a.href);
 }
 
+// Carry the non-enumerable __ephemeralSecrets bag across an Object.
+// assign hop. Plaintext secrets travel with a pending-save entry from
+// doConnect → finalizeSuccess → commitPendingSave; we hold them
+// non-enumerable so a future JSON.stringify on the entry (crash dump,
+// debug log, paneRecord-style serializer) can't spill them to disk.
+// Object.assign drops non-enumerable props, so each hop must re-attach.
+// (Finding 2a in the PR-67 review.)
+function _carryEphemeralSecrets(src, dst) {
+  if (!src || !src.__ephemeralSecrets) return;
+  Object.defineProperty(dst, '__ephemeralSecrets', {
+    value: src.__ephemeralSecrets,
+    enumerable: false, configurable: true, writable: true,
+  });
+}
+
 function commitPendingSave(p) {
   if (!p.pendingSave) return;
   let entry = Object.assign({}, p.pendingSave);
+  _carryEphemeralSecrets(p.pendingSave, entry);
   // Overwrite persistent with the actual live mode (handles tmux-skip
   // and any other downgrade paths). Also capture a discovered tmux_cmd.
   entry.persistent = !!p.persistent;
   if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
+  p.pendingSave = null;
+  if ($('iSave').checked) { $('iSave').checked = false; toggleSaveName(); }
+  if (entry.__ephemeralSecrets) {
+    // Vault path: mint conn_id, encrypt secrets, POST to /api/save; on
+    // success the entry (without __ephemeralSecrets) is added to the
+    // saved-card list. Failure surfaces as a toast and does not touch
+    // the list — the live session keeps running either way.
+    commitVaultSave(entry).then(() => {
+      // Best-effort UX hook for future Safari ITP / persist() prompt.
+      if (typeof _onFirstVaultSave === 'function' && _vaultFirstSave) {
+        _vaultFirstSave = false;
+        try { _onFirstVaultSave(); } catch(e){}
+      }
+    }).catch(err => {
+      console.warn('vault save failed:', err);
+      showToast('Could not save credentials to the server. The session ' +
+                'is still open; try Save again later.', 'warn');
+    });
+    return;
+  }
+  // No-vault fallback path. Currently unreachable because doConnect now
+  // only assembles a saveEntry when serverConfig.vault_enabled is true;
+  // kept defensive for any future caller that hand-builds pendingSave.
   let list = loadSaved();
   list = list.filter(c => c.name !== entry.name);
   list.unshift(entry);
   saveSaved(list);
-  p.pendingSave = null;
-  if ($('iSave').checked) { $('iSave').checked = false; toggleSaveName(); }
   renderSaved();
+}
+
+async function commitVaultSave(entry) {
+  // A sign-out (local or from a sibling tab) between this save being
+  // initiated in doConnect and now means we should NOT proceed: the
+  // user wiped their vault, and silently letting encryptCredentials
+  // mint a fresh K + vault_id would resurrect a "row written back into
+  // a wiped local list" scenario gorevds raised. The flag is set in
+  // the BroadcastChannel handler + confirmSignOut, and cleared in
+  // doConnect when the user explicitly initiates a save (which
+  // supersedes any past sign-out intent). We can't use a bare IDB
+  // probe here because the first-ever save legitimately has empty
+  // IDB. (Findings 1 + 4 in the PR-67 review.)
+  if (_vaultRecentlySignedOut) {
+    // Best-effort scrub before the entry falls out of scope. Symmetric
+    // to the post-encrypt + post-POST scrub paths below.
+    let s = entry && entry.__ephemeralSecrets;
+    if (s) { try { s.password = null; s.key = null; s.key_pass = null; } catch (e) {} }
+    showToast('Sign-out happened during save — credentials were NOT saved. ' +
+              'Re-enter to save again.', 'warn');
+    return;
+  }
+  let conn_id = generateConnId();
+  let secrets = entry.__ephemeralSecrets || {};
+  // __ephemeralSecrets is non-enumerable; defineProperty over the same
+  // key clears it. Plain `delete` is also fine, used here for symmetry
+  // with the previous shape.
+  try { delete entry.__ephemeralSecrets; } catch (e) {}
+  let {iv, ct, vault_id} = await encryptCredentials(secrets, conn_id);
+  // Post-encrypt re-check: subtle.encrypt yielded the event loop, and a
+  // sibling tab's BroadcastChannel signed_out handler may have wiped
+  // IDB + invalidateVaultCache() during that gap. Bypass the in-memory
+  // cache by reading IDB directly. If vault_id is gone or has been
+  // replaced, the ciphertext we just built is bound to a namespace the
+  // server can't decrypt — do NOT POST a server-side orphan blob the
+  // server has no way to GC. (Finding 1 in the PR-67 review.)
+  let idbVaultIdAfter = null;
+  try { idbVaultIdAfter = await _idbGet(IDB_VAULT_ID_KEY); } catch (e) {}
+  // Belt-and-braces: also re-check the sign-out flag. The
+  // BroadcastChannel handler sets it synchronously, but in theory the
+  // wipe + new mint could have completed during the encrypt yield and
+  // left IDB matching our `vault_id`. The flag closes that window.
+  if (idbVaultIdAfter !== vault_id || _vaultRecentlySignedOut) {
+    invalidateVaultCache();
+    // Best-effort scrub of the local plaintext copy — strings are
+    // immutable in JS so this only nulls references, but at least the
+    // closure no longer pins them. (Finding 2c in the PR-67 review.)
+    try { secrets.password = null; secrets.key = null; secrets.key_pass = null; } catch (e) {}
+    showToast('Sign-out happened during save — credentials were NOT saved. ' +
+              'Re-enter to save again.', 'warn');
+    return;
+  }
+  let body = {
+    vault_id, conn_id,
+    host: entry.host, port: entry.port, username: entry.user,
+    iv, ct,
+    // ssh_options is part of the /api/save wire contract (server filters
+    // through _filter_ssh_options and persists what survives). The
+    // browser has no UI for arbitrary SSH options yet, so we send an
+    // empty object — it keeps the server-side filter exercised and
+    // lets a future client surface per-entry options without a wire
+    // version bump. (Finding 7 in the PR-67 review.)
+    ssh_options: {},
+  };
+  let resp;
+  try {
+    resp = await api('save', {body: body});
+  } finally {
+    // Whether the POST succeeded, failed, or rejected, drop the local
+    // plaintext copy from the closure so it doesn't outlive the call.
+    try { secrets.password = null; secrets.key = null; secrets.key_pass = null; } catch (e) {}
+  }
+  if (resp && resp.error) {
+    throw new Error('save: ' + resp.error);
+  }
+  // Post-POST re-check: the api('save') round-trip yielded the event
+  // loop a second time, and a sibling tab's signed_out broadcast may
+  // have wiped IDB during that gap. Without this, list.unshift(entry)
+  // below would zombify the entry into the locally-cleared list —
+  // bound to a vault_id the server no longer recognises (the BC
+  // handler in this tab already cleared its own /api/save_delete loop
+  // copy of the entry, but the row we just POSTed was minted after
+  // that loop ran so a server-side orphan blob is unavoidable here;
+  // the local list is the one we can keep coherent). Symmetric to the
+  // pre-encrypt + post-encrypt windows that already guard this.
+  // (Original review item F4.)
+  let idbVaultIdAfterPOST = null;
+  try { idbVaultIdAfterPOST = await _idbGet(IDB_VAULT_ID_KEY); } catch (e) {}
+  if (idbVaultIdAfterPOST !== vault_id || _vaultRecentlySignedOut) {
+    invalidateVaultCache();
+    // No secret scrubbing needed: the finally above already nulled
+    // the closure refs, and entry.__ephemeralSecrets was deleted
+    // before the encrypt call. The BC sign-out handler surfaces its
+    // own toast, so we stay silent here to avoid double-noise.
+    return;
+  }
+  entry.conn_id = conn_id;
+  // De-dup by conn_id (and by name, for the pre-vault upgrade path
+  // where an old plaintext row with the same label is still around).
+  // Same-name re-save ("I'm updating the password") drops the previous
+  // row from localStorage; its server-side blob would linger under the
+  // old conn_id. Capture those old conn_ids first and fire-and-forget
+  // a server-side reap so they don't accumulate in websh.creds.json.
+  let allRows = loadSaved();
+  let droppedConns = allRows
+    .filter(c => c.name === entry.name && c.conn_id && c.conn_id !== conn_id)
+    .map(c => c.conn_id);
+  let list = allRows.filter(c => c.conn_id !== conn_id && c.name !== entry.name);
+  list.unshift(entry);
+  saveSaved(list);
+  renderSaved();
+  // Fire-and-forget: the new entry is already locally committed; a
+  // transient server hiccup on cleanup shouldn't block the save flow.
+  // _bulkDeleteVaultEntry resolves vault_id from IDB and IfPresent-guards
+  // the network call (no fresh vault_id minted in a sign-out state).
+  droppedConns.forEach(cid =>
+    _bulkDeleteVaultEntry({conn_id: cid}).catch(() => {}));
 }
 
 // ── Output transport ────────────────────────────────────────────────
@@ -943,7 +1228,27 @@ document.addEventListener('visibilitychange', () => {
 // is unreliable on this path; pageshow with event.persisted=true is
 // the canonical signal per the WICG Page Lifecycle spec.
 window.addEventListener('pageshow', (e) => {
-  if (e.persisted) kickPanesAfterAbsence();
+  if (e.persisted) {
+    kickPanesAfterAbsence();
+    // Our pagehide handler closes _vaultBroadcast so a frozen bfcache
+    // tab doesn't get spurious replays. Re-open on restore — otherwise
+    // a sign-out in another tab while this one was bfcache'd would
+    // never reach us. _initVaultBroadcast is idempotent (guards on
+    // existing channel) so calling it on every persisted pageshow is
+    // safe and covers cold loads where it's already a no-op.
+    _initVaultBroadcast();
+    // bfcache also froze the in-memory vault caches: a sibling tab
+    // could have signed out while we were bfcache'd, wiping IDB. The
+    // BC re-init above won't replay that past event (closed channel ⇒
+    // no queue), so we'd render saved cards as connectable until the
+    // next IDB touch even though K is gone. Mirror the other "IDB
+    // may have changed underneath us" call sites: drop in-memory
+    // caches first, then re-read presence from IDB, then re-paint.
+    invalidateVaultCache();
+    _refreshIdbHasKey().then(() => {
+      try { renderSaved(); } catch (err) {}
+    }, () => {});
+  }
 });
 
 // Apply one decoded JSON payload from either transport. Returns true if
@@ -1196,9 +1501,12 @@ function queueInput(p, data) {
 
 // ── Unified connect ─────────────────────────────────────────────────
 // opts = { label, host, port, user, connection, auth, password, key, keyPass,
-//          persistent, slotId?, resume? }
+//          conn_id?, persistent, slotId?, resume? }
 // `resume` flag triggers attach-by-slot_id on the backend.
-function connectPane(p, opts) {
+// Vault-backed panes (opts.conn_id or p.conn_id set) re-derive vault_key
+// from IDB at every connect — caching it on the pane would let a
+// sign-out in another tab leave a stale key in memory.
+async function connectPane(p, opts) {
   p.label = opts.label || '';
   if (opts.host !== undefined) p.host = opts.host || '';
   if (opts.port !== undefined) p.port = opts.port || 22;
@@ -1208,6 +1516,7 @@ function connectPane(p, opts) {
   if (opts.password !== undefined) p.password = opts.password || '';
   if (opts.key !== undefined) p.key = opts.key || '';
   if (opts.keyPass !== undefined) p.keyPass = opts.keyPass || '';
+  if (opts.conn_id !== undefined) p.conn_id = opts.conn_id || null;
   if (opts.persistent !== undefined) p.persistent = !!opts.persistent;
   if (opts.slotId) p.slotId = opts.slotId;
   else if (p.persistent && !p.slotId) p.slotId = slotIdFor(p.user, p.host, p.port);
@@ -1222,13 +1531,67 @@ function connectPane(p, opts) {
   setTitle(p.label);
   updatePaneBadge(p);
 
-  let body = buildConnectBody(paneRecord(p), p.term.cols, p.term.rows);
+  let rec = paneRecord(p);
+  if (rec && rec.via === 'vault') {
+    // Use the non-minting variants. If IDB has been wiped between save
+    // and now (Safari ITP eviction, user cleared site data, sign-out
+    // in another tab), we must NOT silently mint a fresh K — that
+    // mints garbage that can't decrypt the server-side blob AND
+    // defeats the .nokey cleanup UX in renderSaved. Surface the
+    // condition and bail with the reconnect bar showing "no_vault_key".
+    let vault_id_b32 = null;
+    let key = null;
+    try {
+      vault_id_b32 = await ensureVaultIdIfPresent();
+      key = await ensureVaultKeyIfPresent();
+    } catch (e) { /* IDB broken — treat as missing */ }
+    if (!vault_id_b32 || !key) {
+      p.connecting = false;
+      showReconnectBar(p, 'no_vault_key');
+      showToast('Saved pane "' + (p.label || (p.user + '@' + p.host)) +
+                '" cannot reconnect — vault key missing in this browser. ' +
+                'Use the saved-card list to clean up.', 'warn');
+      updatePaneBadge(p);
+      return;
+    }
+    rec.vault_id = vault_id_b32;
+    // key already in cache; pass it through so exportRawVaultKey doesn't
+    // re-read IDB (which a wipe between our IfPresent guard and now
+    // would otherwise let it mint from). exportKey can still throw on
+    // corrupt CryptoKey / OOM — route to the no-key reconnect bar
+    // instead of leaving the pane in connecting=false with an
+    // unhandled rejection. (Finding 3 in the PR-67 review.)
+    try {
+      rec.vault_key = await exportRawVaultKey(key);
+    } catch (e) {
+      p.connecting = false;
+      showReconnectBar(p, 'no_vault_key');
+      showToast('Could not export the vault key for "' +
+                (p.label || (p.user + '@' + p.host)) +
+                '". Try signing out and re-saving.', 'err');
+      updatePaneBadge(p);
+      return;
+    }
+  } else if (rec) {
+    // Manual / named: paneRecord intentionally strips plaintext from the
+    // disk shape (kept in sessionStorage, see _setPaneSecret). Pass the
+    // live in-memory credentials through to the body builder.
+    rec.password = p.password || '';
+    rec.key = p.key || '';
+    rec.key_pass = p.keyPass || '';
+  }
+  let body = buildConnectBody(rec, p.term.cols, p.term.rows);
   if (opts.resume && p.slotId) body.resume_slot_id = p.slotId;
 
-  console.log('connectPane: host=' + body.host + ' user=' + body.username +
-              ' persistent=' + !!body.persistent +
-              ' pw len=' + ((body.password || '').length) +
-              ' key len=' + ((body.key || '').length));
+  if (body.vault_id) {
+    console.log('connectPane: vault conn_id=' + body.conn_id +
+                ' persistent=' + !!body.persistent);
+  } else {
+    console.log('connectPane: host=' + body.host + ' user=' + body.username +
+                ' persistent=' + !!body.persistent +
+                ' pw len=' + ((body.password || '').length) +
+                ' key len=' + ((body.key || '').length));
+  }
 
   api('connect', {body: body})
     .then(r => {
@@ -1450,7 +1813,10 @@ function runConnect(opts) {
 
 function realConnect(opts, run) {
   // Build connect body from opts (no pane yet, so cols/rows default to
-  // 80x24 and we /api/resize once the pane is materialised).
+  // 80x24 and we /api/resize once the pane is materialised). When the
+  // saved-variant fields are present, the body builder ships them
+  // instead of host/password/etc — the server resolves the real
+  // credentials from the vault.
   let rec = {
     label: opts.label || '',
     host: opts.host || '',
@@ -1461,6 +1827,9 @@ function realConnect(opts, run) {
     password: opts.password || '',
     key: opts.key || '',
     key_pass: opts.keyPass || '',
+    vault_id: opts.vault_id || null,
+    conn_id:  opts.conn_id  || null,
+    vault_key: opts.vault_key || null,
     persistent: !!opts.persistent,
     slot_id: opts.slotId || (opts.persistent
       ? slotIdFor(opts.user, opts.host, opts.port) : null),
@@ -1482,6 +1851,26 @@ function realConnect(opts, run) {
       }
       if (/too many (connection attempts|active sessions|background sessions)/i.test(r.error)) {
         throw { kind: 'rate_limited', msg: r.error };
+      }
+      // Saved-variant /api/connect surfaces vault-specific errors:
+      //   404 + "saved entry not found"
+      //   400 + {error: "vault_decrypt_failed"}
+      //   501 + "credential vault unavailable…"
+      // Status code is opaque to api() (always parses JSON), so we
+      // pattern-match the strings.
+      if (/saved entry not found/i.test(r.error)) {
+        throw { kind: 'vault_not_found', msg: r.error };
+      }
+      if (r.error === 'vault_decrypt_failed') {
+        // Intentionally do NOT call invalidateVaultCache / clear K here.
+        // The failing blob is ONE entry; K may still decrypt every other
+        // saved card in this vault. Wiping K on a single decrypt-fail
+        // would brick the rest of the user's vault. The .nokey UX is
+        // reached through a different signal (IDB itself missing K).
+        throw { kind: 'vault_decrypt', msg: r.error };
+      }
+      if (/credential vault unavailable/i.test(r.error)) {
+        throw { kind: 'vault_off', msg: r.error };
       }
       throw { kind: 'error', msg: r.error };
     }
@@ -1506,9 +1895,23 @@ function finalizeSuccess(opts, result, run) {
   p.user = opts.user || '';
   p.connection = opts.connection || null;
   p.auth = opts.auth || (opts.key ? 'key' : 'pw');
+  // Plaintext SSH credentials live on the pane only for manual /
+  // prompt-named modes. We mirror them into sessionStorage so F5 within
+  // the tab can restore without re-prompting; vault-backed panes carry
+  // conn_id instead (their secrets live server-side).
   p.password = opts.password || '';
   p.key = opts.key || '';
   p.keyPass = opts.keyPass || '';
+  p.conn_id = opts.conn_id || null;
+  if (!p.conn_id) {
+    _setPaneSecret(p.id, {
+      password: p.password,
+      key: p.key,
+      key_pass: p.keyPass,
+    });
+  } else {
+    _deletePaneSecret(p.id);
+  }
   p.persistent = !!opts.persistent;
   p.slotId = result.slot_id || opts.slotId || null;
   p.tmuxCmd = result.tmux_cmd || opts.tmuxCmd || 'tmux';
@@ -1517,9 +1920,11 @@ function finalizeSuccess(opts, result, run) {
   p.recentOutput = '';
   p.connecting = false;
   // Deferred save: commitPendingSave writes it to localStorage once the
-  // session has proven healthy for ≥2.5s with no auth failure.
+  // session has proven healthy for ≥2.5s with no auth failure. The
+  // non-enumerable __ephemeralSecrets bag rides along (Finding 2a).
   if (opts.saveEntry) {
     let entry = Object.assign({}, opts.saveEntry);
+    _carryEphemeralSecrets(opts.saveEntry, entry);
     entry.persistent = !!p.persistent;
     if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
     p.pendingSave = entry;
@@ -1618,6 +2023,23 @@ function showConnectStatus(kind, ctx) {
     sub.textContent = 'Please wait and try again shortly.';
     if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
     btn.textContent = 'OK';
+  } else if (kind === 'vault_not_found') {
+    title.textContent = 'Saved entry missing on server';
+    sub.textContent = 'This card was deleted or the server vault was cleared.';
+    status.textContent = 'Delete this card from the saved list, then re-enter to re-save.';
+    status.className = 'tm-status err';
+    btn.textContent = 'OK';
+  } else if (kind === 'vault_decrypt') {
+    title.textContent = 'Cannot decrypt this card';
+    sub.textContent = 'The vault key in this browser does not match the stored blob.';
+    status.textContent = 'Re-enter the credentials to re-save this connection.';
+    status.className = 'tm-status err';
+    btn.textContent = 'OK';
+  } else if (kind === 'vault_off') {
+    title.textContent = 'Vault is disabled on the server';
+    sub.textContent = 'The server is not accepting saved credentials right now.';
+    if (ctx.msg) { status.textContent = ctx.msg; status.className = 'tm-status err'; }
+    btn.textContent = 'OK';
   } else {
     title.textContent = 'Connection error';
     sub.textContent = 'Could not connect to ' + host + '.';
@@ -1667,13 +2089,54 @@ function showOverlay(){
 function hideOverlay(){
   $('ov').classList.add('h');
   // Scrub credentials from the DOM once the overlay is closed so the
-  // browser has nothing to offer to save/sync.
+  // browser has nothing to offer to save/sync and so a later devtools
+  // paste / extension content-script can't read `$('iPw').value` etc.
+  // Also clear iName: not a secret, but a residual connection label
+  // is leaky and the next connect will re-populate it. (Finding 2b.)
   $('iPw').value = '';
   $('iKey').value = '';
   $('iKeyPw').value = '';
+  $('iName').value = '';
 }
 function showErr(m){ let e=$('err'); e.textContent=m; e.classList.add('on') }
 function hideErr(){ $('err').classList.remove('on') }
+
+// Non-blocking notification. `kind` is one of '', 'warn', 'err'. Used by
+// background flows (e.g. /api/save failures) so the live terminal isn't
+// interrupted but the user still sees what happened. Dedups identical
+// messages (e.g. two overlapping save-failure retries from the same
+// pane would otherwise stack identical toasts). Click to dismiss.
+// Error toasts get a longer auto-dismiss and an assertive role so AT
+// users hear them — aria-live=polite on the host alone is fine for
+// info but wrong for actionable errors. (Finding 5a/b/d, PR-67 review.)
+function showToast(message, kind) {
+  let host = $('toastHost'); if (!host) return;
+  let key = (kind || '') + ':' + message;
+  for (let i = 0; i < host.children.length; i++) {
+    if (host.children[i].getAttribute('data-toast-key') === key) return;
+  }
+  let el = document.createElement('div');
+  el.className = 'toast' + (kind ? ' ' + kind : '');
+  el.setAttribute('data-toast-key', key);
+  el.textContent = message;
+  if (kind === 'err') el.setAttribute('role', 'alert');
+  el.title = 'Click to dismiss';
+  let dismissed = false;
+  let dismiss = () => {
+    if (dismissed) return;
+    dismissed = true;
+    el.classList.remove('on');
+    setTimeout(() => { try { el.remove(); } catch(e){} }, 250);
+  };
+  el.addEventListener('click', dismiss);
+  host.appendChild(el);
+  // Force layout, then add .on for the transition.
+  void el.offsetWidth;
+  el.classList.add('on');
+  // Error toasts are typically actionable; give the user longer to
+  // notice and click. Info/warn toasts stay at 5 s.
+  setTimeout(dismiss, kind === 'err' ? 10000 : 5000);
+}
 
 function focusFirst() {
   if($('manualForm').classList.contains('h')) return;
@@ -1692,41 +2155,674 @@ function setAuthTab(mode) {
   $('authKey').className=mode==='key'?'fg':'fg h';
 }
 
+// ── Vault primitives (IndexedDB + Web Crypto AES-GCM) ───────────────
+// K (AES-256-GCM CryptoKey, extractable=true) and vault_id (128-bit
+// base32) live in IndexedDB. extractable is required because the
+// /api/connect handshake ships the raw key bytes — the IDB layer is
+// not the confidentiality boundary; the absence of ciphertext blobs
+// from the client is what closes the threat. See docs/encryption.md.
+
+const IDB_NAME = 'websh_vault';
+const IDB_STORE = 'kv';
+const IDB_K_KEY = 'K';
+const IDB_VAULT_ID_KEY = 'vault_id';
+
+function _idbOpen() {
+  return new Promise((resolve, reject) => {
+    let req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+function _idbGet(key) {
+  return _idbOpen().then(db => new Promise((resolve, reject) => {
+    let tx = db.transaction(IDB_STORE, 'readonly');
+    let req = tx.objectStore(IDB_STORE).get(_idbScopedKey(key));
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function _idbPut(key, value) {
+  return _idbOpen().then(db => new Promise((resolve, reject) => {
+    let tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(value, _idbScopedKey(key));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+function _idbDelete(key) {
+  return _idbOpen().then(db => new Promise((resolve, reject) => {
+    let tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).delete(_idbScopedKey(key));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+// isolate_storage support: scope IDB keys by URL path the same way
+// storageKey() scopes localStorage. Two deployments on the same origin
+// at different paths thus get independent vault keys + vault_ids.
+function _idbScopedKey(name) {
+  return storagePrefix ? storagePrefix + name : name;
+}
+
+// 26-char Crockford-style base32 of 128 random bits. Matches the
+// server's _VAULT_ID_RE / _CONN_ID_RE: ^[A-Z2-7]{26}$.
+// Note: 128 bits / 5 = 25.6 chars, so the 26th char carries only the
+// remaining 3 bits (low 2 bits are zero per the RFC 4648 padding
+// convention we apply with `acc << (5 - accBits)`). Total entropy is
+// still 128 bits — the regex just keeps the alphabet uniform.
+const _B32_ALPHA = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+function _generateBase32Id() {
+  let bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  let s = '';
+  let acc = 0, accBits = 0;
+  for (let b of bytes) {
+    acc = (acc << 8) | b;
+    accBits += 8;
+    while (accBits >= 5) {
+      accBits -= 5;
+      s += _B32_ALPHA[(acc >> accBits) & 0x1f];
+    }
+  }
+  if (accBits > 0) s += _B32_ALPHA[(acc << (5 - accBits)) & 0x1f];
+  return s;  // 26 chars
+}
+
+let _vaultIdCache = null;
+let _vaultKeyCache = null;  // CryptoKey
+let _vaultFirstSave = false;  // set when ensureVaultId generates a new id
+
+async function ensureVaultId() {
+  if (_vaultIdCache) return _vaultIdCache;
+  let id = await _idbGet(IDB_VAULT_ID_KEY);
+  if (!id) {
+    id = _generateBase32Id();
+    await _idbPut(IDB_VAULT_ID_KEY, id);
+    _vaultFirstSave = true;
+  }
+  _vaultIdCache = id;
+  return id;
+}
+
+async function ensureVaultKey() {
+  if (_vaultKeyCache) return _vaultKeyCache;
+  let key = await _idbGet(IDB_K_KEY);
+  if (!key) {
+    // extractable=true: required so exportRawVaultKey can return the
+    // raw bytes for the saved-variant /api/connect handshake. The IDB
+    // layer is not the confidentiality boundary — see the block
+    // comment above (search "extractable is required") and
+    // docs/encryption.md "Threat model" for the full rationale.
+    key = await crypto.subtle.generateKey(
+      {name: 'AES-GCM', length: 256},
+      true,
+      ['encrypt', 'decrypt']);
+    await _idbPut(IDB_K_KEY, key);
+  }
+  _vaultKeyCache = key;
+  _idbHasKeyCache = true;  // K is present, sync-readable for renderSaved
+  return key;
+}
+
+// Non-minting variants of ensureVaultId / ensureVaultKey. Return the
+// IDB-resident value if it exists, null otherwise — NEVER mint.
+//
+// Why we need both: the mint-allowed variants are correct for the save
+// flow (commitVaultSave / _onFirstVaultSave), where "no vault yet" is
+// the precondition for creating one. They're wrong for every other
+// caller (connectPane on F5 restore, connectSaved click, bulk-delete,
+// decryptCredentials). After IDB is wiped — Safari ITP eviction, the
+// user cleared site data, sign-out in another tab — those code paths
+// must see "no key" and degrade, not silently mint a fresh K that has
+// nothing to do with the stored ciphertext. Silent minting after a
+// wipe defeats the no-key cleanup UX (the .nokey grayed state goes
+// away on the next render) and re-populates IDB right after a sibling
+// tab signed out (Finding 3 in the PR-67 review). See connectPane and
+// confirmSignOut for the consumers.
+async function ensureVaultIdIfPresent() {
+  if (_vaultIdCache) return _vaultIdCache;
+  let id = await _idbGet(IDB_VAULT_ID_KEY);
+  if (!id) return null;
+  _vaultIdCache = id;
+  return id;
+}
+
+async function ensureVaultKeyIfPresent() {
+  if (_vaultKeyCache) return _vaultKeyCache;
+  let key = await _idbGet(IDB_K_KEY);
+  if (!key) {
+    // Keep the sync-readable mirror honest. Without this, a caller
+    // that observes _idbHasKeyCache=true (stale from boot) would
+    // mistake "no key" for "key present" and render a non-grayed row.
+    _idbHasKeyCache = false;
+    return null;
+  }
+  _vaultKeyCache = key;
+  _idbHasKeyCache = true;
+  return key;
+}
+
+async function exportRawVaultKey(key) {
+  // Prefer the caller's already-resolved CryptoKey handle: a wipe
+  // between the caller's ensureVaultKeyIfPresent and this call would
+  // otherwise let ensureVaultKey's mint-if-absent fallback silently
+  // create a fresh K, and the body we ship to /api/connect would
+  // carry key bytes that don't match any server-side blob (Finding 3
+  // in the PR-67 review). For direct callers that don't hold a
+  // reference (tests, future code) we still mint on demand to keep
+  // the convenience contract.
+  if (!key) key = await ensureVaultKey();
+  let raw = await crypto.subtle.exportKey('raw', key);
+  return _bufToB64(raw);
+}
+
+function _bufToB64(buf) {
+  let bytes = new Uint8Array(buf);
+  let s = '';
+  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+  return btoa(s);
+}
+
+function _b64ToBytes(b64) {
+  let s = atob(b64);
+  let bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) bytes[i] = s.charCodeAt(i);
+  return bytes;
+}
+
+async function encryptCredentials(plaintext, conn_id) {
+  let vault_id = await ensureVaultId();
+  let key = await ensureVaultKey();
+  // GCM IV reuse under the same key is catastrophic; draw a fresh
+  // 12-byte IV on every encrypt. See docs/encryption.md.
+  let iv = crypto.getRandomValues(new Uint8Array(12));
+  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  let pt = new TextEncoder().encode(JSON.stringify(plaintext));
+  let ct = await crypto.subtle.encrypt(
+    {name: 'AES-GCM', iv, additionalData: aad}, key, pt);
+  return {iv: _bufToB64(iv), ct: _bufToB64(ct), vault_id};
+}
+
+async function decryptCredentials(iv_b64, ct_b64, conn_id) {
+  // Non-minting: silently minting a fresh vault_id / K here would just
+  // guarantee a decrypt failure with extra garbage left in IDB. Raise
+  // a clear error so the caller can surface a useful diagnostic
+  // (Finding 8 in the PR-67 review).
+  let vault_id = await ensureVaultIdIfPresent();
+  let key = await ensureVaultKeyIfPresent();
+  if (!vault_id || !key) throw new Error('no_vault_key');
+  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  let pt = await crypto.subtle.decrypt(
+    {name: 'AES-GCM', iv: _b64ToBytes(iv_b64), additionalData: aad},
+    key, _b64ToBytes(ct_b64));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+// Fresh conn_id for a new saved card. Same alphabet/length as
+// vault_id; the server validates with the same regex.
+function generateConnId() { return _generateBase32Id(); }
+
+// Heuristic Safari detection — useragent-based, intentionally
+// pessimistic about edge cases (Chrome on iOS reports as Safari and
+// gets the same IDB constraint, so the heuristic flags it too).
+function _isSafari() {
+  let ua = navigator.userAgent || '';
+  return /^((?!chrome|chromium|android).)*safari/i.test(ua);
+}
+
+// One-shot hook fired by commitPendingSave the first time a vault_id
+// gets generated. Asks the browser to retain IndexedDB across storage
+// pressure (Firefox shows a permission prompt; Chromium is silent;
+// Safari quietly ignores it outside an installed PWA — hence the
+// one-line note for Safari users so they understand why their saved
+// cards may disappear after a week.
+async function _onFirstVaultSave() {
+  if (navigator.storage && typeof navigator.storage.persist === 'function') {
+    try { await navigator.storage.persist(); } catch (e) {}
+  }
+  if (_isSafari()) {
+    showToast('On Safari, saved credentials are cleared after 7 days ' +
+              'of inactivity unless you add this site to your home screen.',
+              'warn');
+  }
+}
+
+// Cross-tab signalling. localStorage 'storage' events cover the
+// saved-card list (any tab editing websh_connections fires in every
+// other tab). IDB / sign-out are out-of-band, so we also open a
+// BroadcastChannel where signedOut signals invalidate the other tab's
+// in-memory caches. Both layers degrade gracefully — when
+// BroadcastChannel is absent the user just won't see immediate
+// invalidation in the second tab, and the next render after a manual
+// refresh picks up the wipe.
+let _vaultBroadcast = null;
+let _vaultBroadcastPagehideWired = false;
+// Flag set when a sign-out happens (local or via the BroadcastChannel
+// signal) and cleared when the user initiates a new save in doConnect.
+// commitVaultSave consults it to bail if a sign-out raced the 2.5 s
+// stable-connection window. (Finding 4 in the PR-67 review.)
+let _vaultRecentlySignedOut = false;
+function _initVaultBroadcast() {
+  if (typeof BroadcastChannel === 'undefined' || _vaultBroadcast) return;
+  try {
+    _vaultBroadcast = new BroadcastChannel('websh_vault');
+    _vaultBroadcast.onmessage = (e) => {
+      if (!e || !e.data) return;
+      if (e.data.type === 'signed_out') {
+        // Tear down live vault-backed panes BEFORE invalidating caches
+        // so the in-flight connectPane / pollOutput on this tab can't
+        // race ahead and mint a fresh K from empty IDB (Finding 3).
+        _vaultRecentlySignedOut = true;
+        _disconnectAllVaultPanesForNoKey();
+        invalidateVaultCache();
+        renderSaved();
+      }
+    };
+    // Safari's bfcache can keep a frozen tab subscribed to the channel,
+    // firing handlers into a page that's effectively dead (touching DOM
+    // that may be gone). Close on pagehide so we don't leak listeners
+    // into bfcache. Listener is wired once per page lifetime so a
+    // re-init after a fresh load doesn't double-bind.
+    if (!_vaultBroadcastPagehideWired) {
+      _vaultBroadcastPagehideWired = true;
+      window.addEventListener('pagehide', () => {
+        if (_vaultBroadcast) {
+          try { _vaultBroadcast.close(); } catch (e) {}
+          _vaultBroadcast = null;
+        }
+      });
+    }
+  } catch (e) { _vaultBroadcast = null; }
+}
+function _broadcastSignedOut() {
+  if (!_vaultBroadcast) return;
+  try { _vaultBroadcast.postMessage({type: 'signed_out'}); } catch (e) {}
+}
+
+window.addEventListener('storage', (e) => {
+  if (!e || !e.key) return;  // localStorage.clear() fires with key=null
+  if (e.key === storageKey('websh_connections')) {
+    // The other tab edited the saved-card list (delete, sign-out
+    // wipe, fresh save). Render immediately with the current cache so
+    // the visible list matches the just-edited storage in this tick.
+    renderSaved();
+    // Then refresh the IDB-presence mirror and re-render — a sibling
+    // tab that just minted K + vault_id and saved its first card
+    // would otherwise leave _idbHasKeyCache=false here, painting every
+    // vault row .nokey until the next IDB touch. (Finding 1b in the
+    // PR-67 review.) try/catch survives a window close between the
+    // event firing and the deferred render.
+    _refreshIdbHasKey().then(() => {
+      try { renderSaved(); } catch (err) {}
+    }, () => {});
+  }
+});
+
+// Sync-readable mirror of "is K present in IDB?". renderSaved checks
+// this to gray out vault-backed rows that can no longer connect
+// (Safari ITP cleared IDB after 7 days, user wiped site data, etc).
+// Refreshed from loadServerConfig at boot, after save / sign-out
+// (which know they just touched IDB), and on the storage / vault
+// BroadcastChannel events (Task 11).
+let _idbHasKeyCache = false;
+async function _refreshIdbHasKey() {
+  try { _idbHasKeyCache = !!(await _idbGet(IDB_K_KEY)); }
+  catch (e) { _idbHasKeyCache = false; }
+  return _idbHasKeyCache;
+}
+
+// Invalidate in-memory caches without touching IDB. Used when another
+// tab signs out, when sign-out completes locally, and when /api/config
+// reports the vault has been disabled out from under us.
+function invalidateVaultCache() {
+  _vaultIdCache = null;
+  _vaultKeyCache = null;
+  _idbHasKeyCache = false;
+}
+
+// Tear down a live vault-backed pane after the vault key has just been
+// wiped (local sign-out, or a sibling tab broadcasting signed_out).
+// Lighter than _destroyPane: we keep the pane in the DOM so the user
+// sees the no-key state and can act, but stop polling, close the
+// stream, and best-effort disconnect the server-side session.
+// Reconnect bar shows 'no_vault_key' — clicking Reconnect funnels back
+// through connectPane's vault guard, which re-shows the same bar
+// (intentional: the user has to sign in again to recover).
+function _disconnectVaultPaneForNoKey(p) {
+  if (!p) return;
+  p.connecting = false;
+  if (p.sid) {
+    let sid = p.sid;
+    p.polling = false;
+    stopKeepalive(p);
+    closeStream(p);
+    api('disconnect', {body: {session_id: sid}}).catch(() => {});
+    p.sid = null;
+  }
+  updatePaneBadge(p);
+  showReconnectBar(p, 'no_vault_key');
+}
+
+// Iterate live panes and tear down every vault-backed one. Shared by
+// confirmSignOut (this tab) and the BroadcastChannel signed_out
+// handler (sibling tab) so the same pane state is reached either way.
+function _disconnectAllVaultPanesForNoKey() {
+  Object.keys(panes).forEach(id => {
+    let p = panes[id];
+    if (p && p.conn_id) _disconnectVaultPaneForNoKey(p);
+  });
+}
+
+// Toggle vault-on / vault-off on <html> based on the server's
+// /api/config response. Elements with class="vault-only" are hidden
+// while the vault is off (server lacks cryptography, WEBSH_VAULT_ENABLE
+// isn't set, schema version unsupported, or just before /api/config
+// returns). Default in the HTML is vault-off — no flash of a "Save"
+// affordance the server can't honor.
+function _applyVaultEnabledClass() {
+  let on = !!(serverConfig && serverConfig.vault_enabled);
+  document.documentElement.classList.toggle('vault-on', on);
+  document.documentElement.classList.toggle('vault-off', !on);
+}
+
 // ── Saved connections (localStorage) ────────────────────────────────
+// Post-vault shape: {name, conn_id, host, port, user, auth, persistent,
+// tmux_cmd?, connection?}. No `pass` / `key` fields — secrets live in
+// the server-side vault under `conn_id`. Legacy entries with `pass` /
+// `key` are tolerated (read-only) until the user acks the
+// legacy-plaintext banner, which drops those fields.
 function loadSaved() { try{return JSON.parse(localStorage.getItem(storageKey('websh_connections'))||'[]')}catch(e){return[]} }
 function saveSaved(list) { localStorage.setItem(storageKey('websh_connections'),JSON.stringify(list)) }
+
+// Heuristic for the "(key)" badge: trust `c.auth` first; fall back to
+// the legacy `c.key` truthy-check for pre-vault rows that don't carry
+// an explicit auth tag.
+function _entryUsesKey(c) {
+  if (c.auth) return c.auth === 'key';
+  return !!c.key;
+}
+
+// Detect rows from before the vault shipped — they still carry the
+// plaintext password or key inline. _maybeAutoDropLegacy consumes the
+// signal once on load: strips pass/key from every legacy row,
+// persists the cleaned list, then opens an informational modal so
+// the user knows their saved cards will ask for the password the
+// next time they're used.
+function _hasLegacyPlaintext() {
+  return loadSaved().some(c => c.pass || c.key);
+}
+
+// Strip pass/key from every legacy row, persist, and open the
+// "Saved connections updated" modal. The earlier design asked the
+// user to click "Drop plaintext now"; in practice that was just
+// bureaucracy — the user can't make a different choice (we'd never
+// silently re-encrypt; the original may live in browser-history sync
+// or profile backups, and auto-encrypting would create a false sense
+// of security). Dropping is purely defensive: it shrinks this
+// browser's localStorage footprint without claiming to recover from
+// any prior leak. So we do it automatically and just inform.
+function _maybeAutoDropLegacy() {
+  if (!_hasLegacyPlaintext()) return;
+  let cleaned = loadSaved().map(c => {
+    let copy = Object.assign({}, c);
+    delete copy.pass;
+    delete copy.key;
+    return copy;
+  });
+  saveSaved(cleaned);
+  // No renderSaved here — loadServerConfig calls it next, after
+  // _refreshIdbHasKey, so we'd otherwise paint twice with a brief
+  // .nokey flash on vault rows.
+  openLegacyUpdateModal();
+}
+
+// One-shot callback queued by loadServerConfig when the legacy modal
+// preempts doAutoConnect. closeLegacyUpdateModal drains it so the
+// user sees the connect overlay only AFTER they've acknowledged the
+// migration message.
+let _deferredAfterLegacyModal = null;
+// A11y plumbing mirrors signOutModal: Esc closes, Tab traps focus
+// inside the dialog, focus is restored on close. Without these the
+// modal had role=dialog/aria-modal but Tab leaked to the page behind
+// it and Esc did nothing.
+let _legacyUpdatePrevFocus = null;
+let _legacyUpdateKeyHandler = null;
+function openLegacyUpdateModal() {
+  let modal = $('legacyUpdateModal'); if (!modal) return;
+  // Defensive: if a previous open left a keydown listener wired
+  // (programmatic re-open without close), tear it down first so we
+  // don't leak listeners or stomp on _legacyUpdatePrevFocus.
+  if (_legacyUpdateKeyHandler) {
+    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
+    _legacyUpdateKeyHandler = null;
+  }
+  _legacyUpdatePrevFocus = document.activeElement;
+  _legacyUpdateKeyHandler = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeLegacyUpdateModal(); return; }
+    if (e.key !== 'Tab') return;
+    let m = $('legacyUpdateModal'); if (!m) return;
+    let focusables = m.querySelectorAll('input:not([disabled]),button:not([disabled])');
+    if (!focusables.length) return;
+    let first = focusables[0], last = focusables[focusables.length - 1];
+    if (e.shiftKey) {
+      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+    } else {
+      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  };
+  document.addEventListener('keydown', _legacyUpdateKeyHandler);
+  modal.classList.remove('h');
+  // Initial focus on the Got-it button so Enter dismisses; matches
+  // the implicit-default convention used by the connect form.
+  setTimeout(() => { try { $('legacyUpdateOk').focus(); } catch(e){} }, 0);
+}
+
+function closeLegacyUpdateModal() {
+  let modal = $('legacyUpdateModal'); if (!modal) return;
+  if (_legacyUpdateKeyHandler) {
+    document.removeEventListener('keydown', _legacyUpdateKeyHandler);
+    _legacyUpdateKeyHandler = null;
+  }
+  modal.classList.add('h');
+  // Restore focus to whatever opened the modal before draining the
+  // deferred autoconnect — otherwise focus would briefly land back
+  // on (e.g.) the page body and the connect form's focusFirst would
+  // race against it.
+  if (_legacyUpdatePrevFocus && typeof _legacyUpdatePrevFocus.focus === 'function') {
+    try { _legacyUpdatePrevFocus.focus(); } catch (e) {}
+  }
+  _legacyUpdatePrevFocus = null;
+  // Drain the queued post-modal action (typically doAutoConnect).
+  if (_deferredAfterLegacyModal) {
+    let fn = _deferredAfterLegacyModal;
+    _deferredAfterLegacyModal = null;
+    try { fn(); } catch (e) {}
+  }
+}
 
 function renderSaved() {
   let list=loadSaved(), el=$('savedList');
   el.innerHTML='';
   $('divider').querySelector('span').textContent=list.length?'Or connect manually':'Connect';
   list.forEach((c,i) => {
-    let div=document.createElement('div'); div.className='sv'; div.setAttribute('data-idx',i);
+    // A vault-backed row is unusable when the browser's IDB key is gone
+    // (Safari ITP eviction, user wiped site data, sign-out in another
+    // tab). We mark it .nokey so CSS grays it out, and the click
+    // handler routes to the bulk-delete path instead of connect.
+    let nokey = !!(c.conn_id && !_idbHasKeyCache);
+    let div=document.createElement('div');
+    div.className = 'sv' + (nokey ? ' nokey' : '');
+    div.setAttribute('data-idx', i);
+    let suffix = _entryUsesKey(c) ? ' (key)' : '';
+    let nokeyTag = nokey ? ' <span class="sv-kind sv-nokey" title="No vault key in this browser — cannot connect; delete to clean up">no key</span>' : '';
     div.innerHTML=
       `<div class="sv-info"><div class="sv-name">${esc(c.name)}</div>`+
-      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${c.port}${c.key?' (key)':''}</div></div>`+
+      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${c.port}${suffix}${nokeyTag}</div></div>`+
       `<div class="sv-actions"><button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
     el.appendChild(div);
   });
   el.onclick=e => {
     if(e.target.classList.contains('del')){
-      list.splice(parseInt(e.target.getAttribute('data-idx')),1);saveSaved(list);renderSaved();return;
+      let idx = parseInt(e.target.getAttribute('data-idx'));
+      let c = list[idx];
+      if (c && c.conn_id) {
+        // Vault-backed: best-effort tell the server to drop its blob.
+        // We don't await — local removal proceeds even if the server
+        // is unreachable.
+        _bulkDeleteVaultEntry(c).catch(() => {});
+      }
+      list.splice(idx, 1); saveSaved(list); renderSaved();
+      return;
     }
     let row=e.target.closest('.sv'); if(!row) return;
     let idx=parseInt(row.getAttribute('data-idx')); if(isNaN(idx)) return;
-    connectSaved(list[idx]);
+    let c = list[idx];
+    if (c && c.conn_id && !_idbHasKeyCache) {
+      // No-key state: the row's click target is delete, not connect.
+      _bulkDeleteVaultEntry(c).catch(() => {});
+      list.splice(idx, 1); saveSaved(list); renderSaved();
+      return;
+    }
+    connectSaved(c);
   };
 }
 
-function connectSaved(c) {
+// Fire-and-forget DELETE /api/save for a vault-backed entry. The PHP
+// proxy translates `?action=save_delete` POST into a backend DELETE.
+async function _bulkDeleteVaultEntry(c) {
+  if (!c || !c.conn_id) return;
+  // Non-minting: if the user wiped IDB and then clicked Delete on a
+  // .nokey row, the old ensureVaultId would mint a fresh vault_id
+  // that doesn't match the saved entry's namespace — the DELETE
+  // would fire against a meaningless URL and the original blob
+  // would linger server-side. Skip the network call instead.
+  let vault_id = null;
+  try { vault_id = await ensureVaultIdIfPresent(); } catch (e) {}
+  if (!vault_id) return;  // local removal still proceeds in the caller
+  let q = '&vault_id=' + encodeURIComponent(vault_id) +
+          '&conn_id='  + encodeURIComponent(c.conn_id);
+  // body:{} forces POST through api(); empty body is fine, PHP proxy
+  // routes by ?action= regardless of body content.
+  await api('save_delete', {query: q, body: {}});
+}
+
+async function connectSaved(c) {
   hideErr();
-  let label = c.name||(c.user+'@'+c.host);
+  let label = c.name || (c.user + '@' + c.host);
+  // New-shape rows carry a conn_id and use the saved-variant
+  // /api/connect — the server fetches host/port/username from the
+  // vault record, browser supplies vault_key. Legacy rows (still
+  // carrying c.pass / c.key in localStorage from before the vault
+  // shipped) keep the old manual-mode flow so they continue to work
+  // until _maybeAutoDropLegacy strips those fields on next load or
+  // the user re-saves.
+  if (c.conn_id) {
+    // Non-minting: IDB may be empty (Safari ITP, site-data clear,
+    // sign-out in another tab). renderSaved's onclick handler pre-gates
+    // on _idbHasKeyCache, but that mirror can be momentarily stale —
+    // and direct callers (programmatic or future code paths) bypass it.
+    // Guard at the bottom of the funnel so a fresh K is never minted
+    // from a no-key state.
+    let vault_id = null;
+    let key = null;
+    try {
+      vault_id = await ensureVaultIdIfPresent();
+      key = await ensureVaultKeyIfPresent();
+    } catch (e) { /* IDB broken — treat as missing */ }
+    if (!vault_id || !key) {
+      showToast('No vault key in this browser — re-enter to re-save this connection.', 'err');
+      return;
+    }
+    let vault_key;
+    try {
+      vault_key = await exportRawVaultKey(key);
+    } catch (e) {
+      showToast('Could not export the vault key for this connection. ' +
+                'Try signing out and re-saving.', 'err');
+      return;
+    }
+    runConnect({
+      label: label,
+      vault_id: vault_id,
+      conn_id: c.conn_id,
+      vault_key: vault_key,
+      // host/port/user are display hints for the connect popup; the
+      // server derives the real values from the stored vault record.
+      host: c.host, port: c.port || 22, user: c.user,
+      persistent: c.persistent !== false,
+      slotId: null,
+      tmuxCmd: c.tmux_cmd || 'tmux',
+    });
+    return;
+  }
+  // Legacy row whose plaintext was dropped by _maybeAutoDropLegacy
+  // (or never had it in the first place). The metadata (name/host/
+  // port/user/auth/persistent/connection) is still useful — open the
+  // connect form pre-filled and let the user type the password once.
+  // We pre-check Save so the next connect re-saves under the vault.
+  // For restrict_hosts deployments where the row matches a named
+  // prompt connection, route through selectPromptConnection so the
+  // server actually accepts the connect (manual host would be denied).
+  if (!c.pass && !c.key) {
+    let useKey = c.auth === 'key';
+    let routedViaPrompt = false;
+    if (serverConfig && serverConfig.connections) {
+      // First: name match (rows saved after connection-naming shipped).
+      let m = null;
+      if (c.connection) {
+        m = serverConfig.connections.find(
+          e => e.name === c.connection && e.kind === 'prompt');
+      }
+      // Fallback: pre-naming legacy rows have no c.connection. Match
+      // by host:port so restrict_hosts deployments don't drop the
+      // user into a hidden manual form with no way back. Only the
+      // host:port pair uniquely identifies a connection in practice,
+      // so this is safe.
+      if (!m) {
+        m = serverConfig.connections.find(
+          e => e.kind === 'prompt' && e.host === c.host && e.port === c.port);
+      }
+      if (m) { selectPromptConnection(m.name); routedViaPrompt = true; }
+    }
+    if (!routedViaPrompt) {
+      // No prompt match: clear any stale selectedPrompt that a prior
+      // in-form selection may have left behind. Otherwise doConnect
+      // would use selectedPrompt.name and route to the wrong host.
+      if (selectedPrompt) clearPromptSelection();
+      $('iH').value = c.host || '';
+      $('iP').value = c.port || 22;
+    }
+    // Username: selectPromptConnection may have locked iU when the
+    // named connection fixes it; fill from the saved card otherwise.
+    if (!$('iU').disabled && c.user) $('iU').value = c.user;
+    $('iName').value = c.name || '';
+    if ($('iPersistent')) $('iPersistent').checked = c.persistent !== false;
+    if (serverConfig && serverConfig.vault_enabled) {
+      $('iSave').checked = true;
+      toggleSaveName();
+    }
+    // Auth-tab + focus run AFTER routing so a legacy key-auth row
+    // matching a prompt connection lands on the key tab (the
+    // selectPromptConnection call inside routing always sets 'pw').
+    setAuthTab(useKey ? 'key' : 'pw');
+    showOverlay();
+    setTimeout(() => {
+      try { (useKey ? $('iKey') : $('iPw')).focus(); } catch(e){}
+    }, 0);
+    return;
+  }
   // Auto-match legacy entries (saved before we tagged with connection name)
   // to a config entry by host:port so they still work under restrict_hosts.
   let connName = c.connection;
-  if(!connName && serverConfig && serverConfig.connections) {
-    let m = serverConfig.connections.find(e => e.host===c.host && e.port===c.port);
-    if(m) connName = m.name;
+  if (!connName && serverConfig && serverConfig.connections) {
+    let m = serverConfig.connections.find(e => e.host === c.host && e.port === c.port);
+    if (m) connName = m.name;
   }
   runConnect({
     label: label,
@@ -1778,10 +2874,35 @@ function doConnect() {
   // probe era; that field still flows through buildConnectBody for
   // backward compatibility, but new entries don't capture it.
   let saveEntry = null;
-  if ($('iSave').checked) {
+  if ($('iSave').checked && serverConfig && serverConfig.vault_enabled) {
+    // The user explicitly initiated a save. Whatever sign-out happened
+    // before this click is intent the user has now superseded — clear
+    // the flag so commitVaultSave's bail doesn't trip on stale state
+    // (legitimate first-save after a sign-out). A subsequent sign-out
+    // during the 2.5 s window will re-set it. (Finding 4 polish.)
+    _vaultRecentlySignedOut = false;
+    // Vault flow: the entry that lands in localStorage carries NO
+    // secrets — `__ephemeralSecrets` is consumed by commitVaultSave
+    // once the connection is healthy, encrypted, and successfully
+    // POSTed to /api/save. The conn_id is minted at commit-time. If
+    // vault_enabled is false (UI hidden anyway by Task 2 CSS), no save
+    // path runs at all — we deliberately don't fall back to plaintext
+    // localStorage.
     saveEntry = {name: label, host: host, port: port, user: username,
                  auth: authMode, persistent: wantPersistent};
-    if (authMode === 'pw') saveEntry.pass = password; else saveEntry.key = key;
+    // MUST NEVER BE SERIALIZED. Held in a non-enumerable property so
+    // any future JSON.stringify on the entry (crash dump, debug log,
+    // paneRecord-style serializer) drops it silently rather than
+    // spilling plaintext to localStorage. See _carryEphemeralSecrets
+    // for how this survives the Object.assign hops to commitVaultSave.
+    Object.defineProperty(saveEntry, '__ephemeralSecrets', {
+      value: {
+        password: authMode === 'pw' ? password : null,
+        key:      authMode === 'key' ? key      : null,
+        key_pass: authMode === 'key' ? $('iKeyPw').value : null,
+      },
+      enumerable: false, configurable: true, writable: true,
+    });
     if (selectedPrompt) saveEntry.connection = selectedPrompt.name;
   }
   let opts = {
@@ -1804,9 +2925,22 @@ function doConnect() {
 
 // ── Server config ───────────────────────────────────────────────────
 function loadServerConfig() {
-  api('config').then(cfg => {
+  api('config').then(async cfg => {
     serverConfig=cfg;
     if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
+    _applyVaultEnabledClass();
+    // Pre-cache the IDB key presence so the first renderSaved doesn't
+    // flash all vault-backed rows as no-key while we wait on IDB.
+    await _refreshIdbHasKey();
+    // Auto-drop legacy plaintext rows BEFORE the first render so the
+    // saved-card list paints in its final shape. Surfaces a modal
+    // when something was actually dropped. Gated on vault_enabled:
+    // on a vault-off deployment (cryptography missing, schema
+    // downgrade, WEBSH_VAULT_ENABLE unset) the legacy plaintext rows
+    // are the ONLY working storage path — stripping them strands
+    // the user with empty-password forms forever, since the Save UI
+    // is hidden by .vault-only CSS so they can't re-save either.
+    if (cfg.vault_enabled === true) _maybeAutoDropLegacy();
     renderServerConnections();
     renderSaved();
     // Try to restore sessions from page reload. If there's nothing to
@@ -1814,7 +2948,16 @@ function loadServerConfig() {
     // submit, so the user sees the overlay on an empty workspace.
     if(!tryRestoreSessions()) {
       overlayMode = 'initial';
-      doAutoConnect();
+      // Defer autoconnect while the legacy-migration modal is open:
+      // both .ov divs share z-index, and #ov paints on top (later in
+      // DOM) — autoconnect would hide the migration message and steal
+      // focus to iPw. closeLegacyUpdateModal drains the queued call.
+      let legacy = $('legacyUpdateModal');
+      if (legacy && !legacy.classList.contains('h')) {
+        _deferredAfterLegacyModal = doAutoConnect;
+      } else {
+        doAutoConnect();
+      }
     }
   }).catch(() => {
     overlayMode = 'initial';
@@ -2676,6 +3819,149 @@ function openOptions(){
   $('ovOpt').classList.remove('h');
 }
 function closeOptions(){ $('ovOpt').classList.add('h'); }
+
+// ── Sign out of this browser ────────────────────────────────────────
+// Permanently deletes every saved credential in this vault from the
+// server and clears the key in this browser. Typed-DELETE confirm
+// gate because the action is irreversible. WCAG: role=dialog +
+// aria-modal in the markup; focus trap + Escape + restore-focus
+// wired here. (Finding 9 in the PR-67 review.)
+let _signOutPrevFocus = null;
+let _signOutKeyHandler = null;
+function openSignOutModal() {
+  // Defensive: if a previous open left a keydown listener wired (no
+  // current call site does this, but a future programmatic open might),
+  // tear it down first so we don't leak listeners or stomp on
+  // _signOutPrevFocus.
+  if (_signOutKeyHandler) closeSignOutModal();
+  let input = $('signOutInput');
+  let confirm = $('signOutConfirm');
+  let status = $('signOutStatus');
+  let scope = $('signOutScope');
+  if (input) input.value = '';
+  if (confirm) confirm.disabled = true;
+  if (status) { status.textContent = ''; status.className = 'tm-status'; }
+  if (input && !input._wired) {
+    input._wired = true;
+    input.addEventListener('input', () => {
+      let ok = input.value === 'DELETE';
+      if (confirm) confirm.disabled = !ok;
+    });
+  }
+  // Show how much this affects: count + a few names + a heads-up that
+  // live saved-card panes across tabs will disconnect. The list-of-
+  // names confirmation comes from the same loadSaved that confirmSignOut
+  // iterates, so what we show is exactly what we'll delete.
+  if (scope) {
+    let list = loadSaved();
+    let vaultRows = list.filter(c => c.conn_id);
+    let names = vaultRows.map(c => c.name || (c.user + '@' + c.host));
+    if (vaultRows.length === 0) {
+      scope.textContent = 'No vault-backed cards are stored in this browser. ' +
+        'Sign-out will still clear the vault key.';
+    } else {
+      let shown = names.slice(0, 5).join(', ');
+      let more = names.length > 5 ? ', and ' + (names.length - 5) + ' more' : '';
+      scope.textContent = 'This affects ' + vaultRows.length + ' saved ' +
+        (vaultRows.length === 1 ? 'card' : 'cards') + ': ' + shown + more +
+        '. Live sessions opened from these cards will disconnect across all tabs.';
+    }
+  }
+  _signOutPrevFocus = document.activeElement;
+  // Tab focus trap + Escape handler. Bound to document so it fires
+  // regardless of which focusable inside the modal currently holds
+  // focus. Both are removed in closeSignOutModal.
+  _signOutKeyHandler = (e) => {
+    if (e.key === 'Escape') { e.preventDefault(); closeSignOutModal(); return; }
+    if (e.key !== 'Tab') return;
+    let modal = $('signOutModal'); if (!modal) return;
+    let focusables = modal.querySelectorAll('input:not([disabled]),button:not([disabled])');
+    if (!focusables.length) return;
+    let first = focusables[0], last = focusables[focusables.length - 1];
+    if (e.shiftKey) {
+      if (document.activeElement === first) { e.preventDefault(); last.focus(); }
+    } else {
+      if (document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  };
+  document.addEventListener('keydown', _signOutKeyHandler);
+  $('signOutModal').classList.remove('h');
+  setTimeout(() => { try { input && input.focus(); } catch(e){} }, 0);
+}
+
+function closeSignOutModal() {
+  if (_signOutKeyHandler) {
+    document.removeEventListener('keydown', _signOutKeyHandler);
+    _signOutKeyHandler = null;
+  }
+  $('signOutModal').classList.add('h');
+  // Restore focus to whatever opened the modal (typically the
+  // "Sign out of this browser" button in the Options panel).
+  if (_signOutPrevFocus && typeof _signOutPrevFocus.focus === 'function') {
+    try { _signOutPrevFocus.focus(); } catch (e) {}
+  }
+  _signOutPrevFocus = null;
+}
+
+async function confirmSignOut() {
+  let confirm = $('signOutConfirm');
+  let status = $('signOutStatus');
+  if (confirm) confirm.disabled = true;
+  if (status) { status.textContent = 'Deleting saved credentials…'; status.className = 'tm-status'; }
+  // Best-effort: tell the server to drop each blob in this vault. We
+  // continue on per-row failure (404/network) — the local wipe still
+  // happens, and the orphaned server-side blob (if any) is just a
+  // namespace squat with no plaintext leak.
+  let vault_id = null;
+  try { vault_id = await ensureVaultId(); } catch (e) {}
+  let list = loadSaved();
+  for (let c of list) {
+    if (!vault_id || !c.conn_id) continue;
+    let q = '&vault_id=' + encodeURIComponent(vault_id) +
+            '&conn_id='  + encodeURIComponent(c.conn_id);
+    try { await api('save_delete', {query: q, body: {}}); } catch (e) {}
+  }
+  // Local wipe: IDB (K + vault_id), saved-card list, pane-secrets.
+  try { await _idbDelete(IDB_K_KEY); } catch (e) {}
+  try { await _idbDelete(IDB_VAULT_ID_KEY); } catch (e) {}
+  saveSaved([]);
+  try { sessionStorage.removeItem(storageKey(SS_PANE_SECRETS_KEY)); } catch (e) {}
+  // Filter vault entries out of the pane manifest in localStorage.
+  // Without this, an open vault-backed pane's record survives the wipe
+  // and the next F5 would hit connectPane's vault branch with no key
+  // → silently mint a fresh K (the original Finding 1 scenario). We
+  // filter rather than nuking the whole manifest so any non-vault
+  // panes (manual / named) the user had open still restore on F5.
+  try {
+    let raw = localStorage.getItem(storageKey(PANES_KEY));
+    if (raw) {
+      let m = JSON.parse(raw);
+      if (m && m.panes) {
+        let kept = {};
+        let dropped = false;
+        Object.keys(m.panes).forEach(k => {
+          let rec = m.panes[k];
+          if (rec && (rec.via === 'vault' || rec.conn_id)) { dropped = true; return; }
+          kept[k] = rec;
+        });
+        if (dropped) {
+          m.panes = kept;
+          localStorage.setItem(storageKey(PANES_KEY), JSON.stringify(m));
+        }
+      }
+    }
+  } catch (e) {}
+  // Tear down any live vault-backed panes in this tab — they're now
+  // running with a key that was just wiped from disk, so the next
+  // disconnect/reconnect would silently re-mint a fresh K.
+  _disconnectAllVaultPanesForNoKey();
+  invalidateVaultCache();
+  _vaultRecentlySignedOut = true;
+  _broadcastSignedOut();
+  closeSignOutModal();
+  renderSaved();
+  showToast('Signed out. All saved credentials in this browser have been removed.', '');
+}
 function resetOptions(){
   settings = { ...DEFAULT_SETTINGS };
   fontSize = settings.fontSize;
@@ -2939,19 +4225,63 @@ function tryRestoreSessions() {
   if (!ids.length) return false;
   activatePane(restored[ids[0]].id);
 
+  let missingCreds = 0;
   Object.keys(m.panes).forEach(oldId => {
     let rec = m.panes[oldId];
     let p = restored[oldId];
     if (!p || !rec) return;
+    // `via` is set by paneRecord post-vault; legacy v2 records without
+    // via are treated as manual (their plaintext is in password/key
+    // inline, which connectPane consumes once and saveSessions will
+    // overwrite with the new shape on the next save).
+    // Plaintext for manual / prompt-named panes lives in sessionStorage
+    // (Task 7). Legacy v2 records carry password / key inline; we
+    // prefer sessionStorage when present, fall back to legacy fields,
+    // and finally surface a toast if both are empty for a non-vault
+    // pane that needs creds at connect time.
+    let secrets = _getPaneSecret(oldId);
+    // Pane ids (`p' + ++paneCounter`) reset on every module load, so a
+    // manifest with gaps (e.g. {p1, p3} because p2 was closed earlier)
+    // remints panes as {p1, p2} on restore. If we don't re-key
+    // sessionStorage right now, the next saveSessions() (fired after
+    // the connect lands) will write a manifest with the new ids while
+    // the secrets stay under the OLD ids — and the next F5 cannot find
+    // them. Do the rewrite eagerly so it survives even if this connect
+    // itself fails. _setPaneSecret(p.id, null) is a no-op delete, so
+    // pass-through cases (vault panes, panes with no stored secrets)
+    // don't accidentally create empty rows.
+    if (secrets && oldId !== p.id) {
+      _setPaneSecret(p.id, secrets);
+      _deletePaneSecret(oldId);
+    }
+    let password = (secrets && secrets.password) || rec.password || '';
+    let key      = (secrets && secrets.key)      || rec.key      || '';
+    let keyPass  = (secrets && secrets.key_pass) || rec.key_pass || '';
+    let isVault  = !!rec.conn_id;
+    let isReady  = rec.via === 'named' && !password && !key;
+    // Manual mode (free-form host) needs credentials; prompt-named
+    // panes do too. Ready-kind named panes connect with no body creds
+    // (server has them in websh.json), so missing-cred toast doesn't
+    // apply to those — but we have no kind on the client, so treat
+    // empty named entries as "server provides" (`isReady` above).
+    if (!isVault && !isReady && !password && !key) {
+      missingCreds++;
+    }
     connectPane(p, {
       label: rec.label, host: rec.host, port: rec.port, user: rec.user,
       connection: rec.connection, auth: rec.auth,
-      password: rec.password, key: rec.key, keyPass: rec.key_pass,
+      password: password, key: key, keyPass: keyPass,
+      conn_id: rec.conn_id,
       persistent: rec.persistent, slotId: rec.slot_id,
       tmuxCmd: rec.tmux_cmd || 'tmux',
       resume: !!rec.persistent
     });
   });
+  if (missingCreds > 0) {
+    showToast(missingCreds + ' pane' + (missingCreds === 1 ? ' was' : 's were') +
+              ' restored without saved credentials. Open the login form to re-enter.',
+              'warn');
+  }
   return true;
 }
 
@@ -2961,6 +4291,10 @@ function tryRestoreSessions() {
 // before the change is an orphan. Remove it once so a fresh devtools
 // pass on a returning user's browser doesn't show stray entries.
 try { localStorage.removeItem('websh_theme'); } catch(e){}
+
+// Open the vault BroadcastChannel early so a sign-out fired in another
+// tab during loadServerConfig still gets observed by this tab.
+_initVaultBroadcast();
 
 // No pane is created eagerly. loadServerConfig drives next step:
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
