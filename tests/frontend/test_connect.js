@@ -31,18 +31,50 @@ function makeFakes(win) {
       this.cols = 80; this.rows = 24;
       this._focusCalls = 0; this._blurCalls = 0;
       this._cursorMoveCbs = [];
+      this._oscHandlers = {};
+      this._selectionChangeCb = null;
+      this._selection = '';
     }
     loadAddon() {} open() {} reset() {}
     focus() { this._focusCalls++; }
     blur() { this._blurCalls++; }
     write() {} dispose() {}
-    onData() {} onBinary() {} onResize() {} onSelectionChange() {} onBell() {}
+    onData() {} onBinary() {} onResize() {} onBell() {}
+    onSelectionChange(cb) {
+      this._selectionChangeCb = cb;
+      let self = this;
+      return { dispose() { if (self._selectionChangeCb === cb) self._selectionChangeCb = null; } };
+    }
+    getSelection() { return this._selection; }
+    _fireSelectionChange(text) {
+      this._selection = text == null ? '' : text;
+      if (this._selectionChangeCb) this._selectionChangeCb();
+    }
     onCursorMove(cb) {
       this._cursorMoveCbs.push(cb);
       let self = this;
       return { dispose() { self._cursorMoveCbs = self._cursorMoveCbs.filter(c => c !== cb); } };
     }
     _fireCursorMove() { this._cursorMoveCbs.slice().forEach(cb => cb()); }
+    // Parser exposed via getter so the OSC 52 handler in createPane finds
+    // a `registerOscHandler` to attach to. Tests trigger payloads via
+    // `term.parser._fireOsc(52, "<base64;data>")`.
+    get parser() {
+      if (!this._parser) {
+        let self = this;
+        this._parser = {
+          registerOscHandler(id, cb) {
+            self._oscHandlers[id] = cb;
+            return { dispose() { delete self._oscHandlers[id]; } };
+          },
+          _fireOsc(id, data) {
+            const cb = self._oscHandlers[id];
+            return cb ? cb(data) : false;
+          }
+        };
+      }
+      return this._parser;
+    }
     get buffer() { return {active: {length: 0, getLine: () => null}}; }
     get unicode() { return {activeVersion: '11'}; }
   };
@@ -653,38 +685,6 @@ test("SSE 'open' event does not mark body as arrived", async () => {
   cleanup(env);
 });
 
-// SELECTION_TRIM regression tests — three coupled mechanisms must stay
-// aligned: (1) drag-blur on mousedown via term.blur(), (2) deferred
-// term.focus() restore via onCursorMove + 500ms timer, (3) trimDragTail
-// dropping the trailing tmux cursor-cell char from clipboard payloads.
-test('SELECTION_TRIM: trimDragTail drops trailing char while drag-blurred', async () => {
-  const plan = [{action: 'config', response: {restrict_hosts: false,
-                                                connections: []}}];
-  const env = await mkEnv(plan);
-  const win = env.win;
-  // Synthesize a minimal pane with the SELECTION_TRIM state fields.
-  const p = { _dragBlurred: true, _recentDragSelectAt: 0 };
-  ok(win.trimDragTail(p, 'abcd') === 'abc',
-     'drops trailing char when _dragBlurred');
-  // Length-≤1 short-circuit: never trim to empty.
-  ok(win.trimDragTail(p, 'a') === 'a',
-     'preserves single-char payloads (no trim to empty)');
-  // Outside window AND not blurred → identity.
-  p._dragBlurred = false;
-  p._recentDragSelectAt = 0;
-  ok(win.trimDragTail(p, 'abcd') === 'abcd',
-     'no trim when neither blurred nor recently dragged');
-  // Inside trim window → trim.
-  p._recentDragSelectAt = Date.now() - 100;
-  ok(win.trimDragTail(p, 'abcd') === 'abc',
-     'trims inside DRAG_TRIM_WINDOW_MS');
-  // Outside trim window → no trim.
-  p._recentDragSelectAt = Date.now() - 5000;
-  ok(win.trimDragTail(p, 'abcd') === 'abcd',
-     'no trim outside DRAG_TRIM_WINDOW_MS');
-  cleanup(env);
-});
-
 // fitPaneWhenStable runs an async settle loop and is called from
 // multiple places (createPane, applySettings, the 1 s drift watchdog,
 // kickPanesAfterAbsence). An earlier iteration had a self-feeding
@@ -1070,7 +1070,86 @@ test('drift watchdog: drift inside tolerance band leaves pane alone', async () =
   cleanup(env);
 });
 
-test('SELECTION_TRIM: mousedown blurs xterm, mousemove sets _dragMoved', async () => {
+// CURSOR_HIDE regression tests cover two coupled mechanisms (drag-blur
+// on mousedown via term.blur(), deferred term.focus() restore via
+// onCursorMove + 500ms timer) plus the clipboard-passthrough contract:
+// drag-select copy must reach the clipboard byte-identical to tmux's
+// OSC 52 payload — no trim. 4703bc1 added a one-char `trimDragTail`
+// to compensate for a supposed tmux OSC 52 off-by-one, but wire-level
+// measurement on tmux 3.2a and 3.4 (and the tmux CHANGES log) showed
+// no such off-by-one ever existed — the selection is `[start, end)`
+// on every version, so the trim always dropped a real visible
+// character. The trim is gone; the two passthrough tests below pin
+// the no-trim contract so nobody reintroduces it.
+test('CURSOR_HIDE: OSC 52 payload reaches clipboard unmodified', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  // Spy on copyText — function declarations attach to window in
+  // non-strict mode, so replacing window.copyText replaces the binding
+  // the OSC handler closes over.
+  const copies = [];
+  win.copyText = (t) => copies.push(t);
+  // Mid-drag is the realistic timing (tmux's OSC 52 arrives ~50–200ms
+  // after mouseup, often before document mouseup has fired). Pin
+  // both the drag-blurred and post-drag states.
+  p._dragBlurred = true;
+  const b64Hello = Buffer.from('hello', 'utf8').toString('base64');
+  const handled = p.term.parser._fireOsc(52, 'c;' + b64Hello);
+  ok(handled === true, 'OSC 52 handler claims the sequence');
+  ok(copies.length === 1 && copies[0] === 'hello',
+     'clipboard got full "hello" mid-drag (no trim); got=' +
+     JSON.stringify(copies));
+  copies.length = 0;
+  p._dragBlurred = false;
+  const handled2 = p.term.parser._fireOsc(52, 'c;' + b64Hello);
+  ok(handled2 === true, 'OSC 52 handler claims the sequence (post-drag)');
+  ok(copies.length === 1 && copies[0] === 'hello',
+     'clipboard got full "hello" post-drag (no trim); got=' +
+     JSON.stringify(copies));
+  // Non-content OSC 52 payloads must be declined (return false) so
+  // xterm's built-in handler is not suppressed, and must never touch
+  // the clipboard: no `;` separator, a `?` read-request, and a payload
+  // that isn't valid base64 (atob throws).
+  copies.length = 0;
+  ok(p.term.parser._fireOsc(52, 'no-semicolon') === false,
+     'OSC 52 without a ; separator is declined');
+  ok(p.term.parser._fireOsc(52, 'c;?') === false,
+     'OSC 52 read-request (?) is declined');
+  ok(p.term.parser._fireOsc(52, 'c;!!!not-base64!!!') === false,
+     'OSC 52 with a non-base64 payload is declined');
+  ok(copies.length === 0,
+     'declined OSC 52 payloads do not reach the clipboard; got=' +
+     JSON.stringify(copies));
+  cleanup(env);
+});
+
+test('CURSOR_HIDE: onSelectionChange payload reaches clipboard unmodified', async () => {
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                                connections: []}}];
+  const env = await mkEnv(plan);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  const copies = [];
+  win.copyText = (t) => copies.push(t);
+  p._dragBlurred = true;
+  p.term._fireSelectionChange('hello');
+  ok(copies.length === 1 && copies[0] === 'hello',
+     'onSelectionChange copies full "hello" while drag-blurred (no trim); ' +
+     'got=' + JSON.stringify(copies));
+  // Empty selection: must not call copyText (the `if (sel)` guard).
+  copies.length = 0;
+  p.term._fireSelectionChange('');
+  ok(copies.length === 0,
+     'empty selection does not call copyText; got=' + JSON.stringify(copies));
+  cleanup(env);
+});
+
+test('CURSOR_HIDE: mousedown blurs xterm, mousemove sets _dragMoved', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false,
                                                 connections: []}}];
   const env = await mkEnv(plan);
@@ -1103,7 +1182,7 @@ test('SELECTION_TRIM: mousedown blurs xterm, mousemove sets _dragMoved', async (
   cleanup(env);
 });
 
-test('SELECTION_TRIM: drag mouseup arms onCursorMove + timer; cursor-move restores focus', async () => {
+test('CURSOR_HIDE: drag mouseup arms onCursorMove + timer; cursor-move restores focus', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false,
                                                 connections: []}}];
   const env = await mkEnv(plan);
@@ -1122,10 +1201,8 @@ test('SELECTION_TRIM: drag mouseup arms onCursorMove + timer; cursor-move restor
      'pre-mouseup: dragged + blurred');
   const focusBefore = p.term._focusCalls;
   win.document.dispatchEvent(new win.MouseEvent('mouseup', {bubbles: true}));
-  // After mouseup: still blurred (deferred), trim-window timestamp set,
-  // disposer + timer armed.
+  // After mouseup: still blurred (deferred), disposer + timer armed.
   ok(p._dragBlurred === true, 'mouseup defers — still blurred');
-  ok(p._recentDragSelectAt > 0, 'mouseup recorded _recentDragSelectAt');
   ok(p._selDisp !== null, 'onCursorMove disposer armed');
   ok(p._selTimer !== null, 'fallback timer armed');
   // Fire cursor-move (tmux's copy-pipe-and-cancel signal) → restore.
@@ -1137,7 +1214,7 @@ test('SELECTION_TRIM: drag mouseup arms onCursorMove + timer; cursor-move restor
   cleanup(env);
 });
 
-test('SELECTION_TRIM: bare click (no movement) restores immediately, no trim arm', async () => {
+test('CURSOR_HIDE: bare click (no movement) restores immediately, no defer arm', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false,
                                                 connections: []}}];
   const env = await mkEnv(plan);
@@ -1153,12 +1230,10 @@ test('SELECTION_TRIM: bare click (no movement) restores immediately, no trim arm
   ok(p._dragBlurred === false, 'bare click restores immediately');
   ok(p._selDisp === null && p._selTimer === null,
      'no defer arm for bare click');
-  ok(p._recentDragSelectAt === 0,
-     'no trim window arm for bare click (timestamp untouched)');
   cleanup(env);
 });
 
-test('SELECTION_TRIM: _destroyPane cancels pending onCursorMove subscription', async () => {
+test('CURSOR_HIDE: _destroyPane cancels pending onCursorMove subscription', async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false,
                                                 connections: []}}];
   const env = await mkEnv(plan);

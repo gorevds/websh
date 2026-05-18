@@ -6,9 +6,13 @@ wrapped in a tmux session on the target host
 page, or restart `server.py` — the pane re-attaches to the same session
 with scrollback and running processes intact.
 
-**Requirements.** `tmux` must be installed on the target (any recent
-version). If it isn't, the connect flow surfaces a popup offering to
-fall back to a short-lived (non-persistent) session instead.
+**Requirements.** `tmux` 3.4 or newer is recommended on the target
+host, though any reasonably recent tmux works — drag-select copy
+reaches the clipboard byte-identical to tmux's OSC 52 payload on every
+version (the selection is `[start, end)` exclusive throughout). If
+`tmux` isn't installed at all, the connect flow surfaces a popup
+offering to fall back to a short-lived (non-persistent) session
+instead.
 
 ## How reattach works
 
