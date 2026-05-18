@@ -24,37 +24,21 @@ const panes = {};
 let activeId = null;
 let paneCounter = 0;
 let connectingFor = null; // pane ID the overlay is connecting for
-// SELECTION_TRIM: cursor-hide + clipboard-trim machinery
+// CURSOR_HIDE — drag-selection cursor-hide machinery
 // ----------------------------------------------------------------
-// With tmux mouse-on, tmux's copy-mode leaves a terminal cursor at the
-// cell one past the orange (mode-style yellow) selection. That cell is
-// included in tmux's selection (and OSC 52 payload), so we both
-//   (a) hide it visually during the drag by blurring xterm (combined
-//       with `cursorInactiveStyle:'none'` on the Terminal, see
-//       createPane) so the cursor bar / blink stops being painted, and
-//   (b) trim one trailing character from any clipboard payload that
-//       fires shortly after the drag.
+// During a drag-selection in tmux (mouse-on), xterm's cursor bar/blink
+// would paint over the cell at the trailing edge of tmux's yellow
+// selection — a stray "dim symbol after the orange". We blur xterm on
+// left-mousedown (combined with `cursorInactiveStyle:'none'`, see
+// createPane) so the cursor cell renders glyph-only for the duration
+// of the drag, then defer term.focus() until tmux moves the cursor
+// back to the prompt (`onCursorMove`) or 500 ms have elapsed.
 // State lives per-pane on `p` (_dragBlurred, _selDisp, _selTimer,
-// _dragStartX/Y, _dragMoved, _recentDragSelectAt). The three coupled
-// sites are tagged `SELECTION_TRIM:` so the trio can't drift apart.
-const DRAG_TRIM_WINDOW_MS = 1500;   // OSC 52 over SSE arrives ~50–200ms
-                                    // after mouseup; window is generous.
+// _dragStartX/Y, _dragMoved). The two coupled sites (mousedown blur,
+// document mouseup deferred restore) are tagged `CURSOR_HIDE:` so they
+// can't drift apart.
 const POST_DRAG_HIDE_FALLBACK_MS = 500; // for non-tmux sessions where the
                                         // cursor never moves on its own.
-function trimDragTail(p, s) {
-  if (!s || s.length <= 1) return s;
-  // SELECTION_TRIM: drop the trailing cursor-cell character if the pane
-  // is either still in drag-blur (xterm's mouseup-fired onSelectionChange
-  // runs synchronously *before* the document mouseup, so timestamp is
-  // stale on that path) or within the trim window of a recent drag (the
-  // async OSC 52 path from tmux over SSE).
-  if (p._dragBlurred ||
-      (p._recentDragSelectAt &&
-       Date.now() - p._recentDragSelectAt < DRAG_TRIM_WINDOW_MS)) {
-    return s.slice(0, -1);
-  }
-  return s;
-}
 function _cancelDragBlurArm(p) {
   if (!p) return;
   if (p._selDisp) { try { p._selDisp.dispose(); } catch(e){} p._selDisp = null; }
@@ -198,10 +182,10 @@ function createPane(container) {
   let fit = new FitAddon.FitAddon();
   let term = new Terminal({
     cursorBlink:true, cursorStyle:'bar',
-    // SELECTION_TRIM: when xterm is blurred, render the cursor cell with
+    // CURSOR_HIDE: when xterm is blurred, render the cursor cell with
     // no decoration at all — so the cell glyph stays visible but no
     // bar/block/blink is drawn. We blur on drag-start and refocus on the
-    // deferred restore. See the SELECTION_TRIM trio in this file.
+    // deferred restore. See the CURSOR_HIDE pair in this file.
     cursorInactiveStyle:'none',
     fontSize: settings.fontSize,
     fontFamily: fontStack(settings.font),
@@ -232,10 +216,14 @@ function createPane(container) {
     auth:'pw', password:'', key:'', keyPass:'',
     persistent:false, slotId:null, tmuxCmd:'tmux',
     connectedAt:0, // ms timestamp of last successful /api/connect resolve
-    // SELECTION_TRIM: per-pane drag-blur state (see trimDragTail header)
+    // CURSOR_HIDE: per-pane drag-blur state (see module header)
     _dragBlurred:false, _selDisp:null, _selTimer:null,
     _dragStartX:0, _dragStartY:0, _dragMoved:false,
-    _recentDragSelectAt:0
+    // Conditional drag-select trim — true when the target's tmux is
+    // <3.4 (OSC 52 includes the trailing cursor cell). Set by the
+    // OSC 1338 handler on attach; undefined on non-tmux / non-persistent
+    // / unparseable `tmux -V`, where no-trim is the correct default.
+    _tmuxNeedsTrim:undefined
   };
   panes[id] = p;
   // Schedule a font-load-aware settle-loop refit after registration so
@@ -244,16 +232,15 @@ function createPane(container) {
   // settle-loop fontFamily round-trip; see commit 292eace.)
   fitPaneWhenStable(p);
 
-  // SELECTION_TRIM: focus tracking + drag-blur for cursor hiding.
+  // CURSOR_HIDE: focus tracking + drag-blur for cursor hiding.
   // Blur the xterm terminal on left-mousedown so the cursor cell that
   // ends up at the trailing edge of tmux's orange selection renders
   // without the bar/blink (via cursorInactiveStyle:'none'). The
   // companion document-level mouseup defers `focus()` restoration until
   // tmux moves the cursor back to the prompt (onCursorMove) or 500ms
   // elapsed, so the bar doesn't flicker back in the gap. Click-vs-drag
-  // is decided by mousemove > 3px — bare clicks skip both the arm and
-  // the trim window so a programmatic OSC 52 right after a focus-click
-  // isn't truncated.
+  // is decided by mousemove > 3px — bare clicks skip the
+  // deferred-restore arm and re-focus xterm immediately.
   el.addEventListener('mousedown', (e) => {
     activatePane(id);
     if (e.button !== 0) return;
@@ -302,13 +289,10 @@ function createPane(container) {
         .catch(() => { /* leave lastSent alone so the next refit retries */ });
     }, 150);
   });
-  // SELECTION_TRIM: hand selection-change copies through trimDragTail so
-  // tmux's trailing cursor-cell character is dropped. See module-level
-  // trimDragTail header for the rationale.
   term.onSelectionChange(() => {
     let sel = term.getSelection();
     if (!sel) return;
-    sel = trimDragTail(p, sel);
+    if (p._tmuxNeedsTrim) sel = sel.slice(0, -1);
     if (sel) copyText(sel);
   });
 
@@ -319,6 +303,11 @@ function createPane(container) {
   // the sync execCommand runs inside the activation window left by
   // the recent mouseup. Format: "<kind>;<base64>"; "?" means a read
   // request, which we don't service.
+  //
+  // OSC 1338 carries the target's `tmux -V` so the client can decide
+  // whether to trim the trailing cursor cell from drag-select payloads
+  // (tmux <3.4 includes it; 3.4+ does not). Handler-consumed so the
+  // marker never reaches the terminal renderer.
   if (term.parser && term.parser.registerOscHandler) {
     term.parser.registerOscHandler(52, data => {
       let semi = data.indexOf(';');
@@ -328,9 +317,16 @@ function createPane(container) {
       let text;
       try { text = atob(payload); } catch (e) { return false; }
       try { text = decodeURIComponent(escape(text)); } catch (e) {}
-      // SELECTION_TRIM: see trimDragTail header at module top.
-      text = trimDragTail(p, text);
-      copyText(text);
+      if (p._tmuxNeedsTrim) text = text.slice(0, -1);
+      if (text) copyText(text);
+      return true;
+    });
+    term.parser.registerOscHandler(1338, data => {
+      let m = /websh-tmux-version=tmux (\d+)\.(\d+)/.exec(data);
+      if (m) {
+        let major = +m[1], minor = +m[2];
+        p._tmuxNeedsTrim = major < 3 || (major === 3 && minor < 4);
+      }
       return true;
     });
   }
@@ -537,7 +533,7 @@ function _destroyPane(id, terminate) {
   // Cancel active transfers
   if (p.upload) { p.upload.cancelled = true; closeUploadSession(p.upload); }
   if (p.download) { p.download.cancelled = true; if (p.download.abort) p.download.abort(); }
-  // SELECTION_TRIM: drop any pending onCursorMove subscription / timer
+  // CURSOR_HIDE: drop any pending onCursorMove subscription / timer
   // pointing at the term we're about to dispose.
   _cancelDragBlurArm(p);
   // fitPaneWhenStable safety-valve timer. Without clearing it here, a
@@ -4118,7 +4114,7 @@ function toggleFullscreen(){
   document.addEventListener('touchcancel', endDrag);
 })();
 
-// SELECTION_TRIM: defer the focus restore on every drag-blurred pane.
+// CURSOR_HIDE: defer the focus restore on every drag-blurred pane.
 // Between mouseup and tmux's drag-end processing (copy-pipe-and-cancel
 // → cursor returns to the shell prompt) there's a ~50–200ms window
 // where the cursor still sits at end-of-orange. Calling focus()
@@ -4127,22 +4123,15 @@ function toggleFullscreen(){
 // onCursorMove (tmux moving the cursor back is the signal that copy-
 // mode is gone) and restore focus then. Fallback timer for sessions
 // where the cursor doesn't move on its own (raw shell, no tmux).
-// Click-without-drag panes restore immediately and skip the trim arm.
+// Click-without-drag panes restore immediately.
 document.addEventListener('mouseup', () => {
   Object.keys(panes).forEach(id => {
     let p = panes[id];
     if (!p || !p._dragBlurred) return;
     if (!p._dragMoved) {
-      // Bare click — no drag, no trim window, no defer.
-      // Clear any stale trim timestamp from a recent drag, otherwise a
-      // programmatic OSC 52 firing within DRAG_TRIM_WINDOW_MS of the
-      // earlier drag would still be trimmed even though the user has
-      // since just clicked.
-      p._recentDragSelectAt = 0;
       _restorePaneFromDrag(p);
       return;
     }
-    p._recentDragSelectAt = Date.now();
     // Defensive: cancel any stale subscription/timer from a prior drag.
     _cancelDragBlurArm(p);
     let restore = () => _restorePaneFromDrag(p);

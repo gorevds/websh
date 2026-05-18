@@ -317,8 +317,19 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     # re-attached via -A.
     for opt, val in (tmux_options or ()):
         attach += " \\; set -g " + opt + " " + val
+    # Before exec'ing tmux, emit an OSC 1338 marker carrying `tmux -V`
+    # on the target so the client can detect <3.4 (OSC 52 off-by-one)
+    # and conditionally trim the trailing cursor-cell from drag-select
+    # clipboard payloads. The OSC is consumed by an xterm.js handler
+    # (see websh.js → registerOscHandler(1338)) and never rendered.
+    # `tmux -V` typically outputs "tmux X.Y\n"; the trailing LF stays
+    # inside the OSC payload (OSC ends with ESC\, not LF).
+    probe = (
+        "printf '\\033]1338;websh-tmux-version=%s\\033\\\\' "
+        '"$(' + tmux_cmd + ' -V 2>&1)"\n'
+    )
     if ttl_seconds <= 0:
-        return "exec " + attach
+        return probe + "exec " + attach
 
     pidfile = "$HOME/.websh-ttl-" + slot_id + ".pid"
     seenfile = "$HOME/.websh-ttl-" + slot_id + ".seen"
@@ -356,7 +367,8 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
         "{ [ -f " + pidfile + " ] && "
           'kill -0 "$(cat ' + pidfile + ' 2>/dev/null)" 2>/dev/null; } || '
         "nohup sh -c '" + body + "' >/dev/null 2>&1 </dev/null &\n"
-        "exec " + attach
+        + probe
+        + "exec " + attach
     )
 
 

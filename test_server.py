@@ -3354,13 +3354,42 @@ class TestBuildRemoteCommand(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
         return r.returncode == 0, r.stderr
 
-    def test_ttl_zero_returns_plain_exec(self):
+    def test_ttl_zero_returns_probe_then_exec(self):
         cmd = server._build_remote_command("alice", "tmux", 0)
         self.assertEqual(
             cmd,
+            'printf \'\\033]1338;websh-tmux-version=%s\\033\\\\\' '
+            '"$(tmux -V 2>&1)"\n'
             'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
             ' \\; set -g mouse on'
             ' \\; set -g status off')
+
+    def test_osc_1338_probe_emitted_before_exec_for_ttl_zero(self):
+        """The version-probe must land before exec tmux so the client's
+        OSC 1338 handler runs at attach-time, before any drag-select can
+        produce an OSC 52 payload that would need conditional trim."""
+        cmd = server._build_remote_command("alice", "tmux", 0)
+        probe_idx = cmd.index("websh-tmux-version=%s")
+        exec_idx = cmd.index("exec tmux ")
+        self.assertLess(probe_idx, exec_idx,
+            "OSC 1338 probe must precede the exec tmux line")
+
+    def test_osc_1338_probe_emitted_before_exec_for_ttl_positive(self):
+        """Same ordering must hold in the watchdog branch: probe lands
+        between the watchdog spawn and the exec attach."""
+        cmd = server._build_remote_command("alice", "tmux", 3600)
+        probe_idx = cmd.index("websh-tmux-version=%s")
+        exec_idx = cmd.index("exec tmux ")
+        nohup_idx = cmd.index("nohup sh -c")
+        self.assertLess(nohup_idx, probe_idx)
+        self.assertLess(probe_idx, exec_idx)
+
+    def test_osc_1338_probe_uses_configured_tmux_cmd(self):
+        """Custom tmux paths must flow through the probe, so a non-PATH
+        tmux still reports its version."""
+        cmd = server._build_remote_command(
+            "alice", "/usr/local/bin/tmux", 0)
+        self.assertIn('"$(/usr/local/bin/tmux -V 2>&1)"', cmd)
 
     def test_ttl_negative_treated_as_disabled(self):
         # The _build function is called with TMUX_IDLE_TTL which is

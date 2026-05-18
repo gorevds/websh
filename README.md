@@ -39,6 +39,13 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 
 - **Backend.** Python 3.5+ with `ssh` in PATH. Stdlib only — no pip dependencies.
 - **Browser.** Any modern browser. xterm.js is loaded from a CDN.
+- **Optional persistent sessions.** `tmux 3.4+` recommended on the
+  target host. Older tmux releases include an extra cell in OSC 52
+  clipboard payloads; websh detects the target's tmux version at
+  attach (OSC 1338 from the session wrapper) and auto-trims the
+  trailing character on `<3.4`, so drag-select copy matches the visible
+  selection on every still-supported LTS. See
+  [`docs/persistent-sessions.md`](docs/persistent-sessions.md).
 - **Optional shared-hosting proxy.** PHP 5.3+ with the `curl` extension.
 - **Optional reverse proxy.** nginx, Caddy, or Apache.
 

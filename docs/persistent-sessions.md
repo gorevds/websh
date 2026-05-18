@@ -6,8 +6,22 @@ wrapped in a tmux session on the target host
 page, or restart `server.py` — the pane re-attaches to the same session
 with scrollback and running processes intact.
 
-**Requirements.** `tmux` must be installed on the target (any recent
-version). If it isn't, the connect flow surfaces a popup offering to
+**Requirements.** `tmux` 3.4 or newer is recommended on the target host
+for clean drag-select copy. Older releases (Ubuntu 22.04's 3.2a,
+Debian 12's 3.3a, RHEL 9 / Rocky 9's 3.2a, etc.) include an extra
+cursor-cell character in OSC 52 clipboard payloads, so drag-selecting
+`hello` produces an OSC 52 of `hello?` (where `?` is whatever sits at
+the cell tmux's cursor parks on after the selection). websh
+auto-detects the target's tmux version at attach: the session wrapper
+emits `OSC 1338;websh-tmux-version=tmux X.Y` before exec'ing tmux, the
+client's xterm.js handler parses it and flips a per-pane
+`_tmuxNeedsTrim` flag, and both the OSC 52 path and the synchronous
+`onSelectionChange` path trim one trailing character when set. On
+tmux 3.4+ the flag stays unset and payloads pass through unmodified.
+Unparseable `tmux -V` output (missing tmux, custom builds with
+non-`X.Y` versions) defaults to no-trim, which is the safe option
+since those targets won't have the off-by-one to begin with. If `tmux`
+isn't installed at all, the connect flow surfaces a popup offering to
 fall back to a short-lived (non-persistent) session instead.
 
 ## How reattach works
