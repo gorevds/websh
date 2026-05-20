@@ -39,6 +39,9 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 
 - **Backend.** Python 3.5+ with `ssh` in PATH. Stdlib only — no pip dependencies.
 - **Browser.** Any modern browser. xterm.js is loaded from a CDN.
+- **Optional persistent sessions.** `tmux` on the target host — any
+  reasonably recent version. See
+  [`docs/persistent-sessions.md`](docs/persistent-sessions.md).
 - **Optional shared-hosting proxy.** PHP 5.3+ with the `curl` extension.
 - **Optional reverse proxy.** nginx, Caddy, or Apache.
 
