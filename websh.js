@@ -2047,7 +2047,7 @@ function dismissConnectStatus() {
 
 // ── UI ──────────────────────────────────────────────────────────────
 function setTitle(label) {
-  document.title = label ? label + ' \u2014 websh' : 'websh \u2014 Lite but powerful web terminal';
+  document.title = label ? label + ' \u2014 websh' : 'websh \u2014 Powerful web terminal';
 }
 
 
