@@ -1275,7 +1275,14 @@ function handleOutputPayload(p, r) {
     // silently drop end-of-session output.
     updatePaneBadge(p);
     let chunk = atob(r.data);
-    p.term.write(Uint8Array.from(chunk, c => c.charCodeAt(0)));
+    // Tight loop instead of Uint8Array.from(chunk, c => c.charCodeAt(0)):
+    // this runs per output chunk on the hottest path (noisy output like
+    // `cat`/build logs), and the per-element callback in .from() is a
+    // measurable tax there. `chunk` (the binary string) is still needed
+    // below for recentOutput, so we don't route through _b64ToBytes.
+    let bytes = new Uint8Array(chunk.length);
+    for (let i = 0; i < chunk.length; i++) bytes[i] = chunk.charCodeAt(i);
+    p.term.write(bytes);
     // Keep a short tail of decoded output only while we're still
     // within the tmux-death detection window on a persistent pane.
     if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {

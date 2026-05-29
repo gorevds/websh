@@ -4651,6 +4651,27 @@ test('all cdn.jsdelivr.net assets carry SRI integrity + crossorigin', async () =
 });
 
 // =====================================================================
+// Regression for the base64-decode perf refactor (tight loop replacing
+// Uint8Array.from(...,cb)): output bytes must still round-trip EXACTLY,
+// including NUL, ESC and high (>=0x80) bytes.
+test('handleOutputPayload decodes base64 output to exact bytes', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  let captured = null;
+  p.term.write = (u) => { captured = u; };
+  const raw = [0x00, 0x1b, 0x5b, 0xff, 0x41, 0x80, 0x7f];
+  const b64 = win.btoa(String.fromCharCode.apply(null, raw));
+  win.handleOutputPayload(p, {data: b64});
+  ok(captured && captured.length === raw.length,
+     'wrote ' + raw.length + ' bytes; got ' + (captured && captured.length));
+  ok(captured && raw.every((b, i) => captured[i] === b),
+     'bytes match exactly; got ' + (captured && Array.from(captured)));
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
