@@ -4400,16 +4400,35 @@ test('describeUploadError: status 0, no bytes sent → read/reach failure', asyn
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
   const r = win.describeUploadError({status: 0}, null, {fileOffset: 0, fileSize: 100});
-  ok(r === 'could not read the file or reach the server',
-     'status 0 / 0 bytes; got ' + JSON.stringify(r));
+  ok(r.indexOf('could not start the upload') === 0 && r.indexOf('iCloud') !== -1,
+     'status 0 / 0 bytes points at iCloud/connection; got ' + JSON.stringify(r));
   cleanup(env);
 });
 
-test('describeUploadError: status 0, partial bytes → connection lost at pct', async () => {
+test('describeUploadError: status 0, partial bytes → stopped at pct', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
   const r = win.describeUploadError({status: 0}, null, {fileOffset: 50, fileSize: 200});
-  ok(r === 'connection lost at 25%', 'partial; got ' + JSON.stringify(r));
+  ok(r === 'the upload stopped at 25% (connection dropped, or the file became unreadable)',
+     'partial; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: partial pct clamps to 1..99 (no 0% / 100%)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const tiny = win.describeUploadError({status: 0}, null, {fileOffset: 1, fileSize: 1e9});
+  const huge = win.describeUploadError({status: 0}, null, {fileOffset: 999999999, fileSize: 1e9});
+  ok(tiny.indexOf('at 1%') !== -1, 'tiny chunk clamps to 1%; got ' + JSON.stringify(tiny));
+  ok(huge.indexOf('at 99%') !== -1, 'near-complete clamps to 99%; got ' + JSON.stringify(huge));
+  cleanup(env);
+});
+
+test('describeUploadError: non-string resp.error falls back to HTTP status', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 502}, {error: {nested: 'oops'}}, {});
+  ok(r === 'server error (HTTP 502)', 'no [object Object]; got ' + JSON.stringify(r));
   cleanup(env);
 });
 
@@ -4516,9 +4535,85 @@ test('upload network error surfaces a specific reason (iPhone case)', async () =
   win.handleUpload(p.id, {files: [{name: 'aidoc.pdf', size: 15000000}], value: ''});
   await sleep(5);
   const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
-  ok(text.textContent === 'Upload failed: could not read the file or reach the server',
-     'network-error reason; got ' + JSON.stringify(text.textContent));
+  ok(text.textContent.indexOf('Upload failed: could not start the upload') === 0
+     && text.textContent.indexOf('iCloud') !== -1,
+     'network-error reason names iCloud/connection; got ' + JSON.stringify(text.textContent));
   ok(captured !== null, 'xhr.send was reached');
+  cleanup(env);
+});
+
+// Real XHR fires xhr.upload.onprogress (setting u.fileOffset) before
+// onerror — this exercises that whole chain so "stopped at N%" is proven
+// end-to-end, not just in the formatter.
+test('upload mid-stream drop reports the percentage reached (onprogress chain)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; }
+    open() {} setRequestHeader() {} abort() {}
+    send() {
+      if (this.upload.onprogress) this.upload.onprogress({loaded: 3000000});
+      if (this.onerror) this.onerror();
+    }
+  };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.sid = 's1'; p.host = 'h';
+  win.handleUpload(p.id, {files: [{name: 'mid.bin', size: 12000000}], value: ''});
+  await sleep(5);
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent === 'Upload failed: the upload stopped at 25% (connection dropped, or the file became unreadable)',
+     'mid-stream pct from onprogress; got ' + JSON.stringify(text.textContent));
+  cleanup(env);
+});
+
+// finalize succeeded the upload (200) but the move into cwd failed — the
+// banner must say bytes landed, not bare "Upload failed", and must not
+// leak "$HOME" or the raw server string.
+test('upload finalize failure reports bytes-landed without jargon', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'upload_finalize', response: {error: 'control socket not ready'}},
+  ]);
+  const win = env.win;
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 200;
+      this.responseText = JSON.stringify({ok: true, bytes: 10}); }
+    open() {} setRequestHeader() {} abort() {}
+    send() { if (this.onload) this.onload(); }
+  };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.sid = 's1'; p.host = 'h'; p.persistent = true;
+  win.handleUpload(p.id, {files: [{name: 'doc.pdf', size: 10}], value: ''});
+  await sleep(20);
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent === 'Upload failed: the file was uploaded to your home folder but could not be moved into the current directory',
+     'finalize-fail message; got ' + JSON.stringify(text.textContent));
+  ok(text.textContent.indexOf('$HOME') === -1, 'no $HOME jargon');
+  ok(text.textContent.indexOf('control socket') === -1, 'no raw server string');
+  cleanup(env);
+});
+
+// The dwell time is the whole reason the diff exists — a failure banner
+// must linger long enough (6000ms) to read the reason, while a trivial
+// success still clears fast (2000ms).
+test('failure banner lingers 6s, trivial success clears in 2s', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const delays = [];
+  const realSetTimeout = win.setTimeout;
+  win.setTimeout = function (fn, ms) { delays.push(ms); return realSetTimeout.call(win, function () {}, 100000); };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.upload = {staged: [], placed: []};
+  win.finishUpload(p, false, 'something went wrong');
+  ok(delays.indexOf(6000) !== -1, 'failure dwell is 6000ms; got ' + JSON.stringify(delays));
+  delays.length = 0;
+  p.upload = {staged: [], placed: []};
+  win.finishUpload(p, true);
+  ok(delays.indexOf(2000) !== -1, 'trivial-success dwell is 2000ms; got ' + JSON.stringify(delays));
+  win.setTimeout = realSetTimeout;
   cleanup(env);
 });
 

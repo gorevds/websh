@@ -3164,13 +3164,25 @@ function describeUploadError(xhr, resp, u) {
   // browser hides the detail for privacy, so we infer from how far we got.
   if (!xhr.status) {
     if (u && u.fileOffset > 0) {
+      // Clamp to 1..99: a tiny first chunk rounds to 0% and a drop after
+      // the last progress event rounds to 100%, both of which read as
+      // nonsense for a connection that was clearly interrupted mid-flight.
       let pct = u.fileSize > 0
-        ? Math.round(u.fileOffset / u.fileSize * 100) : 0;
-      return 'connection lost at ' + pct + '%';
+        ? Math.min(99, Math.max(1, Math.round(u.fileOffset / u.fileSize * 100)))
+        : 0;
+      return 'the upload stopped at ' + pct +
+        '% (connection dropped, or the file became unreadable)';
     }
-    return 'could not read the file or reach the server';
+    // The motivating case: iOS Safari hands XHR an un-downloaded iCloud
+    // stub whose read fails the instant send() touches it — so steer the
+    // user to the actual fix rather than a generic network message.
+    return 'could not start the upload — if the file is in iCloud/Drive,' +
+      ' open it once to download it, then retry; otherwise check your connection';
   }
-  let err = resp && resp.error ? String(resp.error) : '';
+  // Only the server's own string {error:<string>} is a usable reason; a
+  // proxy returning {error:{...}} or {error:123} must not become
+  // "[object Object]" — fall through to the HTTP-status line instead.
+  let err = resp && typeof resp.error === 'string' ? resp.error : '';
   switch (err) {
     case 'file too large':   return 'file is larger than the server allows';
     case 'empty body':       return 'the file is empty';
@@ -3237,10 +3249,17 @@ function uploadNextFile(p) {
       uploadNextFile(p);
     })
     // Bytes already landed at $HOME/<tmp>; only the move into the cwd
-    // failed. Say so — "Upload failed" alone would be misleading.
+    // failed. Lead with the reassuring plain-language fact and drop the
+    // raw server string + the "$HOME" jargon from the banner (the detail
+    // is still logged below). Guard on u.cancelled like the .then() above,
+    // so a finalize rejection that lands during the cancel window doesn't
+    // clobber the "Cancelled" banner.
     .catch((err) => {
-      finishUpload(p, false, 'saved to $HOME but could not be moved into place'
-        + (err ? ': ' + err : ''));
+      if (!u || u.cancelled) return;
+      if (err) console.warn('websh: upload finalize failed:', err);
+      finishUpload(p, false,
+        'the file was uploaded to your home folder but could not be moved' +
+        ' into the current directory');
     });
   };
   xhr.onerror = () => {
