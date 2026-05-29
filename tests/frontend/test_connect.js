@@ -4637,6 +4637,19 @@ test('upload server 413 surfaces the too-large reason', async () => {
   cleanup(env);
 });
 
+// Every third-party (jsdelivr CDN) <script>/<link> on the credential page
+// must carry Subresource Integrity + crossorigin, so a CDN/MITM swap can't
+// inject code into the page that handles SSH passwords and the vault.
+test('all cdn.jsdelivr.net assets carry SRI integrity + crossorigin', async () => {
+  const tags = html.match(/<(?:script|link)\b[^>]*cdn\.jsdelivr\.net[^>]*>/g) || [];
+  ok(tags.length >= 6, 'expected the 6 xterm CDN tags; got ' + tags.length);
+  tags.forEach(t => {
+    ok(/\sintegrity="sha384-[A-Za-z0-9+/=]+"/.test(t),
+       'missing SRI integrity on: ' + t);
+    ok(/\scrossorigin=/.test(t), 'missing crossorigin on: ' + t);
+  });
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
