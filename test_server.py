@@ -5639,6 +5639,35 @@ class TestDownloadHTTPDispatch(unittest.TestCase):
         self.assertIsInstance(fake_session.last_activity, (int, float))
         self.assertGreater(fake_session.last_activity, 0)
 
+    def test_unknown_size_download_aborts_past_cap(self):
+        """When stat fails the header is 'OK\\t-1' and content_length stays
+        None, so the upfront 413 is skipped. The streaming loop must still
+        bound the bytes and kill the side-channel, or a growing/unbounded
+        file (a live log, /dev/zero, a fifo) pins the worker forever."""
+        from urllib.request import urlopen
+        sid = str(uuid.uuid4())
+        header = b"OK\t-1\n"          # stat failed -> unknown size
+        big_chunk = b"Z" * 4096
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout.read.side_effect = (
+            [bytes([b]) for b in header[:-1]] + [b"\n"] +
+            [big_chunk, big_chunk, b""]
+        )
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.object(server, "MAX_DOWNLOAD_SIZE", 1000), \
+             unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            url = self._url("session_id={}&path=/tmp/grow.log".format(sid))
+            with urlopen(url) as resp:
+                body = resp.read()
+        # Bytes sent are bounded near the cap, not the full 8192 streamed.
+        self.assertLessEqual(len(body), 1000 + len(big_chunk))
+        # The side-channel ssh was killed to stop the runaway stream.
+        deadline = time.time() + 2.0
+        while time.time() < deadline and not fake_proc.kill.called:
+            time.sleep(0.01)
+        self.assertTrue(fake_proc.kill.called, "runaway download not aborted")
+
 
 class TestAccessLogEmit(unittest.TestCase):
     """Unit tests for _access_log_emit (the JSON-line writer)."""
