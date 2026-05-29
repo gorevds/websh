@@ -3414,6 +3414,13 @@ function startFastDownload(id, path) {
       }
       let chunks = [], received = 0;
       let reader = resp.body.getReader();
+      // Cache the progress nodes once. pump() runs per stream chunk, so
+      // re-querying three selectors every chunk is needless DOM work on a
+      // large download; the nodes are stable for the pane's lifetime.
+      let progBar = p.el && p.el.querySelector(
+        '[data-upload-progress] .upload-progress-bar');
+      let progText = p.el && p.el.querySelector(
+        '[data-upload-progress] .upload-progress-text');
       function pump() {
         return reader.read().then(({done, value}) => {
           if (done) return;
@@ -3427,14 +3434,13 @@ function startFastDownload(id, path) {
             throw new Error('download exceeded ' +
               (MAX_DOWNLOAD_BYTES / 1073741824).toFixed(0) + ' GB cap');
           }
-          let el = p.el && p.el.querySelector('[data-upload-progress]');
-          if (el) {
+          if (progBar) {
             let pct = total > 0 ? Math.round(received / total * 100) : 30;
-            el.querySelector('.upload-progress-bar').style.width = pct + '%';
+            progBar.style.width = pct + '%';
             let sz = received < 1048576
               ? Math.round(received / 1024) + ' KB'
               : (received / 1048576).toFixed(1) + ' MB';
-            el.querySelector('.upload-progress-text').textContent = filename + ' (' + sz + ')';
+            if (progText) progText.textContent = filename + ' (' + sz + ')';
           }
           return pump();
         });
