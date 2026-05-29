@@ -3664,9 +3664,24 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             BUF = 256 * 1024
+            sent = 0
             while True:
                 chunk = proc.stdout.read(BUF)
                 if not chunk:
+                    break
+                sent += len(chunk)
+                # Hard ceiling on bytes actually streamed. The upfront 413
+                # only fires when stat reported a size; when stat failed
+                # (header was "OK\t-1") content_length is None and that
+                # check is skipped, and a file that grows after stat (a log
+                # being appended, /dev/zero, a fifo) can stream forever and
+                # pin this worker. Abort once we cross the cap regardless of
+                # whether the size was known — the client gets a truncated
+                # download, which is the right outcome for an over-cap file.
+                if sent > MAX_DOWNLOAD_SIZE:
+                    _log("WARN", "download exceeded MAX_DOWNLOAD_SIZE, "
+                         "aborting sid={} path={}".format(sid, path))
+                    proc.kill()
                     break
                 self.wfile.write(chunk)
                 self.wfile.flush()
