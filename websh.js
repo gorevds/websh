@@ -2677,7 +2677,7 @@ function renderSaved() {
     let nokeyTag = nokey ? ' <span class="sv-kind sv-nokey" title="No vault key in this browser — cannot connect; delete to clean up">no key</span>' : '';
     div.innerHTML=
       `<div class="sv-info"><div class="sv-name">${esc(c.name)}</div>`+
-      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${c.port}${suffix}${nokeyTag}</div></div>`+
+      `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${Number(c.port) || 22}${suffix}${nokeyTag}</div></div>`+
       `<div class="sv-actions"><button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
     el.appendChild(div);
   });
@@ -3044,7 +3044,7 @@ function renderServerConnections() {
     let userDisplay = c.username || (c.allowed_users && c.allowed_users.length===1 ? c.allowed_users[0] : '<em>user</em>');
     let kindBadge = c.kind === 'prompt' ? `<span class="sv-kind" title="Password required on click">prompt</span>` : '';
     div.innerHTML=`<div class="sv-info"><div class="sv-name">${esc(c.name)}${kindBadge}</div>`+
-      `<div class="sv-host">${userDisplay}@${esc(c.host)}:${c.port}</div></div>`;
+      `<div class="sv-host">${userDisplay}@${esc(c.host)}:${Number(c.port) || 22}</div></div>`;
     el.appendChild(div);
   });
   el.onclick=e => {let row=e.target.closest('.sv');if(!row)return;connectByName(row.getAttribute('data-name'))};
