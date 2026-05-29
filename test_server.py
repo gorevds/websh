@@ -7119,5 +7119,37 @@ class TestBodySizeCap(unittest.TestCase):
         self.assertEqual(h._body(), b"")
 
 
+class TestCleanupLockContention(unittest.TestCase):
+    """cleanup() must not hold sessions_lock while calling session.close(),
+    which blocks for up to ~0.5s (SIGTERM -> WNOHANG polls -> SIGKILL ->
+    waitpid). Holding the lock across that stalls every endpoint."""
+
+    def test_cleanup_releases_lock_before_close(self):
+        observed = {}
+
+        class FakeExpired(object):
+            def is_expired(self_):
+                return True
+
+            def close(self_):
+                # sessions_lock is a plain (non-reentrant) Lock, so if
+                # cleanup() still held it, this non-blocking acquire — even
+                # from the same thread — returns False.
+                got = server.sessions_lock.acquire(blocking=False)
+                observed["lock_free_during_close"] = got
+                if got:
+                    server.sessions_lock.release()
+
+        sid = str(uuid.uuid4())
+        with unittest.mock.patch.dict(
+                server.sessions, {sid: FakeExpired()}, clear=True):
+            server.cleanup()
+            self.assertNotIn(sid, server.sessions,
+                             "expired session should be removed")
+        self.assertTrue(
+            observed.get("lock_free_during_close"),
+            "cleanup() held sessions_lock while calling close()")
+
+
 if __name__ == "__main__":
     unittest.main()

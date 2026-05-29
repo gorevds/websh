@@ -2360,12 +2360,24 @@ class SSHSession(object):
 
 def cleanup():
     """Remove timed-out sessions and stale rate limit entries."""
+    # Pop expired sessions OUT of the registry under the lock, then close
+    # them OUTSIDE it. close() does SIGTERM -> up to ~0.5s of WNOHANG polls
+    # -> SIGKILL -> a blocking waitpid; holding sessions_lock across that
+    # stalls every endpoint that takes the lock (input/output/connect/
+    # disconnect/stream). close() only touches per-session state, never the
+    # registry, so running it unlocked is safe.
+    expired = []
     with sessions_lock:
-        expired = [sid for sid, s in sessions.items() if s.is_expired()]
-        for sid in expired:
-            _log("INFO", "session {} expired, cleaning up".format(sid))
-            sessions[sid].close()
-            del sessions[sid]
+        for sid in [sid for sid, s in sessions.items() if s.is_expired()]:
+            expired.append((sid, sessions.pop(sid)))
+    for sid, s in expired:
+        _log("INFO", "session {} expired, cleaning up".format(sid))
+        # Isolate each close so one wedged teardown can't skip the rest of
+        # the batch (the session is already out of the registry regardless).
+        try:
+            s.close()
+        except Exception as e:
+            _log("WARN", "session {} close failed: {}".format(sid, e))
     # Prune stale rate limit entries to prevent unbounded memory growth
     now = time.time()
     cutoff = now - RATE_LIMIT_WINDOW
