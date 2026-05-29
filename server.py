@@ -3189,6 +3189,14 @@ class Handler(BaseHTTPRequestHandler):
                 session = sessions.get(sid)
                 if session is None:
                     break
+                # During the connect window the registry entry is a
+                # _SessionPlaceholder, whose __slots__ omit _stream_active —
+                # dereferencing it would raise AttributeError out of do_GET
+                # (500 / crashed worker). Treat a not-yet-real session as
+                # not-found so the client (EventSource) simply retries.
+                if isinstance(session, _SessionPlaceholder):
+                    session = None
+                    break
                 if not session._stream_active:
                     session._stream_active = True
                     break

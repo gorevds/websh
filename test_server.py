@@ -1268,6 +1268,22 @@ class TestHTTPApi(unittest.TestCase):
         self.assertEqual(code, 404)
         self.assertIn("error", body)
 
+    def test_stream_on_placeholder_session_404s_not_500(self):
+        """During the connect window the registry holds a _SessionPlaceholder
+        (no _stream_active slot). /api/stream must treat it as not-ready and
+        404, not dereference the missing attr and crash the worker (500)."""
+        sid = str(uuid.uuid4())
+        placeholder = server._SessionPlaceholder("1.2.3.4", False)
+        with server.sessions_lock:
+            server.sessions[sid] = placeholder
+        try:
+            body, code = self._get("/api/stream?session_id=" + sid)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+        self.assertEqual(code, 404)
+        self.assertIn("error", body)
+
     def test_stream_happy_path(self):
         """Plant a fake session that emits one chunk then dies.
         Verify SSE headers, the initial ': ok' comment, the encoded
