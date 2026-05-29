@@ -7250,5 +7250,50 @@ class TestReapChild(unittest.TestCase):
                 pass
 
 
+class TestSecurityHeaders(unittest.TestCase):
+    """The credential-handling page must ship CSP + companion hardening
+    headers, and the CSP must still permit what the app actually loads."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 18799
+        server.PORT = cls.port
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", cls.port), server.Handler)
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def _headers(self, path):
+        from urllib.request import urlopen
+        with urlopen("http://127.0.0.1:{}{}".format(self.port, path)) as r:
+            return r.headers
+
+    def test_index_emits_hardening_headers(self):
+        h = self._headers("/")
+        self.assertIsNotNone(h.get("Content-Security-Policy"))
+        self.assertIn("frame-ancestors 'none'",
+                      h.get("Content-Security-Policy"))
+        self.assertEqual(h.get("X-Content-Type-Options"), "nosniff")
+        self.assertEqual(h.get("X-Frame-Options"), "DENY")
+        self.assertEqual(h.get("Referrer-Policy"), "no-referrer")
+
+    def test_csp_permits_what_the_app_loads(self):
+        csp = self._headers("/").get("Content-Security-Policy")
+        # Must not break the real app: self scripts, the xterm CDN, Google
+        # Fonts, and data: URIs are all in use today.
+        self.assertIn("script-src 'self'", csp)
+        self.assertIn("https://cdn.jsdelivr.net", csp)
+        self.assertIn("https://fonts.googleapis.com", csp)
+        self.assertIn("img-src 'self' data:", csp)
+        self.assertIn("connect-src 'self'", csp)
+
+
 if __name__ == "__main__":
     unittest.main()
