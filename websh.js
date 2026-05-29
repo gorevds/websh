@@ -1609,6 +1609,17 @@ async function connectPane(p, opts) {
 
   api('connect', {body: body})
     .then(r => {
+      // The pane may have been destroyed while /api/connect was in flight
+      // (tab closed, vault sign-out teardown, rapid reconnect churn). Every
+      // other async path guards on panes[p.id] === p; this one must too, or
+      // it re-arms keepalive/output timers on a dead pane and — worse —
+      // leaks the server PTY that connect just created. Reap the orphan.
+      if (panes[p.id] !== p) {
+        if (r && r.session_id) {
+          api('disconnect', {body: {session_id: r.session_id}}).catch(() => {});
+        }
+        return;
+      }
       console.log('connect result:', r);
       p.connecting = false;
       if (r.error) { p.pendingSave = null; showErr(r.error); updatePaneBadge(p); return }

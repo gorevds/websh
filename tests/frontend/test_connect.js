@@ -4754,6 +4754,33 @@ test('OSC 52 preserves a leading BOM and keeps raw bytes on invalid UTF-8', asyn
 });
 
 // =====================================================================
+// connectPane must not act on a pane destroyed while /api/connect is in
+// flight: it would re-arm timers on a dead pane and leak the server PTY
+// that connect just created. The guard reaps the orphan session instead.
+test('connectPane reaps the orphan session when the pane is destroyed mid-connect', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'orphan-sid', alive: true}, delay: 60},
+    {action: 'disconnect', response: {ok: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win; const log = env.log;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  win.connectPane(p, {label: 'x', host: '10.0.0.9', user: 'a', password: 'p', persistent: false});
+  await sleep(20);                 // connect still in flight (delay 60)
+  win._destroyPane(p.id, false);   // p.sid still null here, so destroy sends no disconnect
+  await sleep(140);                // let the connect promise resolve
+  const discs = log.filter(e => e.action === 'disconnect' &&
+    e.body && e.body.session_id === 'orphan-sid');
+  ok(discs.length >= 1, 'orphan session disconnected; got ' + discs.length);
+  ok(p.sid !== 'orphan-sid', 'dead pane not activated; sid=' + p.sid);
+  ok(p.polling !== true, 'no polling armed on dead pane; polling=' + p.polling);
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
