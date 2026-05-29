@@ -3152,6 +3152,59 @@ function foregroundMv(p, fname, tmp) {
                                 data: makeUploadMvCmd(fname, tmp) } });
 }
 
+// Turn a failed upload into a reason that names the actual problem.
+// The server already returns a precise {error} string with a matching
+// HTTP status (see server.py _upload) — we surface that instead of a
+// generic "failed", and translate the machine-y codes into plain
+// language. `u` is the in-flight upload state (for byte progress).
+function describeUploadError(xhr, resp, u) {
+  // status 0 = the request never completed: DNS/TLS/connection, or the
+  // file couldn't be read off disk. iOS Safari hands XHR an un-downloaded
+  // iCloud stub whose read fails the instant send() touches it — the
+  // browser hides the detail for privacy, so we infer from how far we got.
+  if (!xhr.status) {
+    if (u && u.fileOffset > 0) {
+      // Clamp to 1..99: a tiny first chunk rounds to 0% and a drop after
+      // the last progress event rounds to 100%, both of which read as
+      // nonsense for a connection that was clearly interrupted mid-flight.
+      let pct = u.fileSize > 0
+        ? Math.min(99, Math.max(1, Math.round(u.fileOffset / u.fileSize * 100)))
+        : 0;
+      return 'the upload stopped at ' + pct +
+        '% (connection dropped, or the file became unreadable)';
+    }
+    // The motivating case: iOS Safari hands XHR an un-downloaded iCloud
+    // stub whose read fails the instant send() touches it — so steer the
+    // user to the actual fix rather than a generic network message.
+    return 'could not start the upload — if the file is in iCloud/Drive,' +
+      ' open it once to download it, then retry; otherwise check your connection';
+  }
+  // Only the server's own string {error:<string>} is a usable reason; a
+  // proxy returning {error:{...}} or {error:123} must not become
+  // "[object Object]" — fall through to the HTTP-status line instead.
+  let err = resp && typeof resp.error === 'string' ? resp.error : '';
+  switch (err) {
+    case 'file too large':   return 'file is larger than the server allows';
+    case 'empty body':       return 'the file is empty';
+    case 'invalid path':     return 'the file name was rejected by the server';
+    case 'session not found':
+    case 'session is dead':  return 'the terminal session is no longer connected';
+    case 'control socket not ready':
+      return 'the connection to the host is not ready yet';
+    case 'ssh side-channel timeout':
+      return 'timed out sending the file to the host';
+    case 'client sent fewer bytes than Content-Length':
+      return 'the upload was interrupted before all bytes arrived';
+  }
+  // e.g. "ssh exit 1: ...No space left on device" or "stream error: ..."
+  // — the remote-side reason is the useful part, keep it verbatim.
+  if (err.indexOf('ssh exit') === 0 || err.indexOf('stream error') === 0) {
+    return 'host rejected the file (' + err + ')';
+  }
+  if (err) return err;
+  return 'server error (HTTP ' + xhr.status + ')';
+}
+
 function uploadNextFile(p) {
   let u = p.upload;
   if (!u || u.cancelled) return;
@@ -3182,7 +3235,7 @@ function uploadNextFile(p) {
     let resp = null;
     try { resp = JSON.parse(xhr.responseText); } catch(e) {}
     if (xhr.status !== 200 || !resp || !resp.ok) {
-      finishUpload(p, false); return;
+      finishUpload(p, false, describeUploadError(xhr, resp, u)); return;
     }
     finalizeUploadedFile(p, file).then(() => {
       if (!u || u.cancelled) return;
@@ -3195,9 +3248,23 @@ function uploadNextFile(p) {
       updateUploadProgress(p);
       uploadNextFile(p);
     })
-    .catch(() => { finishUpload(p, false); });
+    // Bytes already landed at $HOME/<tmp>; only the move into the cwd
+    // failed. Lead with the reassuring plain-language fact and drop the
+    // raw server string + the "$HOME" jargon from the banner (the detail
+    // is still logged below). Guard on u.cancelled like the .then() above,
+    // so a finalize rejection that lands during the cancel window doesn't
+    // clobber the "Cancelled" banner.
+    .catch((err) => {
+      if (!u || u.cancelled) return;
+      if (err) console.warn('websh: upload finalize failed:', err);
+      finishUpload(p, false,
+        'the file was uploaded to your home folder but could not be moved' +
+        ' into the current directory');
+    });
   };
-  xhr.onerror = () => { if (u && !u.cancelled) finishUpload(p, false); };
+  xhr.onerror = () => {
+    if (u && !u.cancelled) finishUpload(p, false, describeUploadError(xhr, null, u));
+  };
   xhr.send(file);
 }
 
@@ -3241,7 +3308,7 @@ function closeUploadSession(u) {
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
 }
 
-function finishUpload(p, success) {
+function finishUpload(p, success, reason) {
   if (!p.upload) return;
   let u = p.upload;
   u.cancelled = true;
@@ -3268,12 +3335,13 @@ function finishUpload(p, success) {
       }
     } else {
       bar.style.background = 'var(--dg)';
-      text.textContent = 'Upload failed';
+      text.textContent = reason ? 'Upload failed: ' + reason : 'Upload failed';
     }
   }
-  // Banner stays visible longer when there's a path the user needs to
-  // act on, so they have time to read it before it disappears.
-  let dismissAfter = (success && (staged.length || placed.length === 1))
+  // Banner stays visible longer when there's something the user needs to
+  // read and act on — a destination path, or a specific failure reason —
+  // so it doesn't vanish before they can take it in.
+  let dismissAfter = (!success || staged.length || placed.length === 1)
     ? 6000 : 2000;
   setTimeout(() => {
     p.upload = null;

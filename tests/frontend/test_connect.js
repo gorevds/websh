@@ -4392,6 +4392,252 @@ test('Escape inside search input closes the bar', async () => {
 });
 
 // =====================================================================
+// Upload error reporting: the banner must name the actual problem, not a
+// generic "Upload failed". describeUploadError() turns a failed XHR +
+// server {error} into a specific, human reason; finishUpload() renders it.
+
+test('describeUploadError: status 0, no bytes sent → read/reach failure', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 0}, null, {fileOffset: 0, fileSize: 100});
+  ok(r.indexOf('could not start the upload') === 0 && r.indexOf('iCloud') !== -1,
+     'status 0 / 0 bytes points at iCloud/connection; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: status 0, partial bytes → stopped at pct', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 0}, null, {fileOffset: 50, fileSize: 200});
+  ok(r === 'the upload stopped at 25% (connection dropped, or the file became unreadable)',
+     'partial; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: partial pct clamps to 1..99 (no 0% / 100%)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const tiny = win.describeUploadError({status: 0}, null, {fileOffset: 1, fileSize: 1e9});
+  const huge = win.describeUploadError({status: 0}, null, {fileOffset: 999999999, fileSize: 1e9});
+  ok(tiny.indexOf('at 1%') !== -1, 'tiny chunk clamps to 1%; got ' + JSON.stringify(tiny));
+  ok(huge.indexOf('at 99%') !== -1, 'near-complete clamps to 99%; got ' + JSON.stringify(huge));
+  cleanup(env);
+});
+
+test('describeUploadError: non-string resp.error falls back to HTTP status', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 502}, {error: {nested: 'oops'}}, {});
+  ok(r === 'server error (HTTP 502)', 'no [object Object]; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: server "file too large" → plain language', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 413}, {error: 'file too large'}, {});
+  ok(r === 'file is larger than the server allows', 'too large; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: server "empty body" → the file is empty', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 400}, {error: 'empty body'}, {});
+  ok(r === 'the file is empty', 'empty; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: dead session → session no longer connected', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r1 = win.describeUploadError({status: 502}, {error: 'session is dead'}, {});
+  const r2 = win.describeUploadError({status: 404}, {error: 'session not found'}, {});
+  ok(r1 === 'the terminal session is no longer connected', 'dead; got ' + JSON.stringify(r1));
+  ok(r2 === 'the terminal session is no longer connected', 'notfound; got ' + JSON.stringify(r2));
+  cleanup(env);
+});
+
+test('describeUploadError: side-channel timeout → timed out sending', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 502}, {error: 'ssh side-channel timeout'}, {});
+  ok(r === 'timed out sending the file to the host', 'timeout; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: short-count → interrupted before all bytes', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError(
+    {status: 502}, {error: 'client sent fewer bytes than Content-Length'}, {});
+  ok(r === 'the upload was interrupted before all bytes arrived',
+     'short-count; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: ssh exit keeps verbatim host reason', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError(
+    {status: 502}, {error: 'ssh exit 1: No space left on device'}, {});
+  ok(r.indexOf('No space left on device') !== -1,
+     'ssh exit reason preserved; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('describeUploadError: no JSON body → falls back to HTTP status', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const r = win.describeUploadError({status: 502}, null, {});
+  ok(r === 'server error (HTTP 502)', 'no-body fallback; got ' + JSON.stringify(r));
+  cleanup(env);
+});
+
+test('finishUpload renders the specific reason in the banner', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.upload = {staged: [], placed: []};
+  win.finishUpload(p, false, 'file is larger than the server allows');
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent === 'Upload failed: file is larger than the server allows',
+     'specific reason rendered; got ' + JSON.stringify(text.textContent));
+  cleanup(env);
+});
+
+test('finishUpload with no reason keeps the bare failure message', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.upload = {staged: [], placed: []};
+  win.finishUpload(p, false);
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent === 'Upload failed', 'bare message; got ' + JSON.stringify(text.textContent));
+  cleanup(env);
+});
+
+test('upload network error surfaces a specific reason (iPhone case)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  // Minimal XHR fake: send() drives the outcome via the injected behavior.
+  let captured = null;
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; }
+    open() {} setRequestHeader() {} abort() {}
+    send() { captured = this; if (this.onerror) this.onerror(); }
+  };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.sid = 's1'; p.host = 'h';
+  win.handleUpload(p.id, {files: [{name: 'aidoc.pdf', size: 15000000}], value: ''});
+  await sleep(5);
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent.indexOf('Upload failed: could not start the upload') === 0
+     && text.textContent.indexOf('iCloud') !== -1,
+     'network-error reason names iCloud/connection; got ' + JSON.stringify(text.textContent));
+  ok(captured !== null, 'xhr.send was reached');
+  cleanup(env);
+});
+
+// Real XHR fires xhr.upload.onprogress (setting u.fileOffset) before
+// onerror — this exercises that whole chain so "stopped at N%" is proven
+// end-to-end, not just in the formatter.
+test('upload mid-stream drop reports the percentage reached (onprogress chain)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; }
+    open() {} setRequestHeader() {} abort() {}
+    send() {
+      if (this.upload.onprogress) this.upload.onprogress({loaded: 3000000});
+      if (this.onerror) this.onerror();
+    }
+  };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.sid = 's1'; p.host = 'h';
+  win.handleUpload(p.id, {files: [{name: 'mid.bin', size: 12000000}], value: ''});
+  await sleep(5);
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent === 'Upload failed: the upload stopped at 25% (connection dropped, or the file became unreadable)',
+     'mid-stream pct from onprogress; got ' + JSON.stringify(text.textContent));
+  cleanup(env);
+});
+
+// finalize succeeded the upload (200) but the move into cwd failed — the
+// banner must say bytes landed, not bare "Upload failed", and must not
+// leak "$HOME" or the raw server string.
+test('upload finalize failure reports bytes-landed without jargon', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'upload_finalize', response: {error: 'control socket not ready'}},
+  ]);
+  const win = env.win;
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 200;
+      this.responseText = JSON.stringify({ok: true, bytes: 10}); }
+    open() {} setRequestHeader() {} abort() {}
+    send() { if (this.onload) this.onload(); }
+  };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.sid = 's1'; p.host = 'h'; p.persistent = true;
+  win.handleUpload(p.id, {files: [{name: 'doc.pdf', size: 10}], value: ''});
+  await sleep(20);
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent === 'Upload failed: the file was uploaded to your home folder but could not be moved into the current directory',
+     'finalize-fail message; got ' + JSON.stringify(text.textContent));
+  ok(text.textContent.indexOf('$HOME') === -1, 'no $HOME jargon');
+  ok(text.textContent.indexOf('control socket') === -1, 'no raw server string');
+  cleanup(env);
+});
+
+// The dwell time is the whole reason the diff exists — a failure banner
+// must linger long enough (6000ms) to read the reason, while a trivial
+// success still clears fast (2000ms).
+test('failure banner lingers 6s, trivial success clears in 2s', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const delays = [];
+  const realSetTimeout = win.setTimeout;
+  win.setTimeout = function (fn, ms) { delays.push(ms); return realSetTimeout.call(win, function () {}, 100000); };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.upload = {staged: [], placed: []};
+  win.finishUpload(p, false, 'something went wrong');
+  ok(delays.indexOf(6000) !== -1, 'failure dwell is 6000ms; got ' + JSON.stringify(delays));
+  delays.length = 0;
+  p.upload = {staged: [], placed: []};
+  win.finishUpload(p, true);
+  ok(delays.indexOf(2000) !== -1, 'trivial-success dwell is 2000ms; got ' + JSON.stringify(delays));
+  win.setTimeout = realSetTimeout;
+  cleanup(env);
+});
+
+test('upload server 413 surfaces the too-large reason', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 413;
+      this.responseText = JSON.stringify({error: 'file too large'}); }
+    open() {} setRequestHeader() {} abort() {}
+    send() { if (this.onload) this.onload(); }
+  };
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  p.sid = 's1'; p.host = 'h';
+  win.handleUpload(p.id, {files: [{name: 'big.bin', size: 9e9}], value: ''});
+  await sleep(5);
+  const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
+  ok(text.textContent === 'Upload failed: file is larger than the server allows',
+     '413 reason; got ' + JSON.stringify(text.textContent));
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
