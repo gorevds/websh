@@ -4672,6 +4672,27 @@ test('handleOutputPayload decodes base64 output to exact bytes', async () => {
 });
 
 // =====================================================================
+// c.port was the one un-esc()'d value interpolated into the saved-card
+// innerHTML. Coercing it to a Number closes a would-be stored-XSS hole if
+// a non-numeric port ever reaches a saved record (import/restore, bug).
+test('renderSaved coerces a non-numeric port to a number (no injection)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'x', host: 'h', user: 'u',
+     port: '22"><img src=x onerror=window.__xss=1>', auth: 'pw', persistent: false},
+  ]));
+  win.renderSaved();
+  const host = win.document.querySelector('.sv-host');
+  ok(host, 'rendered a saved card');
+  ok(host && host.innerHTML.indexOf('<img') === -1,
+     'no injected markup in host line; got ' + (host && host.innerHTML));
+  ok(host && host.textContent.indexOf(':22') !== -1,
+     'port shown as the fallback number; got ' + (host && host.textContent));
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
