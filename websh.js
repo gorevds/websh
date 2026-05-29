@@ -310,9 +310,22 @@ function createPane(container) {
       if (semi < 0) return false;
       let payload = data.slice(semi + 1);
       if (!payload || payload === '?') return false;
+      // A connected host (possibly compromised — it is the thing being
+      // administered) can emit an arbitrarily large OSC 52 sequence. Cap it
+      // so a hostile remote can't dump megabytes into the system clipboard.
+      // ~1 MB of base64 is ~768 KB of text, far more than any real copy.
+      if (payload.length > 1024 * 1024) return false;
       let text;
       try { text = atob(payload); } catch (e) { return false; }
-      try { text = decodeURIComponent(escape(text)); } catch (e) {}
+      // tmux sends UTF-8. Reinterpret the latin1 byte string as UTF-8 via
+      // TextDecoder — replacing the deprecated escape()/unescape() pair.
+      // fatal:true preserves the old behavior exactly: on bytes that aren't
+      // valid UTF-8 it throws (as escape() did) and the catch keeps the raw
+      // latin1 text, rather than silently substituting U+FFFD.
+      try {
+        text = new TextDecoder('utf-8', {fatal: true}).decode(
+          Uint8Array.from(text, c => c.charCodeAt(0)));
+      } catch (e) {}
       copyText(text);
       return true;
     });

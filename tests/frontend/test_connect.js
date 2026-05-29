@@ -4693,6 +4693,39 @@ test('renderSaved coerces a non-numeric port to a number (no injection)', async 
 });
 
 // =====================================================================
+// OSC 52 clipboard handler: decode multibyte UTF-8 via TextDecoder (not the
+// deprecated escape()), and refuse a pathologically large payload from a
+// (possibly hostile) remote host.
+test('OSC 52 decodes UTF-8 clipboard text correctly', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  let captured = null;
+  win.copyText = (t) => { captured = t; };
+  const utf8 = '→ café ✓';
+  const b64 = win.btoa(unescape(encodeURIComponent(utf8)));
+  const handled = p.term.parser._fireOsc(52, '0;' + b64);
+  ok(handled === true, 'OSC 52 handled; got ' + handled);
+  ok(captured === utf8, 'decoded UTF-8 exactly; got ' + JSON.stringify(captured));
+  cleanup(env);
+});
+
+test('OSC 52 refuses an oversize clipboard payload', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  let called = false;
+  win.copyText = () => { called = true; };
+  const huge = '0;' + 'A'.repeat(2 * 1024 * 1024);  // 2 MB base64 > cap
+  const handled = p.term.parser._fireOsc(52, huge);
+  ok(handled === false, 'oversize OSC 52 rejected; got ' + handled);
+  ok(called === false, 'clipboard not written for oversize payload');
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');
