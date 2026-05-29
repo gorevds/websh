@@ -98,6 +98,12 @@ server {
     listen 443 ssl;
     server_name ssh.example.com;
 
+    # nginx caps request bodies at 1m by default, which 413s any file
+    # upload larger than that before it ever reaches websh. Raise it to
+    # at least the backend's MAX_UPLOAD_SIZE (2 GiB default); the server
+    # still enforces its own limit, so this is just the proxy ceiling.
+    client_max_body_size 2g;
+
     location / {
         proxy_pass http://127.0.0.1:8765;
         proxy_read_timeout 60s;
@@ -116,6 +122,17 @@ server {
 (10 s) and the SSE keep-alive interval (15 s) — 60 s leaves plenty of
 headroom. The backend sets `X-Accel-Buffering: no` on the SSE response,
 so nginx flushes each event immediately without further configuration.
+
+`client_max_body_size` must be at least as large as the files you intend
+to upload. nginx defaults to `1m` and rejects anything bigger with
+`413 Request Entity Too Large` before the request reaches websh, so a
+proxy that omits this directive silently breaks uploads of ordinary files
+(PDFs, images, archives). The backend independently caps uploads at
+`MAX_UPLOAD_SIZE` (2 GiB default, specified in bytes — not nginx-style
+size suffixes), so the proxy value only needs to not be the bottleneck.
+Caddy v2 has no default body-size limit, so no equivalent setting is
+required there.
+
 If the proxy runs on a different host, add its IP to `TRUSTED_PROXIES`
 so rate limiting uses the real client IP — see
 [Rate limiting & proxies](security.md#rate-limiting--proxies).
