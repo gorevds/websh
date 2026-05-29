@@ -7191,6 +7191,64 @@ class TestReapChild(unittest.TestCase):
             s._reap_child()
         self.assertEqual(s._exit_status, 1234)
 
+    def test_auth_fail_path_in_read_loop_reaps_child(self):
+        """Integration guard for the actual reported path: _read_loop's
+        auth-fail branch SIGTERMs the child and breaks *before* the inline
+        WNOHANG reap, so only the finally's _reap_child() collects it. The
+        two tests above exercise _reap_child() in isolation; this drives the
+        real loop end-to-end and leaves a zombie (fails) without the fix."""
+        import pty
+        master, slave = pty.openpty()
+        pid = os.fork()
+        if pid == 0:  # child: emit an auth-fail line, then block until killed
+            os.close(master)
+            try:
+                os.write(slave, b"Permission denied, please try again.\r\n")
+                time.sleep(30)
+            finally:
+                os._exit(0)
+        os.close(slave)
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.master_fd = master
+        s.pid = pid
+        s.id = "test-authfail"
+        s.alive = True
+        s.is_background = False
+        s._password = None
+        s._password_sent = True   # take the auth-watch branch, not pw-typing
+        s.auth_failed = False
+        s._auth_buf = b""
+        s._auth_bytes_seen = 0
+        s.output_buf = b""
+        s.buf_lock = threading.Lock()
+        s._exit_status = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = False
+        s._signal = lambda: None  # isolate: we assert on reaping, not signaling
+        try:
+            t = threading.Thread(target=s._read_loop, daemon=True)
+            t.start()
+            t.join(15)
+            self.assertFalse(t.is_alive(),
+                             "_read_loop did not exit on auth fail")
+            self.assertTrue(s.auth_failed, "auth failure was not detected")
+            self.assertIsNotNone(s._exit_status,
+                                 "child was not reaped (zombie leak)")
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+        finally:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            # Safety net: if an assertion failed before the reap, don't leak
+            # the child process into the rest of the suite.
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (OSError, ChildProcessError):
+                pass
+
 
 if __name__ == "__main__":
     unittest.main()
