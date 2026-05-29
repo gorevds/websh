@@ -2153,10 +2153,13 @@ class SSHSession(object):
             'if [ "$b.$e" = "$f" ]; then '
                 'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; '
             'else '
-                # Strip any prior "(n)" before appending the next one so
-                # repeated collisions on an extension-less name produce
-                # name(1), name(2), name(3) — not name(1)(2)(3).
-                'n=1; while [ -e "$f" ]; do f="${f%(*)}($n)"; n=$((n+1)); done; '
+                # Build name(1), name(2), ... from the ORIGINAL name each
+                # iteration. The old `${f%(*)}` stripped the shortest "(...)"
+                # suffix, which mangled real names containing parentheses
+                # (e.g. "report(final)" -> "report(1)" instead of
+                # "report(final)(1)"). Keeping the base in $o avoids both the
+                # mangling and the name(1)(2)(3) accumulation.
+                'o="$f"; n=1; while [ -e "$f" ]; do f="$o($n)"; n=$((n+1)); done; '
             'fi; '
             'mv -- "$HOME/$t" "./$f" && printf %s "$cwd/$f"'
         )

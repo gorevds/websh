@@ -4781,6 +4781,19 @@ test('connectPane reaps the orphan session when the pane is destroyed mid-connec
 });
 
 // =====================================================================
+// The client-side upload-mv collision loop must build name(1), name(2)
+// from the original name, not strip a "(...)" suffix (which mangled real
+// names with parentheses). Mirrors the server-side finalize fix.
+test('makeUploadMvCmd builds the collision counter from the original name', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const cmd = win.makeUploadMvCmd('report(final)', '.websh-tmp-x');
+  ok(cmd.indexOf('o="$f"') !== -1, 'uses original-name loop; got ' + cmd);
+  ok(cmd.indexOf('${f%(*)}') === -1, 'no fragile suffix-strip; got ' + cmd);
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');

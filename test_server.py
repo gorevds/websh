@@ -4611,12 +4611,14 @@ class TestFinalizeUpload(unittest.TestCase):
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
 
-    def test_no_extension_increment_strips_prior_suffix(self):
-        """Regression: the no-extension branch of the auto-increment
-        loop must strip a prior `(n)` before appending the next one,
-        matching the JS client's makeUploadMvCmd. Otherwise repeated
-        collisions on a name like `Makefile` produce `Makefile(1)(2)(3)`
-        instead of `Makefile(1)`, `Makefile(2)`, `Makefile(3)`."""
+    def test_no_extension_increment_builds_from_original_name(self):
+        """The no-extension branch must build name(1), name(2), ... from the
+        ORIGINAL name (kept in $o), not strip a trailing "(...)" via the old
+        ${f%(*)}. The strip both mangled real parenthesized names
+        (report(final) -> report(1)) and was the wrong mechanism; building
+        from $o yields Makefile(1), Makefile(2), ... with no accumulation and
+        leaves parenthesized names intact. Behavioral coverage lives in
+        TestUploadRenameCollision; this guards the emitted server command."""
         tmpdir = tempfile.mkdtemp()
         sock = os.path.join(tmpdir, "mux.sock")
         open(sock, "w").close()
@@ -4633,11 +4635,10 @@ class TestFinalizeUpload(unittest.TestCase):
             with unittest.mock.patch.object(server.subprocess, "run", fake_run):
                 s.finalize_upload("tmp", "Makefile")
             remote = captured["remote"]
-            # The fixed pattern uses ${f%(*)} to drop any prior `(n)`
-            # before appending the new one.
-            self.assertIn('${f%(*)}($n)', remote)
-            # The buggy pattern f="$f($n)" must not be present.
-            self.assertNotIn('f="$f($n)"', remote)
+            self.assertIn('o="$f"', remote)
+            self.assertIn('f="$o($n)"', remote)
+            # The fragile suffix-strip must be gone.
+            self.assertNotIn('${f%(*)}', remote)
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -7293,6 +7294,65 @@ class TestSecurityHeaders(unittest.TestCase):
         self.assertIn("https://fonts.googleapis.com", csp)
         self.assertIn("img-src 'self' data:", csp)
         self.assertIn("connect-src 'self'", csp)
+
+
+class TestUploadRenameCollision(unittest.TestCase):
+    """The extension-less collision loop must build name(1), name(2), ...
+    from the original name, not strip a "(...)" suffix — which mangled real
+    names containing parentheses (report(final) -> report(1))."""
+
+    # The exact fixed loop emitted by finalize_upload / makeUploadMvCmd.
+    _LOOP = ('cd "$1"; f="$2"; '
+             'o="$f"; n=1; while [ -e "$f" ]; do f="$o($n)"; n=$((n+1)); done; '
+             'printf %s "$f"')
+
+    def _resolve(self, existing, final):
+        import shutil
+        tmp = tempfile.mkdtemp()
+        try:
+            for name in existing:
+                open(os.path.join(tmp, name), "w").close()
+            out = subprocess.check_output(
+                ["sh", "-c", self._LOOP, "sh", tmp, final])
+            return out.decode()
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_parenthesized_name_not_mangled(self):
+        self.assertEqual(
+            self._resolve(["report(final)"], "report(final)"),
+            "report(final)(1)")
+
+    def test_counter_increments_not_accumulates(self):
+        self.assertEqual(self._resolve(["data", "data(1)"], "data"), "data(2)")
+
+    def test_no_collision_keeps_name(self):
+        self.assertEqual(self._resolve([], "Makefile"), "Makefile")
+
+    def test_server_finalize_uses_fixed_loop(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.persistent = True
+        s.slot_id = "ok"
+        s._control_path = "/tmp/fake.sock"
+        s._host = "host.example"
+        s.tmux_cmd = "tmux"
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+
+            class R:
+                returncode = 0
+                stdout = b"/home/a/f"
+                stderr = b""
+            return R()
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch.object(server.subprocess, "run", fake_run):
+            s.finalize_upload(".websh-tmp-x", "report(final)")
+        remote = calls[0][-1]
+        self.assertIn('o="$f"', remote)
+        self.assertNotIn('${f%(*)}', remote)
 
 
 if __name__ == "__main__":
