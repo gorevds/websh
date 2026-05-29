@@ -3129,7 +3129,11 @@ function makeUploadMvCmd(finalName, tmpName) {
     'if [ "$b.$e" = "$f" ]; then ' +
       'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; ' +
     'else ' +
-      'n=1; while [ -e "$f" ]; do f="${f%(*)}($n)"; n=$((n+1)); done; ' +
+      // Build name(1), name(2), ... from the ORIGINAL name. The old
+      // ${f%(*)} stripped the shortest "(...)" suffix, mangling real names
+      // with parentheses (report(final) -> report(1)). Mirrors the
+      // server-side finalize_upload fix.
+      'o="$f"; n=1; while [ -e "$f" ]; do f="$o($n)"; n=$((n+1)); done; ' +
     'fi; ' +
     // `--` plus `./` keep mv from parsing the destination as a flag if
     // the user uploaded a file whose name starts with `-`. Mirrors the
