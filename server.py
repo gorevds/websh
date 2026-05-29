@@ -160,6 +160,12 @@ MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 MAX_DOWNLOAD_SIZE = _int_env("MAX_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 # How long a single upload may take before we kill the side-channel ssh.
 UPLOAD_TIMEOUT = _int_env("UPLOAD_TIMEOUT", "1800")
+# Cap on the in-memory request body for control/JSON endpoints (connect,
+# input, resize, save, tmux_options, upload_finalize/cancel, ...). These
+# carry tiny payloads; the cap stops a bogus Content-Length from making the
+# single-process server buffer gigabytes into RAM. The binary upload path
+# streams separately and is bounded by MAX_UPLOAD_SIZE instead.
+MAX_BODY_SIZE = _int_env("MAX_BODY_SIZE", str(1024 * 1024))
 
 # Trusted proxies (comma-separated IPs) whose X-Forwarded-For header is trusted.
 # Only requests from these IPs will have their X-Forwarded-For used for rate limiting.
@@ -2461,7 +2467,17 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _body(self):
-        n = int(self.headers.get("Content-Length", 0))
+        # Cap the body BEFORE reading so a huge/bogus Content-Length can't
+        # buffer gigabytes into RAM (memory-exhaustion DoS). Every caller
+        # wraps this in try/except and turns a raised error into a 400.
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            raise ValueError("invalid Content-Length")
+        if n < 0:
+            raise ValueError("invalid Content-Length")
+        if n > MAX_BODY_SIZE:
+            raise ValueError("request body too large")
         return self.rfile.read(n) if n else b""
 
     def _path(self):

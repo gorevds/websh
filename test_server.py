@@ -7067,5 +7067,41 @@ class TestUploadFileNoDeadlock(unittest.TestCase):
         self.assertIn("E", err)  # stderr text preserved for the user
 
 
+class TestBodySizeCap(unittest.TestCase):
+    """_body() must reject an oversize Content-Length BEFORE reading it, so
+    a bogus header can't make the single-process server buffer gigabytes."""
+
+    def _handler(self, content_length, rfile):
+        h = server.Handler.__new__(server.Handler)
+        h.headers = {"Content-Length": str(content_length)}
+        h.rfile = rfile
+        return h
+
+    def test_oversize_body_rejected_before_read(self):
+        class TrackingRfile(object):
+            def __init__(self_):
+                self_.read_called = False
+
+            def read(self_, n):
+                self_.read_called = True
+                return b"x" * min(n, 10)
+
+        rf = TrackingRfile()
+        h = self._handler(server.MAX_BODY_SIZE + 1, rf)
+        with self.assertRaises(ValueError):
+            h._body()
+        self.assertFalse(rf.read_called,
+                         "oversize body must not be read into memory")
+
+    def test_body_at_cap_is_read(self):
+        payload = b"a" * 32
+        h = self._handler(len(payload), io.BytesIO(payload))
+        self.assertEqual(h._body(), payload)
+
+    def test_empty_body(self):
+        h = self._handler(0, io.BytesIO(b""))
+        self.assertEqual(h._body(), b"")
+
+
 if __name__ == "__main__":
     unittest.main()
