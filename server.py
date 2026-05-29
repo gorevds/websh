@@ -2549,8 +2549,35 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-cache")
+        self._send_security_headers()
         self.end_headers()
         self.wfile.write(data)
+
+    # Content-Security-Policy + companions for the credential-handling page.
+    # The policy permits exactly what the app already loads (self, the
+    # xterm CDN, Google Fonts, data: URIs) so it does not break anything,
+    # while hardening clickjacking (frame-ancestors), plugins (object-src),
+    # base-tag hijacking (base-uri) and exfiltration (connect-src 'self').
+    # script-src keeps 'unsafe-inline' because the no-build UI relies on
+    # inline event handlers — operators who vendor the assets can tighten it.
+    _CSP = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net "
+        "https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'"
+    )
+
+    def _send_security_headers(self):
+        self.send_header("Content-Security-Policy", self._CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
 
     # ── Dispatch ────────────────────────────────────────────────────
 
