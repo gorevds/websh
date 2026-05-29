@@ -3253,6 +3253,10 @@ class TestSessionNotify(unittest.TestCase):
         s.pid = child_pid
         s._key_file = None
         s._control_path = None
+        # close() now reaps via _reap_child, which needs these.
+        s._exit_status = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = False
         s.close()
         # Event must still be usable after close().
         self.assertIsNotNone(s._data_event)
@@ -7149,6 +7153,43 @@ class TestCleanupLockContention(unittest.TestCase):
         self.assertTrue(
             observed.get("lock_free_during_close"),
             "cleanup() held sessions_lock while calling close()")
+
+
+class TestReapChild(unittest.TestCase):
+    """_read_loop's auth-fail branch SIGTERMs the child and breaks before
+    the inline WNOHANG reap, so _reap_child() in the finally must reap it —
+    otherwise it lingers as a zombie holding a counted slot until timeout."""
+
+    def test_reaps_unreaped_child(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._exit_status = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = False
+        child = os.fork()
+        if child == 0:
+            # Mimic ssh after the auth-fail SIGTERM: blocked, killed by
+            # the signal _reap_child sends.
+            try:
+                time.sleep(30)
+            finally:
+                os._exit(0)
+        s.pid = child
+        s._reap_child()
+        self.assertIsNotNone(s._exit_status, "child was not reaped")
+        # A second waitpid proves it is gone, not a lingering zombie.
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(child, os.WNOHANG)
+
+    def test_noop_when_already_reaped(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._exit_status = 1234
+        s._reap_lock = threading.Lock()
+        s._child_reaped = False
+        s.pid = 999999  # never touched: the guard returns first
+        with unittest.mock.patch("os.kill",
+                                 side_effect=AssertionError("must not kill")):
+            s._reap_child()
+        self.assertEqual(s._exit_status, 1234)
 
 
 if __name__ == "__main__":

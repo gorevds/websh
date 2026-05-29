@@ -1370,6 +1370,11 @@ class SSHSession(object):
         # Raw waitpid() status of the ssh child — used after exit to
         # classify auth vs network failure via the 255 exit code.
         self._exit_status = None
+        # Serialize child teardown: _read_loop's finally and close() can run
+        # in different threads, so exactly one of them may issue the
+        # SIGKILL+waitpid (a second one risks signalling a recycled pid).
+        self._reap_lock = Lock()
+        self._child_reaped = False
         self._key_file = None
         # Strip any -o option that isn't on the safe allow-list (see
         # _SSH_OPTIONS_ALLOWED). Filter here so SSHSession is also
@@ -1660,10 +1665,48 @@ class SSHSession(object):
             with self.buf_lock:
                 self.output_buf += TERM_RESET
 
+            # Reap the child if we broke out before the inline WNOHANG reap
+            # (the auth-fail branch SIGTERMs and breaks). Otherwise the ssh
+            # child lingers as a zombie holding a counted session slot until
+            # /api/disconnect or SESSION_TIMEOUT eventually calls close().
+            self._reap_child()
+
             self.alive = False
             # Wake any consumer parked in wait_for_data so it observes
             # alive=False without waiting up to KEEPALIVE_INTERVAL.
             self._signal()
+
+    def _reap_child(self):
+        """Bounded reap of the ssh child: SIGTERM, poll WNOHANG, then
+        SIGKILL. Serialized via _reap_lock and a one-shot _child_reaped flag
+        so that, across the read-loop thread (this method runs in its finally)
+        and the disconnect/cleanup thread (close() calls this too), exactly
+        one caller ever issues the kill sequence — a second one could SIGKILL
+        a recycled pid. Also skips entirely if the inline WNOHANG reap in
+        _read_loop already captured the exit status (normal self-exit)."""
+        with self._reap_lock:
+            if self._child_reaped or self._exit_status is not None:
+                return
+            self._child_reaped = True
+            try:
+                os.kill(self.pid, signal.SIGTERM)
+            except Exception:
+                pass
+            for _ in range(10):
+                try:
+                    pid, status = os.waitpid(self.pid, os.WNOHANG)
+                    if pid != 0:
+                        self._exit_status = status
+                        return
+                except ChildProcessError:
+                    return
+                time.sleep(0.05)
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+                _, status = os.waitpid(self.pid, 0)
+                self._exit_status = status
+            except Exception:
+                pass
 
     def read(self):
         """Return and clear buffered output."""
@@ -2314,25 +2357,11 @@ class SSHSession(object):
                 # Double-close is possible under disconnect/cleanup
                 # races; the fd is gone either way.
                 pass
-        # SIGTERM, wait briefly, SIGKILL if still alive, then reap
-        try:
-            os.kill(self.pid, signal.SIGTERM)
-        except Exception:
-            pass
-        for _ in range(10):
-            try:
-                pid, _ = os.waitpid(self.pid, os.WNOHANG)
-                if pid != 0:
-                    break
-            except ChildProcessError:
-                break
-            time.sleep(0.05)
-        else:
-            try:
-                os.kill(self.pid, signal.SIGKILL)
-                os.waitpid(self.pid, 0)
-            except Exception:
-                pass
+        # SIGTERM, wait briefly, SIGKILL if still alive, then reap — shared
+        # with _read_loop's finally via _reap_child so only one thread ever
+        # issues the kill sequence (avoids a SIGKILL landing on a recycled
+        # pid if both ran concurrently).
+        self._reap_child()
         if self._key_file:
             try:
                 os.unlink(self._key_file)
