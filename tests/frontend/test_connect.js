@@ -4726,6 +4726,34 @@ test('OSC 52 refuses an oversize clipboard payload', async () => {
 });
 
 // =====================================================================
+// Discriminates the TextDecoder refactor from the old escape() path, which
+// the round-trip test above does not: a leading BOM must be preserved
+// (needs ignoreBOM), and bytes that are not valid UTF-8 must fall back to
+// the raw latin1 via the catch (not U+FFFD). Without ignoreBOM the BOM
+// assertion fails; without the catch the invalid-byte assertion fails.
+test('OSC 52 preserves a leading BOM and keeps raw bytes on invalid UTF-8', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const root = win.document.getElementById('panes');
+  const p = win.createPane(root);
+  let captured = null;
+  win.copyText = (t) => { captured = t; };
+  // Leading BOM + text: old escape() kept U+FEFF; bare TextDecoder strips a
+  // leading BOM, so this asserts ignoreBOM keeps it.
+  const bom = String.fromCharCode(0xFEFF) + 'hi';
+  let b64 = win.btoa(unescape(encodeURIComponent(bom)));
+  ok(p.term.parser._fireOsc(52, '0;' + b64) === true, 'BOM payload handled');
+  ok(captured === bom, 'leading BOM preserved; got ' + JSON.stringify(captured));
+  // Lone 0x80 is not valid UTF-8: fatal:true throws and the catch keeps the
+  // raw latin1 byte rather than substituting U+FFFD.
+  captured = null;
+  b64 = win.btoa(String.fromCharCode(0x80));
+  ok(p.term.parser._fireOsc(52, '0;' + b64) === true, 'invalid-byte payload handled');
+  ok(captured === '\x80', 'raw latin1 kept on invalid UTF-8; got ' + JSON.stringify(captured));
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');

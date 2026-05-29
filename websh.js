@@ -319,11 +319,12 @@ function createPane(container) {
       try { text = atob(payload); } catch (e) { return false; }
       // tmux sends UTF-8. Reinterpret the latin1 byte string as UTF-8 via
       // TextDecoder — replacing the deprecated escape()/unescape() pair.
-      // fatal:true preserves the old behavior exactly: on bytes that aren't
-      // valid UTF-8 it throws (as escape() did) and the catch keeps the raw
-      // latin1 text, rather than silently substituting U+FFFD.
+      // {fatal:true, ignoreBOM:true} reproduces the old escape() behavior
+      // exactly: invalid UTF-8 throws (as escape() did) so the catch keeps
+      // the raw latin1 text instead of substituting U+FFFD, and ignoreBOM
+      // keeps a leading BOM that TextDecoder would otherwise strip.
       try {
-        text = new TextDecoder('utf-8', {fatal: true}).decode(
+        text = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(
           Uint8Array.from(text, c => c.charCodeAt(0)));
       } catch (e) {}
       copyText(text);
