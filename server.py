@@ -1968,9 +1968,41 @@ class SSHSession(object):
         proc = subprocess.Popen(
             ssh_cmd,
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
+            # `cat >` produces no stdout; discard it. stderr is kept (for the
+            # "ssh exit N: <msg>" error below) but MUST be drained while we
+            # write stdin — see _drain below.
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+
+        # Drain ssh's stderr concurrently. Otherwise a >~64 KB stderr burst
+        # (host-key/banner/MOTD warnings, or a remote `cat` error such as
+        # "No space left on device") fills the pipe, ssh blocks on the write,
+        # stops reading our stdin, and proc.stdin.write() below deadlocks.
+        # We keep at most 64 KB of the text for the error message but keep
+        # reading to EOF so the pipe never backs up.
+        _err_buf = []
+        _err_len = [0]
+
+        def _drain_stderr():
+            try:
+                while True:
+                    chunk = proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    if _err_len[0] < 65536:
+                        _err_buf.append(chunk)
+                        _err_len[0] += len(chunk)
+            except Exception:
+                pass
+            finally:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+        _drain = Thread(target=_drain_stderr, daemon=True)
+        _drain.start()
 
         BUF = 256 * 1024
         remaining = length
@@ -2001,6 +2033,7 @@ class SSHSession(object):
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            _drain.join(timeout=5)
             return False, "stream error: " + str(e)
 
         try:
@@ -2014,15 +2047,14 @@ class SSHSession(object):
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            _drain.join(timeout=5)
             return False, "ssh side-channel timeout"
 
+        # proc has exited, so stderr is at EOF and the drain thread is
+        # finishing; join it to collect the captured text.
+        _drain.join(timeout=5)
         if proc.returncode != 0:
-            err = b""
-            try:
-                err = proc.stderr.read() or b""
-            except Exception:
-                pass
-            msg = err.decode("utf-8", "replace").strip()[:300]
+            msg = b"".join(_err_buf).decode("utf-8", "replace").strip()[:300]
             return False, "ssh exit %d: %s" % (proc.returncode, msg)
         if remaining > 0:
             return False, "client sent fewer bytes than Content-Length"

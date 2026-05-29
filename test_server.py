@@ -6979,5 +6979,64 @@ class TestApiConnectSaved(unittest.TestCase):
             self.assertIn("StrictHostKeyChecking", opts)
 
 
+class TestUploadFileNoDeadlock(unittest.TestCase):
+    """Regression: upload_file must drain the side-channel ssh's stderr
+    while it streams stdin. An undrained stderr=PIPE deadlocks once ssh
+    emits >~64 KB (host-key/banner/MOTD warnings, or a remote `cat` error
+    like 'No space left on device'): ssh blocks on the full stderr pipe,
+    stops reading our stdin, and proc.stdin.write() blocks forever. Unlike
+    download_file (which can discard stderr via DEVNULL), upload_file needs
+    the text for its 'ssh exit N: <msg>' error, so it must drain — not
+    discard — concurrently."""
+
+    def _fake_session(self, control_path):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-ul"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.last_activity = 0
+        return s
+
+    def test_large_stderr_does_not_deadlock_and_is_reported(self):
+        s = self._fake_session("/tmp/fake.sock")
+        # A child that floods stderr (>64 KB) BEFORE draining stdin, then
+        # exits non-zero — the exact shape that deadlocks an undrained PIPE.
+        child = [
+            sys.executable, "-c",
+            "import sys; sys.stderr.buffer.write(b'E' * 200000);"
+            " sys.stderr.flush(); sys.stdin.buffer.read(); sys.exit(7)",
+        ]
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):
+            # Honor the stdin/stdout/stderr wiring upload_file chose, but
+            # run our controlled child instead of the real ssh argv.
+            return real_popen(child, **kw)
+
+        body = io.BytesIO(b"D" * (512 * 1024))
+        result = {}
+
+        def run():
+            with unittest.mock.patch("os.path.exists", return_value=True), \
+                 unittest.mock.patch("subprocess.Popen", side_effect=fake_popen):
+                result["v"] = s.upload_file("dest", body, 512 * 1024, timeout=20)
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(15)
+        self.assertFalse(
+            t.is_alive(),
+            "upload_file deadlocked (still running after 15s)")
+        ok, err = result["v"]
+        self.assertFalse(ok)
+        self.assertIn("ssh exit 7", err)
+        self.assertIn("E", err)  # stderr text preserved for the user
+
+
 if __name__ == "__main__":
     unittest.main()
