@@ -3891,6 +3891,60 @@ class TestFilterSshOptions(unittest.TestCase):
         self.assertEqual(server._filter_ssh_options(None), ({}, []))
 
 
+class TestBuildSshCommand(unittest.TestCase):
+    """Final ssh argv assembly. OpenSSH keeps the first value for many
+    repeated `-o` options, so allow-list tests alone are not enough."""
+
+    def _session(self, ssh_options=None, persistent=False):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._ssh_options, _ = server._filter_ssh_options(ssh_options or {})
+        s._key_file = None
+        s._control_path = "/tmp/websh-test.sock"
+        s.persistent = persistent
+        s.slot_id = "slot" if persistent else None
+        s.tmux_cmd = "tmux"
+        s._tmux_options = []
+        return s
+
+    def _option_values(self, cmd, key):
+        prefix = key.lower() + "="
+        vals = []
+        for i, part in enumerate(cmd[:-1]):
+            if part == "-o" and cmd[i + 1].lower().startswith(prefix):
+                vals.append(cmd[i + 1].split("=", 1)[1])
+        return vals
+
+    def test_default_disables_host_key_checks_and_known_hosts_writes(self):
+        cmd = self._session()._build_ssh_cmd("example.com", 22, "alice")
+        self.assertEqual(self._option_values(cmd, "StrictHostKeyChecking"),
+                         ["no"])
+        self.assertEqual(self._option_values(cmd, "UserKnownHostsFile"),
+                         ["/dev/null"])
+
+    def test_profile_strict_host_key_checking_replaces_default(self):
+        cmd = self._session({
+            "StrictHostKeyChecking": "yes",
+        })._build_ssh_cmd("example.com", 22, "alice")
+        self.assertEqual(self._option_values(cmd, "StrictHostKeyChecking"),
+                         ["yes"])
+        self.assertEqual(self._option_values(cmd, "UserKnownHostsFile"), [])
+
+    def test_profile_known_hosts_file_replaces_devnull_default(self):
+        cmd = self._session({
+            "StrictHostKeyChecking": "yes",
+            "UserKnownHostsFile": "/home/alice/.ssh/known_hosts",
+        })._build_ssh_cmd("example.com", 22, "alice")
+        self.assertEqual(
+            self._option_values(cmd, "UserKnownHostsFile"),
+            ["/home/alice/.ssh/known_hosts"])
+
+    def test_profile_timeout_replaces_default(self):
+        cmd = self._session({
+            "ConnectTimeout": "30",
+        })._build_ssh_cmd("example.com", 22, "alice")
+        self.assertEqual(self._option_values(cmd, "ConnectTimeout"), ["30"])
+
+
 class TestWatchdogRuntime(unittest.TestCase):
     """Integration test: run the actual shell command against a fake
     tmux and verify the watchdog kills the session after TTL seconds.
