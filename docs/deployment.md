@@ -59,23 +59,32 @@ WEBSH_CONFIG=/path/to/websh.json nohup python3 server.py &
 The backend can serve the frontend directly — no PHP or separate web server needed:
 
 ```bash
-HOST=0.0.0.0 python3 server.py
+python3 server.py
 ```
 
-Open `http://your-host:8765/` in a browser. The backend serves the static
+Open `http://127.0.0.1:8765/` in a browser. The backend serves the static
 files (`index.html`, `websh.js`, `assets/*.svg`) from the same directory as
 `server.py`, and handles API requests on the same port. See
 [HTTPS via reverse proxy](#https-via-reverse-proxy) below.
+
+Do not expose the Python server directly on the public Internet without
+an authentication layer. If you need remote access, keep websh bound to
+`127.0.0.1` and put nginx, Caddy, Cloudflare Access, Tailscale, or another
+auth/TLS layer in front. Only set `HOST=0.0.0.0` on a trusted private
+network or behind such a proxy.
 
 ## Docker
 
 ```bash
 docker build -t websh .
-docker run -d -p 8765:8765 -e HOST=0.0.0.0 websh
+docker run -d -p 127.0.0.1:8765:8765 websh
 ```
 
-Open `http://localhost:8765/` — the backend serves the frontend directly. See
-[HTTPS via reverse proxy](#https-via-reverse-proxy) below.
+Open `http://localhost:8765/` — the backend serves the frontend directly.
+The container still listens on `0.0.0.0` internally so Docker port
+publishing works, but the command above binds the published host port to
+localhost only. Use a reverse proxy with TLS and authentication before
+publishing it externally.
 
 ## systemd
 

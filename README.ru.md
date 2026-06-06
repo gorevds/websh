@@ -140,8 +140,8 @@ idle-TTL tmux, путь access-log…): [`docs/configuration.md`](docs/configura
 ## Развёртывание
 
 - **Shared-хостинг (PHP + Python)** — FTP-drop 4 файлов + `assets/`. См. [`docs/deployment.md`](docs/deployment.md#shared-hosting-php--python).
-- **Только Python** — `HOST=0.0.0.0 python3 server.py`. См. [`docs/deployment.md`](docs/deployment.md#python-only-no-php).
-- **Docker** — `docker build -t websh . && docker run -d -p 8765:8765 -e HOST=0.0.0.0 websh`. См. [`docs/deployment.md`](docs/deployment.md#docker).
+- **Только Python** — `python3 server.py` для локального использования; перед публикацией поставь TLS/auth reverse proxy. См. [`docs/deployment.md`](docs/deployment.md#python-only-no-php).
+- **Docker** — `docker build -t websh . && docker run -d -p 127.0.0.1:8765:8765 websh`. См. [`docs/deployment.md`](docs/deployment.md#docker).
 - **systemd** — unit `websh.service` в комплекте. См. [`docs/deployment.md`](docs/deployment.md#systemd).
 - **HTTPS через reverse-proxy** — nginx / Caddy впереди для TLS. См. [`docs/deployment.md`](docs/deployment.md#https-via-reverse-proxy).
 

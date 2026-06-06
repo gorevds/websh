@@ -141,8 +141,8 @@ idle-TTL, access log path, …): [`docs/configuration.md`](docs/configuration.md
 ## Deployment
 
 - **Shared hosting (PHP + Python)** — FTP-drop the 4 files + `assets/`. See [`docs/deployment.md`](docs/deployment.md#shared-hosting-php--python).
-- **Python only** — `HOST=0.0.0.0 python3 server.py`. See [`docs/deployment.md`](docs/deployment.md#python-only-no-php).
-- **Docker** — `docker build -t websh . && docker run -d -p 8765:8765 -e HOST=0.0.0.0 websh`. See [`docs/deployment.md`](docs/deployment.md#docker).
+- **Python only** — `python3 server.py` for local use; put a TLS/auth reverse proxy in front before exposing it. See [`docs/deployment.md`](docs/deployment.md#python-only-no-php).
+- **Docker** — `docker build -t websh . && docker run -d -p 127.0.0.1:8765:8765 websh`. See [`docs/deployment.md`](docs/deployment.md#docker).
 - **systemd** — `websh.service` unit included. See [`docs/deployment.md`](docs/deployment.md#systemd).
 - **HTTPS via reverse proxy** — nginx / Caddy in front for TLS. See [`docs/deployment.md`](docs/deployment.md#https-via-reverse-proxy).
 
