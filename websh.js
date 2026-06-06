@@ -3696,7 +3696,7 @@ function searchPrev(){ let s=activeSearch(); if(s){let p=panes[activeId];s.findP
 
 // Search input events — delegated
 document.addEventListener('keydown', e => {
-  if(e.target.closest('[data-search]')){
+  if(e.target && e.target.closest && e.target.closest('[data-search]')){
     if(e.key==='Enter'){e.shiftKey?searchPrev():searchNext()}
     if(e.key==='Escape') closeSearch();
   }
