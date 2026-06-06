@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import os
+import re
 import selectors
 import signal
 import socket
@@ -7665,6 +7666,29 @@ class TestShutdownTopology(unittest.TestCase):
                              "serve_forever() did not exit after shutdown()")
         finally:
             httpd.server_close()
+
+
+class TestPhpProxyActionCoverage(unittest.TestCase):
+    """Static guard for the optional PHP shim. CI may not have PHP
+    installed, but api.php must still route every action the bundled
+    frontend can call."""
+
+    def test_frontend_actions_are_routed_by_php_proxy(self):
+        root = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(root, "api.php"), "r") as f:
+            php = f.read()
+        with open(os.path.join(root, "websh.js"), "r") as f:
+            js = f.read()
+        actions = set(re.findall(r"action=([A-Za-z0-9_]+)", js))
+        actions.update(re.findall(r"api\('([A-Za-z0-9_]+)'", js))
+        # config is built by loadServerConfig via api('config'), and
+        # ping is used by the PHP proxy itself rather than the browser.
+        actions.update(["config", "ping"])
+        missing = sorted(
+            action for action in actions
+            if "case '{}':".format(action) not in php
+        )
+        self.assertEqual(missing, [])
 
 
 class TestMainSigtermSubprocess(unittest.TestCase):
