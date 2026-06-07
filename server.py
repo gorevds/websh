@@ -2649,6 +2649,12 @@ class Handler(BaseHTTPRequestHandler):
             self._tmux_options()
         elif action == "save":
             self._save_credential()
+        elif action == "save_delete":
+            # Compatibility with the bundled frontend in Python-only
+            # mode. The PHP shim translates POST ?action=save_delete
+            # into DELETE /api/save; when server.py serves api.php-style
+            # URLs directly, do the same dispatch here.
+            self._delete_credential()
         else:
             self._json({"error": "not found"}, 404)
 

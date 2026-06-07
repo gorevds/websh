@@ -6686,6 +6686,24 @@ class TestApiSaveDelete(unittest.TestCase):
                 return e.code, payload
             raise
 
+    def _post_save_delete(self, vault_id, conn_id):
+        from urllib.request import urlopen, Request
+        qs = "vault_id={}&conn_id={}".format(vault_id, conn_id)
+        url = "http://127.0.0.1:{}/api.php?action=save_delete&{}".format(
+            self.port, qs)
+        req = Request(url, data=b"{}", method="POST",
+                      headers={"Content-Type": "application/json"})
+        try:
+            resp = urlopen(req, timeout=5)
+            return resp.getcode(), resp.read()
+        except Exception as e:
+            if hasattr(e, 'code'):
+                payload = b""
+                if hasattr(e, 'read'):
+                    payload = e.read()
+                return e.code, payload
+            raise
+
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
     def test_existing_entry_returns_204_and_reaps_empty_vault(self):
         code, _ = self._delete("/api/save?vault_id={}&conn_id={}".format(
@@ -6694,6 +6712,14 @@ class TestApiSaveDelete(unittest.TestCase):
         with open(self.creds_path) as f:
             data = json.load(f)
         # Empty vault is reaped — the last conn_id deletion removes the vault key.
+        self.assertNotIn(self.VAULT, data["vaults"])
+
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_php_style_post_save_delete_works_in_python_only_mode(self):
+        code, _ = self._post_save_delete(self.VAULT, self.CONN)
+        self.assertEqual(code, 204)
+        with open(self.creds_path) as f:
+            data = json.load(f)
         self.assertNotIn(self.VAULT, data["vaults"])
 
     @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
