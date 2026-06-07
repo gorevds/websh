@@ -51,6 +51,18 @@ server log. If you need those, put them in the system `ssh_config` on
 the websh host instead of in `websh.json` (which has a broader trust
 profile — FTP'able on shared hosting, sometimes restored from backups).
 
+A profile option takes precedence over websh's built-in default for the
+same key (OpenSSH keeps the first value, and websh emits its default only
+when the profile leaves the key unset). A few of those defaults back
+websh's own behavior, so override them deliberately: `NumberOfPasswordPrompts`
+defaults to `1` so a rejected password makes `ssh` exit cleanly instead of
+re-prompting on the PTY (the primary auth-failure signal), and
+`ServerAliveInterval`/`ServerAliveCountMax` drive idle keep-alives. Setting
+`StrictHostKeyChecking` to anything other than `no` also drops websh's
+default `UserKnownHostsFile=/dev/null`, so host keys are read from (and
+written to) the websh user's normal `known_hosts` unless the profile sets
+its own `UserKnownHostsFile`.
+
 ## Connection kinds: Ready vs Prompt
 
 Each `connections[]` entry is one of two kinds, auto-detected by whether
