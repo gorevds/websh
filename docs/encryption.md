@@ -1,10 +1,10 @@
 # Encrypted credential vault
 
-> **Status:** design accepted, implementation in progress (issue #64).
-> This document specifies the contract; PRs land the server, client, and
-> hardening pieces in sequence (B → C → D). Until B and C land, websh
-> behaves as today and saved credentials remain in plaintext as
-> documented in [`security.md`](security.md).
+> **Status:** implemented behind an operator opt-in. Install
+> `cryptography` and set `WEBSH_VAULT_ENABLE=1` to enable the encrypted
+> save UI and vault endpoints. Deployments without that optional
+> dependency or flag continue to run, but saved-credential UI stays
+> hidden and legacy plaintext entries are not migrated automatically.
 
 Saved SSH credentials are stored as **opaque encrypted blobs** on the
 server. The decryption key lives in the browser's IndexedDB, generated
@@ -27,17 +27,15 @@ the ~50 ms it takes to type it into the SSH PTY.
    Without it, websh keeps working — the saved-credential UI is just
    hidden. With it, the browser's "Save" checkbox enables encrypted
    storage end-to-end.
-2. Until the client side ships (PR-C), opt the vault on explicitly:
+2. Opt the vault on explicitly:
    ```bash
    WEBSH_VAULT_ENABLE=1 python3 server.py
    ```
    Without `WEBSH_VAULT_ENABLE`, the server reports
    `vault_enabled: false` in `/api/config` and the new endpoints
-   return `501`, even when `cryptography` is present. This stops a
-   server upgrade from advertising endpoints the bundled client
-   does not yet know how to call. The flag becomes the default
-   once the client lands; operators who left it set will see no
-   change.
+   return `501`, even when `cryptography` is present. This keeps the
+   feature operator-controlled while plaintext `websh.json` credentials
+   are still supported for compatibility.
 3. Confirm at startup. The log line:
    ```
    credential vault: enabled (cryptography 42.0.5, WEBSH_VAULT_ENABLE=1)

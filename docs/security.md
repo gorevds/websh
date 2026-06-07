@@ -27,11 +27,21 @@ in `websh.json`:
 
 ## Saved connections & passwords
 
-Saved connections in the browser are stored in `localStorage` **in plaintext**,
-including passwords. Any JavaScript running on the same origin (including XSS
-vulnerabilities) could read them.
+When the encrypted credential vault is enabled (`cryptography` installed
+and `WEBSH_VAULT_ENABLE=1`), saved SSH secrets are encrypted in the browser
+and stored as opaque blobs on the server. The browser keeps only metadata
+in `localStorage` and the vault key in IndexedDB. See
+[`encryption.md`](encryption.md) for the exact threat model.
+
+When the vault is disabled, older saved connections may still be stored in
+browser `localStorage` **in plaintext**, including passwords. Any
+JavaScript running on the same origin (including XSS vulnerabilities) could
+read them. Manual unsaved panes keep credentials in `sessionStorage` for
+same-tab refresh restore; browsers may keep short-lived crash-recovery
+copies while the tab is open.
 
 If this is unacceptable for your use case:
+- Enable the encrypted credential vault
 - Use server-side connections (`websh.json`) — passwords stay on the server, never reach the browser
 - Don't save connections in the browser — use SSH keys instead
 - Restrict access to the websh URL to trusted networks
