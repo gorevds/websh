@@ -558,6 +558,13 @@ function _destroyPane(id, terminate) {
     clearTimeout(p._stuckTimer);
     p._stuckTimer = null;
   }
+  // Deferred-save timer (scheduleSaveCommit): same rationale as the
+  // _stuckTimer above. The p.sid guard inside the timer would NOT catch
+  // a pane closed mid-window — _destroyPane leaves p.sid set (it only
+  // reads it for the disconnect body) — so without this a Save ticked
+  // then aborted by closing the pane within SAVE_COMMIT_DELAY_MS would
+  // still POST and add a card. Clearing it also drops the closure's `p` ref.
+  clearTimeout(p.saveCommitTimer);
   p._fitInFlight = false;
   // Disconnect main session
   if (p.sid) {
@@ -1011,8 +1018,27 @@ function _carryEphemeralSecrets(src, dst) {
   });
 }
 
+// The output-gated commit in handleOutputPayload only fires when the
+// session emits a terminal frame ≥SAVE_COMMIT_DELAY_MS after connect. An
+// idle session over SSE (connect, see the prompt, type nothing) emits no
+// such frame — EventSource only delivers on real output, and the 30s
+// empty-input keepalive doesn't route through handleOutputPayload — so the
+// deferred save would never land. Back it with a timer so "tick Save +
+// connect" persists regardless of output. Idempotent with the output path:
+// commitPendingSave bails once pendingSave is cleared (by the commit itself
+// or an auth failure, which also nulls p.sid), and the p.sid guard skips a
+// session that has since died.
+const SAVE_COMMIT_DELAY_MS = 2600;
+function scheduleSaveCommit(p) {
+  clearTimeout(p.saveCommitTimer);
+  p.saveCommitTimer = setTimeout(() => {
+    if (p.sid && p.pendingSave) commitPendingSave(p);
+  }, SAVE_COMMIT_DELAY_MS);
+}
+
 function commitPendingSave(p) {
   if (!p.pendingSave) return;
+  clearTimeout(p.saveCommitTimer);
   let entry = Object.assign({}, p.pendingSave);
   _carryEphemeralSecrets(p.pendingSave, entry);
   // Overwrite persistent with the actual live mode (handles tmux-skip
@@ -1969,8 +1995,10 @@ function finalizeSuccess(opts, result, run) {
   p.connectedAt = Date.now();
   p.recentOutput = '';
   p.connecting = false;
-  // Deferred save: commitPendingSave writes it to localStorage once the
-  // session has proven healthy for ≥2.5s with no auth failure. The
+  // Deferred save: commitPendingSave writes it once the session has proven
+  // healthy for ≥2.5s with no auth failure — driven both by a healthy output
+  // frame (handleOutputPayload) and an output-independent timer
+  // (scheduleSaveCommit) so an idle SSE session still commits. The
   // non-enumerable __ephemeralSecrets bag rides along (Finding 2a).
   if (opts.saveEntry) {
     let entry = Object.assign({}, opts.saveEntry);
@@ -1978,6 +2006,7 @@ function finalizeSuccess(opts, result, run) {
     entry.persistent = !!p.persistent;
     if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
     p.pendingSave = entry;
+    scheduleSaveCommit(p);
   }
 
   hideReconnectBar(p);
@@ -2566,6 +2595,7 @@ function _disconnectVaultPaneForNoKey(p) {
     p.polling = false;
     stopKeepalive(p);
     closeStream(p);
+    clearTimeout(p.saveCommitTimer);   // drop the armed deferred-save timer
     api('disconnect', {body: {session_id: sid}}).catch(() => {});
     p.sid = null;
   }
