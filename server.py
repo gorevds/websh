@@ -1430,35 +1430,55 @@ class SSHSession(object):
         os.chmod(path, 0o600)
         return path
 
-    def _spawn(self, host, port, username, cols, rows):
-        """Fork a PTY and exec ssh."""
-        env = os.environ.copy()
-        env["TERM"] = "xterm-256color"
-        env["LANG"] = "en_US.UTF-8"
-        env["LC_ALL"] = "en_US.UTF-8"
+    def _build_ssh_cmd(self, host, port, username):
+        """Build the ssh argv for this session.
 
+        OpenSSH uses the first value for many repeated options. Build
+        defaults only for options the profile did not explicitly set so
+        documented per-profile ssh_options can actually override them.
+        """
+        opt_lc = {
+            k.lower(): str(v)
+            for k, v in self._ssh_options.items()
+            if isinstance(k, str)
+        }
+        strict = opt_lc.get("stricthostkeychecking")
+        strict_disabled = (
+            strict is None
+            or strict.strip().lower() in ("no", "false", "off")
+        )
         ssh_cmd = [
             "ssh",
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-o", "ConnectTimeout=10",
-            "-o", "ServerAliveInterval=15",
-            "-o", "ServerAliveCountMax=3",
-            # Cap password retries at one — on rejection ssh exits 255
-            # cleanly instead of looping on the PTY, giving us a
-            # locale-proof primary auth-failure signal.
-            "-o", "NumberOfPasswordPrompts=1",
             "-p", str(port),
             "-l", username,
         ]
+
+        defaults = [
+            ("StrictHostKeyChecking", "no"),
+            ("ConnectTimeout", "10"),
+            ("ServerAliveInterval", "15"),
+            ("ServerAliveCountMax", "3"),
+            # Cap password retries at one — on rejection ssh exits 255
+            # cleanly instead of looping on the PTY, giving us a
+            # locale-proof primary auth-failure signal.
+            ("NumberOfPasswordPrompts", "1"),
+        ]
+        if strict_disabled:
+            # With StrictHostKeyChecking=no, also keep host keys out of
+            # the websh user's known_hosts by default. If a profile
+            # opts into strict/TOFU verification, omit this default so
+            # OpenSSH can use its normal known_hosts files unless the
+            # profile provides an explicit UserKnownHostsFile.
+            defaults.insert(1, ("UserKnownHostsFile", "/dev/null"))
+        for k, v in defaults:
+            if k.lower() not in opt_lc:
+                ssh_cmd.extend(["-o", "{}={}".format(k, v)])
 
         # ControlMaster on every session: the master ssh owns this socket,
         # later `ssh -S <sock> <host> ...` invocations piggyback on the
         # same authenticated channel (tmux kill-session for persistent;
         # binary file uploads for any session). ControlPersist=no ties the
         # socket lifetime to the master so no orphaned masters survive.
-        # Placed before user ssh_options so our values win (ssh uses
-        # first-wins semantics for -o).
         ssh_cmd.extend([
             "-o", "ControlMaster=auto",
             "-o", "ControlPath=" + self._control_path,
@@ -1488,6 +1508,16 @@ class SSHSession(object):
             ssh_cmd.append(_build_remote_command(
                 self.slot_id, self.tmux_cmd, TMUX_IDLE_TTL,
                 tmux_options=self._tmux_options))
+        return ssh_cmd
+
+    def _spawn(self, host, port, username, cols, rows):
+        """Fork a PTY and exec ssh."""
+        env = os.environ.copy()
+        env["TERM"] = "xterm-256color"
+        env["LANG"] = "en_US.UTF-8"
+        env["LC_ALL"] = "en_US.UTF-8"
+
+        ssh_cmd = self._build_ssh_cmd(host, port, username)
 
         pid, fd = pty.fork()
         if pid == 0:
