@@ -771,6 +771,10 @@ function paneRecord(p) {
     rec.host = p.host || '';
     rec.port = p.port || 22;
     rec.user = p.user || '';
+    // The prompt connection this card was saved from, if any. Sent as an
+    // authorization disambiguation hint; the server only honours it when it
+    // matches the card's stored host:port (so it can't escalate).
+    rec.connection = p.connection || null;
   } else if (p.connection) {
     rec.via = 'named';
     rec.connection = p.connection;
@@ -813,6 +817,11 @@ function buildConnectBody(rec, termCols, termRows) {
       if (Number.isFinite(hl) && hl >= 100) b.tmux_history_limit = hl;
     }
     if (rec.tmux_cmd && rec.tmux_cmd !== 'tmux') b.tmux_cmd = rec.tmux_cmd;
+    // Connection-name hint: lets the server authorize the card against the
+    // exact prompt connection it was saved from (rename/duplicate-safe),
+    // falling back to host:port matching when absent. See
+    // _resolve_saved_card_connection in server.py.
+    if (rec.connection) b.connection = rec.connection;
     return b;
   }
   let b = {
@@ -2808,6 +2817,11 @@ async function connectSaved(c) {
       vault_id: vault_id,
       conn_id: c.conn_id,
       vault_key: vault_key,
+      // The prompt connection this card was saved from — forwarded as the
+      // server-side authorization hint (see _resolve_saved_card_connection).
+      // Without it, re-connecting a saved card silently falls back to
+      // host:port matching.
+      connection: c.connection || null,
       // host/port/user are display hints for the connect popup; the
       // server derives the real values from the stored vault record.
       host: c.host, port: c.port || 22, user: c.user,
