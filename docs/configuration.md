@@ -10,7 +10,7 @@ Environment variables for `server.py`:
 | `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
 | `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |
 | `WEBSH_CONFIG` | *(auto-detected)* | Path to `websh.json` config file |
-| `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI when `cryptography` is installed. See [`encryption.md`](encryption.md). |
+| `WEBSH_VAULT_ENABLE` | `0` — but `1` in the bundled `websh.service` and Docker image | Enable the encrypted credential vault endpoints and saved-credential UI (requires `cryptography`, bundled in those deploy paths). A bare `python3 server.py` leaves it off; set `1` to opt in. See [`encryption.md`](encryption.md). |
 | `WEBSH_CREDS_PATH` | *(sibling of `WEBSH_CONFIG`)* | Path to the encrypted credential store `websh.creds.json`. See [`encryption.md`](encryption.md). Created lazily on first user save with mode `0600`. |
 | `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |
 | `MAX_BG_SESSIONS` | `50` | Max background SSH sessions (file upload/download) |

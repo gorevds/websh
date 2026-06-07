@@ -94,9 +94,22 @@ useradd -r -s /bin/false websh
 
 mkdir -p /opt/websh
 cp server.py index.html websh.js /opt/websh/
+cp -r assets /opt/websh/
+
+# The bundled unit enables the encrypted credential vault by default, so
+# install the one optional dependency. Skipping this is non-fatal — the
+# server still runs and the saved-credential UI just stays hidden.
+pip install -r requirements.txt
+
 cp websh.service /etc/systemd/system/
 systemctl enable --now websh
 ```
+
+The shipped `websh.service` sets `WEBSH_VAULT_ENABLE=1` and a
+`StateDirectory=websh`, so saved credentials persist (encrypted) under
+`/var/lib/websh/websh.creds.json`. To run without the vault, `systemctl
+edit websh` and set `Environment=WEBSH_VAULT_ENABLE=`. See
+[`encryption.md`](encryption.md).
 
 ## HTTPS via reverse proxy
 

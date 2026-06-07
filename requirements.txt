@@ -1,0 +1,7 @@
+# websh runs on the Python 3 standard library alone. The single optional
+# dependency below is bundled by default so the encrypted credential vault
+# works out of the box in the shipped Docker image and systemd unit (both
+# set WEBSH_VAULT_ENABLE=1). Without it the server still runs — the
+# saved-credential UI just stays hidden. See docs/encryption.md.
+# 3.4.8 is the documented minimum; modern wheels (>=42) are recommended.
+cryptography>=3.4.8
