@@ -53,6 +53,15 @@ switch ($action) {
     case 'resize':     proxy_post($BACKEND . '/api/resize');     break;
     case 'disconnect': proxy_post($BACKEND . '/api/disconnect'); break;
     case 'save':       proxy_post($BACKEND . '/api/save');       break;
+    case 'tmux_options':
+        proxy_post($BACKEND . '/api/tmux_options');
+        break;
+    case 'upload_finalize':
+        proxy_post($BACKEND . '/api/upload_finalize');
+        break;
+    case 'upload_cancel':
+        proxy_post($BACKEND . '/api/upload_cancel');
+        break;
     case 'save_delete':
         // Browsers can't issue DELETE through form posts, so the
         // client POSTs here and we translate to a real backend DELETE.
@@ -72,6 +81,28 @@ switch ($action) {
         break;
     case 'ping':
         proxy_get($BACKEND . '/api/ping');
+        break;
+    case 'tmux_capture':
+        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
+        proxy_get($BACKEND . '/api/tmux_capture?session_id=' . urlencode($sid));
+        break;
+    case 'ls':
+        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
+        $path = isset($_GET['path']) ? $_GET['path'] : '~';
+        proxy_get($BACKEND . '/api/ls?session_id=' . urlencode($sid)
+            . '&path=' . urlencode($path));
+        break;
+    case 'download':
+        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
+        $path = isset($_GET['path']) ? $_GET['path'] : '';
+        proxy_download($BACKEND . '/api/download?session_id=' . urlencode($sid)
+            . '&path=' . urlencode($path));
+        break;
+    case 'upload':
+        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
+        $path = isset($_GET['path']) ? $_GET['path'] : '';
+        proxy_upload($BACKEND . '/api/upload?session_id=' . urlencode($sid)
+            . '&path=' . urlencode($path));
         break;
     default:
         header('HTTP/1.1 404 Not Found');
@@ -101,6 +132,7 @@ function proxy_post($url) {
     curl_setopt($ch, CURLOPT_TIMEOUT, 30);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $err  = curl_error($ch);
     curl_close($ch);
     if ($resp === false) {
@@ -108,6 +140,7 @@ function proxy_post($url) {
         echo json_encode(array('error' => 'backend unavailable: ' . $err));
         return;
     }
+    if ($code) http_response_code($code);
     echo $resp;
 }
 
@@ -117,6 +150,7 @@ function proxy_get($url) {
     curl_setopt($ch, CURLOPT_TIMEOUT, 50);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
     $err  = curl_error($ch);
     curl_close($ch);
     if ($resp === false) {
@@ -124,13 +158,93 @@ function proxy_get($url) {
         echo json_encode(array('error' => 'backend unavailable: ' . $err));
         return;
     }
+    if ($code) http_response_code($code);
     echo $resp;
 }
 
-// Forwards the backend's status code so the browser can distinguish
-// 204 No Content (success) from 404/400/501 (error). The existing
-// proxy_post / proxy_get do not forward status — kept that way to
-// avoid changing behavior of unrelated routes mid-feature.
+function proxy_upload($url) {
+    $len = isset($_SERVER['CONTENT_LENGTH']) ? intval($_SERVER['CONTENT_LENGTH']) : 0;
+    $in = fopen('php://input', 'rb');
+    if (!$in) {
+        header('HTTP/1.1 500 Internal Server Error');
+        echo '{"error":"cannot read request body"}';
+        return;
+    }
+
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'POST');
+    curl_setopt($ch, CURLOPT_UPLOAD, true);
+    curl_setopt($ch, CURLOPT_INFILE, $in);
+    curl_setopt($ch, CURLOPT_INFILESIZE, $len);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+        'Content-Type: application/octet-stream',
+        'Content-Length: ' . $len,
+    ));
+    curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    $resp = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    fclose($in);
+    if ($resp === false) {
+        header('HTTP/1.1 502 Bad Gateway');
+        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+        return;
+    }
+    if ($code) http_response_code($code);
+    echo $resp;
+}
+
+function proxy_download($url) {
+    while (ob_get_level() > 0) { ob_end_clean(); }
+    @ob_implicit_flush(true);
+
+    $sent_headers = false;
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION,
+        function ($ch, $header) use (&$sent_headers) {
+            $len = strlen($header);
+            $h = trim($header);
+            if (!$sent_headers
+                    && preg_match('#^HTTP/\S+\s+(\d+)\b#', $h, $m)) {
+                http_response_code(intval($m[1]));
+                $sent_headers = true;
+                return $len;
+            }
+            if (preg_match('#^(Content-Type|Content-Length|Content-Disposition|Cache-Control):#i', $h)) {
+                header($h);
+            }
+            return $len;
+        });
+    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
+        echo $data;
+        @flush();
+        if (connection_aborted()) return 0;
+        return strlen($data);
+    });
+    $ok = curl_exec($ch);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if (!$sent_headers) {
+        http_response_code(502);
+        header('Content-Type: application/json');
+        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+    } elseif ($ok === false && !connection_aborted()) {
+        // Response headers may already be committed, so only append a
+        // JSON error when the backend failed before the body reached the
+        // browser. Mid-stream failures naturally surface as truncated
+        // downloads.
+        @flush();
+    }
+}
+
+// DELETE helper for /api/save. Mirrors proxy_post/proxy_get by
+// forwarding the backend's status code, including 204 No Content.
 function proxy_delete($url) {
     $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
