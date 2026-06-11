@@ -112,6 +112,26 @@ switch ($action) {
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
+// Headers every proxied backend request must carry. The X-Forwarded-For
+// is the load-bearing one: all backend calls originate from 127.0.0.1
+// (this PHP process), so without it the server sees every browser client
+// as the loopback address and the entire per-IP defense layer collapses
+// to a single shared bucket — one client exhausts RATE_LIMIT_MAX for
+// everyone, MAX_SESSIONS_PER_IP caps all users combined, and the access
+// log records 127.0.0.1 for every connect. The backend trusts only the
+// FIRST token of X-Forwarded-For from a trusted proxy (loopback by
+// default), so we send exactly one token and OVERWRITE rather than
+// append. REMOTE_ADDR is the real client on the typical shared-hosting
+// layout where PHP faces the browser directly; if PHP itself sits behind
+// another proxy, configure that proxy to populate REMOTE_ADDR.
+function backend_headers($extra = array()) {
+    $h = $extra;
+    if (!empty($_SERVER['REMOTE_ADDR'])) {
+        $h[] = 'X-Forwarded-For: ' . $_SERVER['REMOTE_ADDR'];
+    }
+    return $h;
+}
+
 function ping_backend($backend) {
     $ch = curl_init($backend . '/api/ping');
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
@@ -128,7 +148,7 @@ function proxy_post($url) {
     curl_setopt($ch, CURLOPT_POST, true);
     curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array('Content-Type: application/json')));
     curl_setopt($ch, CURLOPT_TIMEOUT, 30);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
@@ -147,6 +167,7 @@ function proxy_post($url) {
 function proxy_get($url) {
     $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
     curl_setopt($ch, CURLOPT_TIMEOUT, 50);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
@@ -177,10 +198,10 @@ function proxy_upload($url) {
     curl_setopt($ch, CURLOPT_INFILE, $in);
     curl_setopt($ch, CURLOPT_INFILESIZE, $len);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array(
         'Content-Type: application/octet-stream',
         'Content-Length: ' . $len,
-    ));
+    )));
     curl_setopt($ch, CURLOPT_TIMEOUT, 0);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
@@ -204,6 +225,7 @@ function proxy_download($url) {
     $sent_headers = false;
     $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     curl_setopt($ch, CURLOPT_TIMEOUT, 0);
     curl_setopt($ch, CURLOPT_HEADERFUNCTION,
@@ -249,6 +271,7 @@ function proxy_delete($url) {
     $ch = curl_init($url);
     curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
     curl_setopt($ch, CURLOPT_TIMEOUT, 10);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
@@ -294,7 +317,7 @@ function proxy_stream($url) {
     // pool exhausts. The browser's EventSource auto-reconnects on EOF so
     // a long-lived session reconnects through the timeout boundary.
     curl_setopt($ch, CURLOPT_TIMEOUT, 3600);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Accept: text/event-stream'));
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array('Accept: text/event-stream')));
     curl_setopt($ch, CURLOPT_HEADERFUNCTION,
         function ($ch, $header) use (&$sent_headers) {
             $len = strlen($header);

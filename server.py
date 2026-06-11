@@ -97,12 +97,6 @@ _vault_disabled = False
 
 __version__ = "0.2.0"
 
-# socket.MSG_DONTWAIT is Unix-only (Linux/BSD/macOS). On platforms that
-# don't define it (Windows, some embedded), Handler._client_gone() falls
-# back to setblocking() around a plain MSG_PEEK. Both yield the same
-# observable behaviour; the flag avoids an AttributeError at import time.
-_HAVE_MSG_DONTWAIT = hasattr(socket, "MSG_DONTWAIT")
-
 # ─── Configuration ───────────────────────────────────────────────────
 
 def _int_env(name, default):
@@ -1009,12 +1003,30 @@ _CREDS_SCHEMA_VERSION = 1
 # filling the on-disk store via repeated multi-MB ct fields.
 _MAX_VAULT_REQUEST_BYTES = 16 * 1024
 # Keys that are ALLOW-listed for connections from websh.json but
-# REJECTED inside vault-stored ssh_options: a browser-side write to the
-# vault could otherwise point ssh at an arbitrary file path and use the
-# ssh parse-error timing as a read-oracle for files readable by the
-# websh uid. Operator-managed websh.json is the trusted source for
-# file-path options.
-_VAULT_DENY_SSH_OPTIONS = frozenset({"identityfile"})
+# REJECTED inside vault-stored ssh_options. websh.json is operator-owned
+# and trusted; vault entries are written by the browser and are NOT, so
+# the connection-shape options that are safe in operator config become
+# attack surface when they come from a saved card:
+#
+#   identityfile                          — point ssh at an arbitrary file
+#       path and use ssh's parse-error timing as a read-oracle for files
+#       readable by the websh uid.
+#   userknownhostsfile / globalknownhostsfile — with the default
+#       StrictHostKeyChecking=no, ssh APPENDS the target's host key to
+#       this path, so a browser-chosen path is an arbitrary file
+#       create/append primitive on the websh host.
+#   proxyjump                             — the host deny-list only
+#       resolves and checks the final target; a jump host named here is
+#       never checked, so a saved card can reach (or pivot through) a
+#       deny-listed bastion. Operator-config jump hosts still work.
+#
+# Operator-managed websh.json remains the trusted source for all of these.
+_VAULT_DENY_SSH_OPTIONS = frozenset({
+    "identityfile",
+    "userknownhostsfile",
+    "globalknownhostsfile",
+    "proxyjump",
+})
 
 
 def _creds_path():
@@ -2583,6 +2595,22 @@ def _cleanup_loop():
 
 class Handler(BaseHTTPRequestHandler):
 
+    # Per-connection socket timeout (seconds). StreamRequestHandler.setup()
+    # applies this to the client socket, so it bounds every blocking recv
+    # and send. Without it (BaseHTTPRequestHandler's default is None) a
+    # slowloris client that dribbles its request line/headers — or one that
+    # stops reading mid-response so a send blocks on a full TCP window —
+    # pins a worker thread forever; since the worker pool is hard-capped
+    # (MAX_THREADS), a handful of stuck connections make the server return
+    # 503 to everyone. 30 s comfortably exceeds the 15 s SSE keepalive and
+    # the 10 s long-poll window (both write/park on far shorter cadences),
+    # and a write timeout on a streaming response is an OSError that
+    # _stream_session/_output already treat as "client gone". It is a
+    # per-operation timeout, not a whole-request deadline, so it does not
+    # abort a slow-but-steady large upload (recv resets on any byte) — it
+    # only reclaims connections that go fully silent.
+    timeout = 30
+
     # ── HTTP plumbing ───────────────────────────────────────────────
 
     def log_message(self, fmt, *args):
@@ -2614,25 +2642,25 @@ class Handler(BaseHTTPRequestHandler):
         as 'still connected'. Used by long-running endpoints to bail
         out before draining destructive state into a dead socket.
 
-        Portable form: MSG_DONTWAIT is Unix-only (Linux/BSD/macOS), so
-        on platforms that don't define it (Windows, some embedded) we
-        fall back to flipping the socket to non-blocking around a plain
-        MSG_PEEK. Both paths behave identically on the success/EAGAIN
-        edge."""
+        The peek is made non-blocking by forcing a zero timeout for the
+        recv and restoring the connection's previous timeout afterwards.
+        We deliberately do NOT rely on MSG_DONTWAIT: when the socket
+        carries a timeout (Handler.timeout is set), CPython wraps even a
+        MSG_DONTWAIT recv in a select() that waits up to that timeout, so
+        the "non-blocking" peek would block for the whole Handler.timeout
+        window. settimeout(0.0) makes the recv truly non-blocking on every
+        platform regardless of the socket's mode."""
         sock = self.connection
+        prev = sock.gettimeout()
         try:
-            if _HAVE_MSG_DONTWAIT:
-                peek = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-            else:
-                old = sock.getblocking()
-                sock.setblocking(False)
+            sock.settimeout(0.0)
+            try:
+                peek = sock.recv(1, socket.MSG_PEEK)
+            finally:
                 try:
-                    peek = sock.recv(1, socket.MSG_PEEK)
-                finally:
-                    try:
-                        sock.setblocking(old)
-                    except OSError:
-                        pass
+                    sock.settimeout(prev)
+                except OSError:
+                    pass
             return peek == b""
         except (BlockingIOError, InterruptedError):
             return False
@@ -2878,7 +2906,9 @@ class Handler(BaseHTTPRequestHandler):
         if raw_opts is not None and not isinstance(raw_opts, dict):
             return _bad("ssh_options must be an object")
         ssh_options, dropped = _filter_ssh_options(raw_opts or {})
-        # Reject vault-side identityfile (read-oracle via ssh parse timing).
+        # Reject vault-side file-path and routing options (read-oracle,
+        # arbitrary file write via known-hosts, deny-list bypass via
+        # ProxyJump). See _VAULT_DENY_SSH_OPTIONS.
         for k in list(ssh_options.keys()):
             if isinstance(k, str) and k.lower() in _VAULT_DENY_SSH_OPTIONS:
                 dropped.append(k)
@@ -3063,9 +3093,9 @@ class Handler(BaseHTTPRequestHandler):
             username = (rec.get("username") or "").strip()
             ssh_options = rec.get("ssh_options") or {}
             if isinstance(ssh_options, dict):
-                # Drop vault-side identityfile entries even if a prior version
-                # stored them; the operator config (websh.json) is the trusted
-                # source for file-path options.
+                # Drop vault-side file-path/routing entries even if a prior
+                # version stored them; the operator config (websh.json) is the
+                # trusted source for these. See _VAULT_DENY_SSH_OPTIONS.
                 ssh_options = {k: v for k, v in ssh_options.items()
                                if isinstance(k, str)
                                and k.lower() not in _VAULT_DENY_SSH_OPTIONS}

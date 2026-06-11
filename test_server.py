@@ -7014,6 +7014,30 @@ class TestApiSave(unittest.TestCase):
         self.assertNotIn("identityfile", stored)
         self.assertIn("StrictHostKeyChecking", stored)
 
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_routing_and_knownhosts_options_stripped_from_saved(self):
+        # ProxyJump (deny-list bypass) and known-hosts file paths (arbitrary
+        # file write under StrictHostKeyChecking=no) are operator-only —
+        # never honored from a browser-saved card. See
+        # _VAULT_DENY_SSH_OPTIONS.
+        body, code = self._post("/api/save",
+            self._valid_body(ssh_options={
+                "ProxyJump": "bastion.internal",
+                "UserKnownHostsFile": "/home/websh/.ssh/authorized_keys",
+                "GlobalKnownHostsFile": "/tmp/evil",
+                "StrictHostKeyChecking": "no",
+            }))
+        self.assertEqual(code, 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        stored = data["vaults"][self.VAULT][self.CONN].get("ssh_options", {})
+        for k in ("ProxyJump", "proxyjump", "UserKnownHostsFile",
+                  "userknownhostsfile", "GlobalKnownHostsFile",
+                  "globalknownhostsfile"):
+            self.assertNotIn(k, stored)
+        # A benign option in the same payload still round-trips.
+        self.assertIn("StrictHostKeyChecking", stored)
+
 
 class TestApiSaveDelete(unittest.TestCase):
     """DELETE /api/save validation, reap-empty-vault, gate."""
@@ -7462,6 +7486,8 @@ class TestApiConnectSaved(unittest.TestCase):
                 "iv": base64.b64encode(iv).decode(),
                 "ct": base64.b64encode(ct).decode(),
                 "ssh_options": {"IdentityFile": "/etc/shadow",
+                                "ProxyJump": "bastion.internal",
+                                "UserKnownHostsFile": "/tmp/evil",
                                 "StrictHostKeyChecking": "yes"},
             }}},
         })
@@ -7476,8 +7502,10 @@ class TestApiConnectSaved(unittest.TestCase):
             })
             self.assertEqual(code, 200)
             opts = MockSSH.call_args.kwargs.get("ssh_options", {})
-            self.assertNotIn("IdentityFile", opts)
-            self.assertNotIn("identityfile", opts)
+            for k in ("IdentityFile", "identityfile", "ProxyJump",
+                      "proxyjump", "UserKnownHostsFile",
+                      "userknownhostsfile"):
+                self.assertNotIn(k, opts)
             self.assertIn("StrictHostKeyChecking", opts)
 
 
@@ -8232,6 +8260,57 @@ class TestTmuxCapture(unittest.TestCase):
         data, err = s.tmux_capture()
         self.assertIsNone(data)
         self.assertIn("not a persistent", err)
+
+
+class TestRequestTimeout(unittest.TestCase):
+    """A slow/stalled client must not pin a worker thread forever.
+
+    Regression guard for the missing per-connection socket timeout: with
+    Handler.timeout unset, a client that opens a connection and dribbles
+    (or never finishes) its request holds a worker until the peer goes
+    away on its own. Under the hard MAX_THREADS cap that is a trivial DoS.
+    """
+
+    def test_timeout_attribute_is_set(self):
+        self.assertIsNotNone(
+            server.Handler.timeout,
+            "Handler.timeout must be set so StreamRequestHandler bounds the "
+            "request-read/response-write phases")
+
+    def test_stalled_request_is_reclaimed(self):
+        import socket as _socket
+        orig = server.Handler.timeout
+        server.Handler.timeout = 0.5  # shrink so the test runs fast
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            s = _socket.create_connection(("127.0.0.1", port), timeout=5)
+            # Send a complete request line but never the blank line that
+            # ends the headers — a classic slowloris stall.
+            s.sendall(b"GET /api/ping HTTP/1.1\r\n")
+            s.settimeout(5)
+            start = time.time()
+            try:
+                # When the header read times out at ~0.5s the server closes
+                # the connection; recv then returns b'' (clean EOF). If the
+                # timeout were missing, recv would block until our own 5s
+                # client timeout fires instead.
+                data = s.recv(1024)
+            except (ConnectionResetError, _socket.timeout):
+                data = b""
+            elapsed = time.time() - start
+            s.close()
+            self.assertLess(
+                elapsed, 3.0,
+                "stalled connection was not reclaimed near Handler.timeout "
+                "(took {:.2f}s)".format(elapsed))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.Handler.timeout = orig
 
 
 if __name__ == "__main__":
