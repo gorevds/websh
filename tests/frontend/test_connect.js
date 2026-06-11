@@ -39,7 +39,17 @@ function makeFakes(win) {
     focus() { this._focusCalls++; }
     blur() { this._blurCalls++; }
     write() {} dispose() {}
-    onData() {} onBinary() {} onResize() {} onBell() {}
+    onData(cb) { this._onDataCb = cb || null; return { dispose: () => { this._onDataCb = null; } }; }
+    onBinary() {} onResize() {} onBell() {}
+    // Real xterm paste() wraps the text in bracketed-paste markers (when
+    // the app enabled the mode) and emits it via onData. The stub doesn't
+    // model bracketed mode; it records the call and forwards to onData so
+    // tests can assert paste routes into the input queue rather than
+    // bypassing it.
+    paste(data) {
+      (this._pasteCalls = this._pasteCalls || []).push(data);
+      if (this._onDataCb) this._onDataCb(data);
+    }
     onSelectionChange(cb) {
       this._selectionChangeCb = cb;
       let self = this;
@@ -157,6 +167,8 @@ const EXPOSE = `
   });
   Object.defineProperty(window, 'selectedPrompt', {get: () => selectedPrompt, configurable: true});
   Object.defineProperty(window, 'authMode', {get: () => authMode, configurable: true});
+  Object.defineProperty(window, 'settings', {get: () => settings, configurable: true});
+  Object.defineProperty(window, 'fontSizeVal', {get: () => fontSize, configurable: true});
   Object.defineProperty(window, '_deferredAfterLegacyModal', {
     get: () => _deferredAfterLegacyModal,
     configurable: true,
@@ -564,6 +576,114 @@ test('pendingSave: NOT committed on auth-fail shortly after connect', async () =
   // Auth-failed triggers after the second poll. Saved list should be empty.
   const saved = JSON.parse(win.localStorage.getItem('websh_connections') || '[]');
   ok(saved.length === 0, 'saved entry NOT committed on quick auth fail; got ' + saved.length);
+  cleanup(env);
+});
+
+test('idle session: deferred save commits via timer with no output frame', async () => {
+  // The output-gated commit in handleOutputPayload only fires on a terminal
+  // frame ≥2.5s after connect. Over SSE an idle session emits none, so the
+  // timer armed by finalizeSuccess (scheduleSaveCommit) is the only path
+  // that can land the save. Simulate it: arm the timer and never call
+  // handleOutputPayload.
+  let saveCalled = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'save', response: () => { saveCalled++; return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const entry = {name: 'Idle', host: 'h.example', port: 22, user: 'u',
+                 auth: 'pw', persistent: false};
+  Object.defineProperty(entry, '__ephemeralSecrets', {
+    value: {password: 'pw', key: null, key_pass: null},
+    enumerable: false, configurable: true, writable: true});
+  const p = {id: 'pi', sid: 'sid-idle', pendingSave: entry,
+             persistent: false, tmuxCmd: 'tmux', connectedAt: Date.now()};
+  win.scheduleSaveCommit(p);
+  await sleep(2800);  // > SAVE_COMMIT_DELAY_MS (2600)
+  ok(saveCalled === 1,
+     'idle session POSTed the deferred save via timer; got ' + saveCalled);
+  ok(!p.pendingSave, 'pendingSave cleared after commit');
+  cleanup(env);
+});
+
+test('deferred save timer: no-op when the session died before it fired', async () => {
+  // Auth failure / disconnect nulls p.sid (and pendingSave). The timer must
+  // not resurrect a save for a dead session.
+  let saveCalled = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'save', response: () => { saveCalled++; return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const entry = {name: 'Dead', host: 'h', port: 22, user: 'u', auth: 'pw',
+                 persistent: false};
+  Object.defineProperty(entry, '__ephemeralSecrets', {
+    value: {password: 'pw', key: null, key_pass: null},
+    enumerable: false, configurable: true, writable: true});
+  const p = {id: 'pd', sid: 'sid-dead', pendingSave: entry,
+             persistent: false, tmuxCmd: 'tmux', connectedAt: Date.now()};
+  win.scheduleSaveCommit(p);
+  p.sid = null;        // session died before the timer fired
+  await sleep(2800);
+  ok(saveCalled === 0,
+     'no save POST when the session died before the timer; got ' + saveCalled);
+  cleanup(env);
+});
+
+test('finalizeSuccess arms the deferred-save timer when Save is ticked', async () => {
+  // Wiring guard: a successful connect with Save ticked must arm
+  // p.saveCommitTimer (the output-independent commit). Without the
+  // scheduleSaveCommit call in finalizeSuccess, an idle SSE session never
+  // saves. Checked at 120ms, well before the 2.6s timer or the 2.5s
+  // output-gated commit could fire.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'connect', response: {session_id: 's-arm', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'save', response: {}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Armed';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(p && p.saveCommitTimer, 'finalizeSuccess armed p.saveCommitTimer');
+  cleanup(env);
+});
+
+test('deferred save timer: cleared when the pane is closed within the window', async () => {
+  // Closing the pane within SAVE_COMMIT_DELAY_MS must NOT save a session the
+  // user just tore down. _destroyPane leaves p.sid set (it only reads it for
+  // the disconnect body), so the timer's guard wouldn't catch this — the
+  // clearTimeout in _destroyPane is what does.
+  let saveCalled = 0;
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'connect', response: {session_id: 's-close', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'disconnect', response: {ok: true}},
+    {action: 'save', response: () => { saveCalled++; return {}; }},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Closed';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(p && p.saveCommitTimer, 'timer armed before close');
+  win._destroyPane(p.id, true);   // user closes the pane within the window
+  await sleep(2800);
+  ok(saveCalled === 0,
+     'no save POST after closing the pane within the window; got ' + saveCalled);
   cleanup(env);
 });
 
@@ -2646,6 +2766,36 @@ test('legacy modal: autoconnect deferred until Got-it (no focus theft / no overl
      'connect overlay shown after legacy modal dismissed');
   ok(win._deferredAfterLegacyModal === null,
      'deferred callback drained');
+  cleanup(env);
+});
+
+test('restrict_hosts single prompt: host pre-filled even when a saved card exists', async () => {
+  // Single-target kiosk (restrict_hosts + exactly one prompt connection): the
+  // host is the only allowed target, so doAutoConnect must pre-lock it via
+  // selectPromptConnection on load even when localStorage already holds a
+  // saved card. The old `loadSaved().length === 0` guard suppressed the
+  // pre-fill once any card was saved, stranding the user on an empty host
+  // field. Regression for a single fixed-target restrict_hosts setup.
+  const plan = [{action: 'config', response: {restrict_hosts: true, vault_enabled: false,
+    connections: [{name: 'hh', host: 'h.example.com', port: 22,
+                   username: '', kind: 'prompt'}]}}];
+  const env = await mkEnv(plan); const win = env.win;
+  // mkEnv booted with empty localStorage, so the initial doAutoConnect
+  // already pre-filled iH. Reset the form so the assertion reflects the
+  // re-trigger below (with a saved card present), not the empty-boot fill.
+  win.selectedPrompt = null;
+  $(win, 'iH').value = ''; $(win, 'iH').disabled = false;
+  // A saved card present — this used to suppress the host pre-fill.
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'HH', host: 'h.example.com', port: 22, user: 'sber',
+     connection: 'hh', auth: 'pw', persistent: true}]));
+  win.loadServerConfig();
+  await sleep(40);
+  ok($(win, 'iH').value === 'h.example.com',
+     'host pre-filled to the single prompt target despite a saved card');
+  ok($(win, 'iH').disabled === true, 'host input locked');
+  ok(win.selectedPrompt && win.selectedPrompt.name === 'hh',
+     'prompt connection auto-selected on load despite saved card');
   cleanup(env);
 });
 
@@ -4777,6 +4927,159 @@ test('connectPane reaps the orphan session when the pane is destroyed mid-connec
   ok(discs.length >= 1, 'orphan session disconnected; got ' + discs.length);
   ok(p.sid !== 'orphan-sid', 'dead pane not activated; sid=' + p.sid);
   ok(p.polling !== true, 'no polling armed on dead pane; polling=' + p.polling);
+  cleanup(env);
+});
+
+// In-flight guard: a second connectPane for the same pane while the first
+// /api/connect is still outstanding must be ignored. Otherwise it launches
+// a second session, overwrites p.sid, and leaks the first server PTY.
+test('connectPane ignores a concurrent connect for the same pane', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-1', alive: true}, delay: 60},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'resize', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win; const log = env.log;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.connectPane(p, {label: 'x', host: '10.0.0.1', user: 'a', password: 'p'});
+  // Duplicate entrant while the first connect is still in flight.
+  win.connectPane(p, {label: 'x', host: '10.0.0.1', user: 'a', password: 'p'});
+  await sleep(140);
+  const connects = log.filter(e => e.action === 'connect');
+  ok(connects.length === 1, 'exactly one connect issued; got ' + connects.length);
+  ok(p.sid === 'sid-1', 'pane ended on the single session; sid=' + p.sid);
+  cleanup(env);
+});
+
+// Stale-frame guard: a late "session not found" for a session the pane has
+// already moved off of must NOT tear down the current session.
+test('handleOutputPayload ignores a stale frame for a replaced session', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-2'; p.polling = true; p.host = '10.0.0.1'; p.user = 'a';
+  const stopped = win.handleOutputPayload(p, {error: 'session not found'}, 'sid-1');
+  ok(stopped === true, 'stale frame tells its own loop to stop');
+  ok(p.sid === 'sid-2', 'current session preserved; sid=' + p.sid);
+  ok(p.polling === true, 'current polling not torn down');
+  cleanup(env);
+});
+
+// Positive control: an error frame whose sid matches the current session
+// still tears it down (so the guard does not over-block real errors).
+test('handleOutputPayload acts on an error frame for the current session', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  // No host/connection → error branch takes the doAutoConnect path, not a
+  // reconnect, so we don't need a connect in the plan.
+  p.sid = 'sid-cur'; p.polling = true; p.host = ''; p.connection = null;
+  const stopped = win.handleOutputPayload(p, {error: 'session not found'}, 'sid-cur');
+  ok(stopped === true, 'current error frame stops the loop');
+  ok(p.sid === null, 'current session torn down; sid=' + p.sid);
+  ok(p.polling === false, 'polling stopped');
+  cleanup(env);
+});
+
+// =====================================================================
+// Connect errors on a reconnect/restore (overlay closed) must surface on
+// the pane, not the hidden #err line inside the closed overlay.
+test('connect error with the overlay closed shows the reconnect bar', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {error: 'no route to host'}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  win.document.getElementById('ov').classList.add('h');  // reconnect context
+  const p = win.createPane(win.document.getElementById('panes'));
+  await win.connectPane(p, {label: 'x', host: '10.0.0.1', user: 'a', password: 'p'});
+  await sleep(40);
+  const bar = p.el.querySelector('[data-reconnect]');
+  ok(bar && !bar.classList.contains('h'),
+     'reconnect bar shown so the user can retry after a connect error');
+  cleanup(env);
+});
+
+test('showErr falls back to a toast when the overlay is closed', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.document.getElementById('ov').classList.add('h');
+  win.showErr('boom');
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length === 1 && /boom/.test(toasts[0].textContent),
+     'error surfaced as a toast; got ' + toasts.length);
+  ok(!win.document.getElementById('err').classList.contains('on'),
+     'hidden inline #err not used when overlay is closed');
+  cleanup(env);
+});
+
+test('showErr uses the inline error line when the overlay is open', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.document.getElementById('ov').classList.remove('h');  // form is open
+  win.showErr('formfail');
+  const err = win.document.getElementById('err');
+  ok(err.classList.contains('on') && /formfail/.test(err.textContent),
+     'inline error line used while the connect form is open');
+  cleanup(env);
+});
+
+// =====================================================================
+// Right-click paste must route through term.paste() (bracketed-paste
+// aware) rather than raw queueInput(), so multi-line clipboard content
+// isn't executed line-by-line in the shell (paste-jacking hazard, made
+// worse by the OSC 52 remote-clipboard-write handler).
+test('right-click paste routes through term.paste, not raw queueInput', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'input', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win; const log = env.log;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-paste';
+  // Stub the async clipboard read with multi-line content.
+  Object.defineProperty(win.navigator, 'clipboard', {
+    value: { readText: () => Promise.resolve('line1\nline2\n') },
+    configurable: true,
+  });
+  const termEl = p.el.querySelector('.pane-term');
+  termEl.dispatchEvent(new win.MouseEvent('contextmenu',
+    {bubbles: true, cancelable: true}));
+  await sleep(40);
+  ok(p.term._pasteCalls && p.term._pasteCalls.length === 1,
+     'term.paste called once; got ' + (p.term._pasteCalls || []).length);
+  ok(p.term._pasteCalls[0] === 'line1\nline2\n',
+     'paste received the clipboard text');
+  const sent = log.filter(e => e.action === 'input' && e.body &&
+                               e.body.session_id === 'sid-paste');
+  ok(sent.length >= 1 &&
+     sent.map(e => e.body.data).join('').indexOf('line1') !== -1,
+     'pasted content reached /api/input via onData');
+  cleanup(env);
+});
+
+// =====================================================================
+// isolate_storage: settings are loaded at module init under the empty
+// prefix, but written (saveSettings) under the path-scoped prefix. After
+// /api/config reveals isolate_storage, loadServerConfig must reload them
+// from the path-scoped key so per-path settings round-trip instead of
+// reading the shared key forever.
+test('isolate_storage reloads settings from the path-scoped key', async () => {
+  // mkEnv URL is http://localhost/websh/ so the path-scope prefix is "/websh/".
+  const env = await mkEnv([
+    {action: 'config', response: {isolate_storage: true, restrict_hosts: false, connections: []}},
+  ]);
+  const win = env.win;
+  // Different fontSizes under the shared (unprefixed) and path-scoped keys.
+  win.localStorage.setItem('websh_settings', JSON.stringify({fontSize: 11}));
+  win.localStorage.setItem('/websh/websh_settings', JSON.stringify({fontSize: 19}));
+  win.eval('loadServerConfig()');   // fresh page-load with the prefix known
+  await sleep(40);
+  ok(win.settings.fontSize === 19,
+     'settings read from the path-scoped key; got ' + win.settings.fontSize);
+  ok(win.fontSizeVal === 19,
+     'fontSize alias re-derived from path-scoped settings; got ' + win.fontSizeVal);
   cleanup(env);
 });
 
