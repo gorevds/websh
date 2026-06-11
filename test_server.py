@@ -2331,6 +2331,102 @@ class TestRateLimit(unittest.TestCase):
         self.assertTrue(server._check_rate_limit("10.0.0.4"))
 
 
+class TestSideChannelRateLimit(unittest.TestCase):
+    """The side-channel endpoints (ls/download/upload/tmux_capture) each
+    spawn an ssh subprocess; they get their own, higher per-IP limit so an
+    unbounded loop can't amplify into thread/process exhaustion."""
+
+    def setUp(self):
+        server._side_channel_rate_limits.clear()
+
+    def test_allowed_within_limit(self):
+        for _ in range(server.SIDE_CHANNEL_RATE_MAX):
+            self.assertTrue(server._check_side_channel_rate_limit("10.1.0.1"))
+
+    def test_blocked_over_limit(self):
+        for _ in range(server.SIDE_CHANNEL_RATE_MAX):
+            server._check_side_channel_rate_limit("10.1.0.2")
+        self.assertFalse(server._check_side_channel_rate_limit("10.1.0.2"))
+
+    def test_independent_from_connect_limiter(self):
+        server._rate_limits.clear()
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 2
+        try:
+            ip = "10.1.0.3"
+            self.assertTrue(server._check_side_channel_rate_limit(ip))
+            self.assertTrue(server._check_side_channel_rate_limit(ip))
+            self.assertFalse(server._check_side_channel_rate_limit(ip))
+            # Exhausting the side-channel bucket leaves the connect bucket
+            # for the same IP with its full budget.
+            self.assertTrue(server._check_rate_limit(ip))
+        finally:
+            server.SIDE_CHANNEL_RATE_MAX = orig
+
+    def test_ls_endpoint_returns_429_when_throttled(self):
+        # HTTP-level: the throttle fires before sid validation, so even
+        # bad-sid calls count and eventually 429 (rather than 404).
+        import http.client
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 2
+        server._side_channel_rate_limits.clear()
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            codes = []
+            for _ in range(3):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", "/api/ls?session_id=bad&path=~")
+                r = c.getresponse()
+                r.read()
+                codes.append(r.status)
+                c.close()
+            self.assertEqual(codes[:2], [404, 404],
+                             "first calls pass the throttle (bad sid → 404)")
+            self.assertEqual(codes[2], 429, "3rd call throttled")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.SIDE_CHANNEL_RATE_MAX = orig
+            server._side_channel_rate_limits.clear()
+
+    def test_post_side_channel_endpoints_are_throttled(self):
+        # tmux_options / upload_finalize / upload_cancel each spawn an ssh
+        # subprocess too, so they share the same per-IP throttle — the guard
+        # fires before body parsing or any ssh work. MAX=0 blocks every
+        # side-channel call, so the first hit on each endpoint must 429.
+        import http.client
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 0
+        server._side_channel_rate_limits.clear()
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            for action in ("tmux_options", "upload_finalize", "upload_cancel"):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/api/" + action,
+                          body=b'{"session_id":"bad","tmp":"x","final":"y"}',
+                          headers={"Content-Type": "application/json"})
+                r = c.getresponse()
+                r.read()
+                c.close()
+                self.assertEqual(
+                    r.status, 429,
+                    action + " must be throttled like the other side-channel "
+                    "endpoints (got %d)" % r.status)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.SIDE_CHANNEL_RATE_MAX = orig
+            server._side_channel_rate_limits.clear()
+
+
 class TestScanPatternDetection(unittest.TestCase):
     """Unit tests for the scan-pattern detector.
 
