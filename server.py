@@ -210,6 +210,16 @@ AUTH_FAIL_PATTERNS = ("permission denied", "authentication failed",
 RATE_LIMIT_WINDOW = _int_env("RATE_LIMIT_WINDOW", "60")    # seconds
 RATE_LIMIT_MAX = _int_env("RATE_LIMIT_MAX", "50")          # max connect attempts per IP per window
 
+# Rate limiting for the side-channel endpoints (ls / download / upload /
+# tmux_capture). Each of these spawns a fresh ssh subprocess and pins a
+# worker thread, but unlike /api/connect they were unthrottled — so one
+# session could fire them in an unbounded loop as a thread/process
+# amplification lever against the hard-capped worker pool. The limit is
+# far more generous than the connect limit because interactive file
+# browsing legitimately makes many ls calls in quick succession.
+SIDE_CHANNEL_RATE_WINDOW = _int_env("SIDE_CHANNEL_RATE_WINDOW", "60")   # seconds
+SIDE_CHANNEL_RATE_MAX = _int_env("SIDE_CHANNEL_RATE_MAX", "240")        # max side-channel calls per IP per window
+
 # Scan-pattern detection: an IP that has hit the deny-list on at least
 # SCAN_PATTERN_THRESHOLD distinct target hosts inside SCAN_PATTERN_WINDOW
 # seconds is plainly probing — log result=scan_pattern so fail2ban can
@@ -629,20 +639,37 @@ def _access_log_emit(event, ip, **fields):
 _rate_limits = {}  # IP -> list of timestamps
 _rate_lock = Lock()
 
+_side_channel_rate_limits = {}  # IP -> list of timestamps
+_side_channel_rate_lock = Lock()
 
-def _check_rate_limit(ip):
-    """Return True if request is allowed, False if rate-limited."""
+
+def _rate_limit_take(store, lock, ip, max_n, window):
+    """Sliding-window token check. Returns True if the request is allowed
+    (and records it), False if the IP has hit max_n within the window."""
     now = time.time()
-    cutoff = now - RATE_LIMIT_WINDOW
-    with _rate_lock:
-        times = _rate_limits.get(ip, [])
-        times = [t for t in times if t > cutoff]
-        if len(times) >= RATE_LIMIT_MAX:
-            _rate_limits[ip] = times
+    cutoff = now - window
+    with lock:
+        times = [t for t in store.get(ip, []) if t > cutoff]
+        if len(times) >= max_n:
+            store[ip] = times
             return False
         times.append(now)
-        _rate_limits[ip] = times
+        store[ip] = times
         return True
+
+
+def _check_rate_limit(ip):
+    """Return True if a /api/connect request is allowed, False if rate-limited."""
+    return _rate_limit_take(_rate_limits, _rate_lock, ip,
+                            RATE_LIMIT_MAX, RATE_LIMIT_WINDOW)
+
+
+def _check_side_channel_rate_limit(ip):
+    """Return True if a side-channel (ls/download/upload/tmux_capture)
+    request is allowed, False if the IP has exceeded the higher
+    side-channel limit."""
+    return _rate_limit_take(_side_channel_rate_limits, _side_channel_rate_lock,
+                            ip, SIDE_CHANNEL_RATE_MAX, SIDE_CHANNEL_RATE_WINDOW)
 
 
 # ─── Scan-pattern detection ─────────────────────────────────────────
@@ -2528,6 +2555,12 @@ def cleanup():
                  if not any(t > cutoff for t in times)]
         for ip in stale:
             del _rate_limits[ip]
+    sc_cutoff = now - SIDE_CHANNEL_RATE_WINDOW
+    with _side_channel_rate_lock:
+        stale = [ip for ip, times in _side_channel_rate_limits.items()
+                 if not any(t > sc_cutoff for t in times)]
+        for ip in stale:
+            del _side_channel_rate_limits[ip]
     # Prune stale scan-pattern entries the same way. Without this the
     # dict grows proportionally to attacker activity and never shrinks
     # — the worst possible scaling profile for a long-running deploy.
@@ -2789,6 +2822,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
+
+    def _side_channel_throttled(self):
+        """Apply the per-IP side-channel rate limit. Returns True (and has
+        already written a 429) when the caller should stop. Each
+        side-channel endpoint spawns an ssh subprocess and pins a worker,
+        so this caps the amplification an unbounded loop could cause."""
+        if not _check_side_channel_rate_limit(self._client_ip()):
+            self._json({"error": "rate_limited"}, 429)
+            return True
+        return False
 
     # ── Vault save / delete ─────────────────────────────────────────
 
@@ -3583,6 +3626,8 @@ class Handler(BaseHTTPRequestHandler):
         """GET /api/tmux_capture?session_id=...
         Returns the full tmux pane buffer as text/plain; only valid for
         persistent sessions."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
@@ -3639,6 +3684,8 @@ class Handler(BaseHTTPRequestHandler):
         remote host through the ControlMaster side-channel (binary, no
         PTY, no base64). Path is interpreted relative to $HOME so the
         client can't escape the user's account; we still reject `..`."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
@@ -3770,6 +3817,8 @@ class Handler(BaseHTTPRequestHandler):
     def _ls(self):
         """GET /api/ls?session_id=<sid>&path=<path>
         List a remote directory via ControlMaster. path defaults to ~."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
@@ -3797,6 +3846,8 @@ class Handler(BaseHTTPRequestHandler):
     def _download(self):
         """GET /api/download?session_id=<sid>&path=<path>
         Stream a file via ControlMaster (binary, no base64)."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
