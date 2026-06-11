@@ -1274,7 +1274,15 @@ window.addEventListener('pageshow', (e) => {
 // Apply one decoded JSON payload from either transport. Returns true if
 // the session ended (auth_failed / alive=false / fatal session error)
 // so callers know to stop their read loop.
-function handleOutputPayload(p, r) {
+function handleOutputPayload(p, r, sid) {
+  // Stale-frame guard: this frame was produced for `sid`, but the pane has
+  // since moved to a different (or no) session — a rapid reconnect or a
+  // transport switch replaced it. Acting on a stale frame is harmful: a
+  // late "session not found" for the OLD sid would otherwise enter the
+  // error branch below and tear down the CURRENT session, wedging the
+  // pane. Drop it and tell the stale loop to stop. (Callers that don't
+  // pass a sid keep the previous behaviour.)
+  if (sid !== undefined && p.sid !== sid) return true;
   if (r.error) {
     // Session not found — stale restore or server restarted. Persistent
     // panes try to re-attach via tmux; short-lived panes just reconnect.
@@ -1425,7 +1433,8 @@ function startOutput(p) {
 function streamOutput(p) {
   if (!p.sid || !p.polling) return;
   closeStream(p);
-  let url = `${API}?action=stream&session_id=${encodeURIComponent(p.sid)}`;
+  let mySid = p.sid;
+  let url = `${API}?action=stream&session_id=${encodeURIComponent(mySid)}`;
   let es;
   try { es = new EventSource(url); }
   catch (e) {
@@ -1476,13 +1485,13 @@ function streamOutput(p) {
     let r;
     try { r = JSON.parse(e.data); }
     catch (err) { console.error('SSE bad payload:', err); return; }
-    handleOutputPayload(p, r);
+    handleOutputPayload(p, r, mySid);
   });
   es.addEventListener('end', e => {
     onBodyEvent();
     let r = {alive: false};
     try { r = JSON.parse(e.data); } catch (err) {}
-    handleOutputPayload(p, r);
+    handleOutputPayload(p, r, mySid);
     closeStream(p);
   });
   es.onerror = () => {
@@ -1505,9 +1514,10 @@ function streamOutput(p) {
 
 function pollOutput(p) {
   if(!p.sid || !p.polling) return;
-  api('output',{query:'&session_id='+p.sid}).then(r => {
+  let mySid = p.sid;
+  api('output',{query:'&session_id='+mySid}).then(r => {
     clearRetryClock(p);
-    if (handleOutputPayload(p, r)) return;
+    if (handleOutputPayload(p, r, mySid)) return;
     if(p.polling) pollOutput(p);
   }).catch(e => {
     let d = nextRetryDelay(p);
@@ -1543,6 +1553,16 @@ function queueInput(p, data) {
 // from IDB at every connect — caching it on the pane would let a
 // sign-out in another tab leave a stale key in memory.
 async function connectPane(p, opts) {
+  // In-flight guard: a connect is already running for this pane. A second
+  // entrant (double Reconnect click, a manual reconnect racing the
+  // session-error auto-reconnect in handleOutputPayload) would launch a
+  // second /api/connect, overwrite p.sid with the later session, and leak
+  // the first server PTY until its idle timeout. Ignore the duplicate.
+  if (p.connecting) {
+    console.log('connectPane: connect already in flight for pane ' + p.id +
+                ', ignoring duplicate');
+    return;
+  }
   p.label = opts.label || '';
   if (opts.host !== undefined) p.host = opts.host || '';
   if (opts.port !== undefined) p.port = opts.port || 22;
