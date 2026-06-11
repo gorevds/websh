@@ -3675,12 +3675,22 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         ok, err = session.upload_file(rel_path, self.rfile, length)
+        host_for_log = getattr(session, "_host", "")
         if not ok:
             _log("WARN", "upload failed sid={} path={} err={}".format(
                 sid, rel_path, err))
+            _access_log_emit("upload", self._client_ip(), sid=sid,
+                             target_host=host_for_log, path=rel_path,
+                             bytes=length, result="error", error=err)
             self._json({"error": err}, 502)
             return
         session.last_activity = time.time()
+        # Audit the transfer (see the matching download emit) so files
+        # pushed in through a logged-in session are visible to the access
+        # log. The path is sanitized + capped by the access-log layer.
+        _access_log_emit("upload", self._client_ip(), sid=sid,
+                         target_host=host_for_log, path=rel_path,
+                         bytes=length, result="ok")
         self._json({"ok": True, "bytes": length, "path": "$HOME/" + rel_path})
 
     def _upload_finalize(self):
@@ -3916,6 +3926,13 @@ class Handler(BaseHTTPRequestHandler):
                 proc.kill()
                 _reap()
         session.last_activity = time.time()
+        # Audit the transfer so bulk exfiltration through a logged-in
+        # session is visible to WEBSH_ACCESS_LOG / fail2ban. `bytes` is the
+        # count actually streamed (so an over-cap abort is recorded as a
+        # partial). The path is sanitized + capped by the access-log layer.
+        _access_log_emit("download", self._client_ip(), sid=sid,
+                         target_host=getattr(session, "_host", ""),
+                         path=path, bytes=sent, result="ok")
 
     # ── Disconnect ──────────────────────────────────────────────────
 
