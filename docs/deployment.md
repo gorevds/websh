@@ -30,7 +30,7 @@ That's it. `api.php` starts `server.py` automatically on the first request.
 > **Path details:** `api.php` looks for `websh.json` two directories up from itself
 > (i.e. the site root, above `www/`). This works for most hosting providers.
 > If your layout is different, set the `WEBSH_CONFIG` environment variable
-> or edit the path in `api.php` line 34.
+> or edit the `$WEBSH_CONFIG` default near the top of `api.php`.
 
 For manual control (e.g. custom config path):
 
@@ -93,10 +93,29 @@ publishing it externally.
 useradd -r -s /bin/false websh
 
 mkdir -p /opt/websh
-cp server.py index.html websh.js /opt/websh/
+# Copy the backend, the frontend, AND the assets/ dir (the logo lives
+# there; without it index.html 404s on assets/websh-logo.svg).
+cp -r server.py index.html websh.js assets/ /opt/websh/
 cp websh.service /etc/systemd/system/
 systemctl enable --now websh
 ```
+
+Unlike the PHP path — where `api.php` computes a config path and passes it
+to the backend — `server.py` under systemd does **not** auto-detect
+`websh.json`: it loads a config only when `WEBSH_CONFIG` is set. Without
+it the server still runs, but server-side connections silently don't
+load. To define connections, point the unit at a config file (kept
+outside any web root):
+
+```bash
+mkdir -p /etc/websh        # then create /etc/websh/websh.json
+systemctl edit websh       # add, under [Service]:
+#   Environment=WEBSH_CONFIG=/etc/websh/websh.json
+systemctl restart websh
+```
+
+The bundled unit also pins `PORT`/`HOST`; change them there (or via
+`systemctl edit`) rather than relying on the in-code defaults.
 
 ## HTTPS via reverse proxy
 
