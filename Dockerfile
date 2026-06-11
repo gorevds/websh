@@ -1,4 +1,6 @@
-FROM python:3-slim
+# Pinned to a specific minor so a base rebase can't silently move Python
+# under us; 3.12 matches the upper end of the CI test matrix.
+FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
