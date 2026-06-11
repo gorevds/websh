@@ -39,7 +39,17 @@ function makeFakes(win) {
     focus() { this._focusCalls++; }
     blur() { this._blurCalls++; }
     write() {} dispose() {}
-    onData() {} onBinary() {} onResize() {} onBell() {}
+    onData(cb) { this._onDataCb = cb || null; return { dispose: () => { this._onDataCb = null; } }; }
+    onBinary() {} onResize() {} onBell() {}
+    // Real xterm paste() wraps the text in bracketed-paste markers (when
+    // the app enabled the mode) and emits it via onData. The stub doesn't
+    // model bracketed mode; it records the call and forwards to onData so
+    // tests can assert paste routes into the input queue rather than
+    // bypassing it.
+    paste(data) {
+      (this._pasteCalls = this._pasteCalls || []).push(data);
+      if (this._onDataCb) this._onDataCb(data);
+    }
     onSelectionChange(cb) {
       this._selectionChangeCb = cb;
       let self = this;
@@ -4777,6 +4787,40 @@ test('connectPane reaps the orphan session when the pane is destroyed mid-connec
   ok(discs.length >= 1, 'orphan session disconnected; got ' + discs.length);
   ok(p.sid !== 'orphan-sid', 'dead pane not activated; sid=' + p.sid);
   ok(p.polling !== true, 'no polling armed on dead pane; polling=' + p.polling);
+  cleanup(env);
+});
+
+// =====================================================================
+// Right-click paste must route through term.paste() (bracketed-paste
+// aware) rather than raw queueInput(), so multi-line clipboard content
+// isn't executed line-by-line in the shell (paste-jacking hazard, made
+// worse by the OSC 52 remote-clipboard-write handler).
+test('right-click paste routes through term.paste, not raw queueInput', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'input', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win; const log = env.log;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-paste';
+  // Stub the async clipboard read with multi-line content.
+  Object.defineProperty(win.navigator, 'clipboard', {
+    value: { readText: () => Promise.resolve('line1\nline2\n') },
+    configurable: true,
+  });
+  const termEl = p.el.querySelector('.pane-term');
+  termEl.dispatchEvent(new win.MouseEvent('contextmenu',
+    {bubbles: true, cancelable: true}));
+  await sleep(40);
+  ok(p.term._pasteCalls && p.term._pasteCalls.length === 1,
+     'term.paste called once; got ' + (p.term._pasteCalls || []).length);
+  ok(p.term._pasteCalls[0] === 'line1\nline2\n',
+     'paste received the clipboard text');
+  const sent = log.filter(e => e.action === 'input' && e.body &&
+                               e.body.session_id === 'sid-paste');
+  ok(sent.length >= 1 &&
+     sent.map(e => e.body.data).join('').indexOf('line1') !== -1,
+     'pasted content reached /api/input via onData');
   cleanup(env);
 });
 
