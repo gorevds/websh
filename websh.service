@@ -16,12 +16,53 @@ Environment=MAX_SESSIONS=10
 User=websh
 Group=websh
 
-# Security hardening
+# Security hardening. websh drives ssh from web-supplied input, so the
+# blast radius of a backend compromise is worth shrinking aggressively.
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
-ReadWritePaths=/tmp
+
+# The service needs no privileges of its own — it only spawns ssh as the
+# unprivileged service user.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# ssh needs outbound IPv4/IPv6; AF_UNIX is required for the ControlMaster
+# socket websh keeps under (private) /tmp. AF_NETLINK is required too:
+# glibc's getaddrinfo() opens a NETLINK_ROUTE socket (__check_pf) to
+# enumerate local address families, so without it DNS resolution can fail
+# — both in server.py's pre-connect _resolve_host_ips() (whose gaierror
+# fall-open would then silently disable the denied-hosts SSRF check) and
+# in the ssh children. Everything else (AF_PACKET, AF_BLUETOOTH, …) is
+# denied.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# Allow only the syscall groups a normal service (and its ssh children)
+# use. @system-service already permits fork/exec/wait, so spawning ssh
+# still works; raw/exotic syscalls are blocked.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+
+# CPython has no JIT and ssh maps no W+X pages, so write-xor-execute is safe.
+MemoryDenyWriteExecute=yes
+
+# Kernel / host surface the service has no business touching.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
 
 # Open-file limit. Each active session holds: 1 PTY master_fd + 1 SSH
 # ControlMaster socket + 1 epoll fd in every SSE/long-poll worker. Under
