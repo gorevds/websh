@@ -38,3 +38,35 @@ jobs:
       - name: Run frontend tests
         working-directory: tests/frontend
         run: node test_connect.js
+
+  php-lint:
+    # The PHP proxy shipped untested — not even syntax-checked. The
+    # ubuntu-latest runner image includes the PHP CLI.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: php -l api.php
+        run: php -l api.php
+
+  docker:
+    # The image could break (bad base rebase, missing COPY) without CI
+    # noticing. Build it and smoke-test that the container boots and the
+    # backend answers /api/ping.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t websh .
+      - name: Boot + ping
+        run: |
+          docker run -d --name websh -p 127.0.0.1:8765:8765 websh
+          ok=
+          for i in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8765/api/ping >/dev/null 2>&1; then
+              ok=1; break
+            fi
+            sleep 1
+          done
+          docker logs websh
+          docker rm -f websh >/dev/null
+          test -n "$ok" || { echo "backend never answered /api/ping"; exit 1; }
