@@ -359,7 +359,15 @@ function createPane(container) {
   termEl.addEventListener('contextmenu', e => {
     e.preventDefault();
     if(navigator.clipboard && navigator.clipboard.readText){
-      navigator.clipboard.readText().then(t => { if(t && p.sid) queueInput(p,t) }).catch(() => {});
+      // Route through term.paste(), not queueInput(), so multi-line
+      // clipboard content is wrapped in bracketed-paste markers when the
+      // remote app has enabled the mode (vim, psql, shells with
+      // bracketed paste on). Sending it raw executes each line
+      // immediately — the classic paste-jacking hazard, made worse here
+      // because the OSC 52 handler lets the remote host seed the
+      // clipboard. paste()'s output flows through term.onData into the
+      // same input queue (and inherits its p.sid guard).
+      navigator.clipboard.readText().then(t => { if(t && p.sid) p.term.paste(t) }).catch(() => {});
     }
   });
 
