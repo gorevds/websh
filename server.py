@@ -97,12 +97,6 @@ _vault_disabled = False
 
 __version__ = "0.2.0"
 
-# socket.MSG_DONTWAIT is Unix-only (Linux/BSD/macOS). On platforms that
-# don't define it (Windows, some embedded), Handler._client_gone() falls
-# back to setblocking() around a plain MSG_PEEK. Both yield the same
-# observable behaviour; the flag avoids an AttributeError at import time.
-_HAVE_MSG_DONTWAIT = hasattr(socket, "MSG_DONTWAIT")
-
 # ─── Configuration ───────────────────────────────────────────────────
 
 def _int_env(name, default):
@@ -2555,6 +2549,22 @@ def _cleanup_loop():
 
 class Handler(BaseHTTPRequestHandler):
 
+    # Per-connection socket timeout (seconds). StreamRequestHandler.setup()
+    # applies this to the client socket, so it bounds every blocking recv
+    # and send. Without it (BaseHTTPRequestHandler's default is None) a
+    # slowloris client that dribbles its request line/headers — or one that
+    # stops reading mid-response so a send blocks on a full TCP window —
+    # pins a worker thread forever; since the worker pool is hard-capped
+    # (MAX_THREADS), a handful of stuck connections make the server return
+    # 503 to everyone. 30 s comfortably exceeds the 15 s SSE keepalive and
+    # the 10 s long-poll window (both write/park on far shorter cadences),
+    # and a write timeout on a streaming response is an OSError that
+    # _stream_session/_output already treat as "client gone". It is a
+    # per-operation timeout, not a whole-request deadline, so it does not
+    # abort a slow-but-steady large upload (recv resets on any byte) — it
+    # only reclaims connections that go fully silent.
+    timeout = 30
+
     # ── HTTP plumbing ───────────────────────────────────────────────
 
     def log_message(self, fmt, *args):
@@ -2586,25 +2596,25 @@ class Handler(BaseHTTPRequestHandler):
         as 'still connected'. Used by long-running endpoints to bail
         out before draining destructive state into a dead socket.
 
-        Portable form: MSG_DONTWAIT is Unix-only (Linux/BSD/macOS), so
-        on platforms that don't define it (Windows, some embedded) we
-        fall back to flipping the socket to non-blocking around a plain
-        MSG_PEEK. Both paths behave identically on the success/EAGAIN
-        edge."""
+        The peek is made non-blocking by forcing a zero timeout for the
+        recv and restoring the connection's previous timeout afterwards.
+        We deliberately do NOT rely on MSG_DONTWAIT: when the socket
+        carries a timeout (Handler.timeout is set), CPython wraps even a
+        MSG_DONTWAIT recv in a select() that waits up to that timeout, so
+        the "non-blocking" peek would block for the whole Handler.timeout
+        window. settimeout(0.0) makes the recv truly non-blocking on every
+        platform regardless of the socket's mode."""
         sock = self.connection
+        prev = sock.gettimeout()
         try:
-            if _HAVE_MSG_DONTWAIT:
-                peek = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-            else:
-                old = sock.getblocking()
-                sock.setblocking(False)
+            sock.settimeout(0.0)
+            try:
+                peek = sock.recv(1, socket.MSG_PEEK)
+            finally:
                 try:
-                    peek = sock.recv(1, socket.MSG_PEEK)
-                finally:
-                    try:
-                        sock.setblocking(old)
-                    except OSError:
-                        pass
+                    sock.settimeout(prev)
+                except OSError:
+                    pass
             return peek == b""
         except (BlockingIOError, InterruptedError):
             return False

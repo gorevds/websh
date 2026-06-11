@@ -8158,5 +8158,56 @@ class TestMainSigtermSubprocess(unittest.TestCase):
                 proc.stderr.decode("utf-8", "replace")))
 
 
+class TestRequestTimeout(unittest.TestCase):
+    """A slow/stalled client must not pin a worker thread forever.
+
+    Regression guard for the missing per-connection socket timeout: with
+    Handler.timeout unset, a client that opens a connection and dribbles
+    (or never finishes) its request holds a worker until the peer goes
+    away on its own. Under the hard MAX_THREADS cap that is a trivial DoS.
+    """
+
+    def test_timeout_attribute_is_set(self):
+        self.assertIsNotNone(
+            server.Handler.timeout,
+            "Handler.timeout must be set so StreamRequestHandler bounds the "
+            "request-read/response-write phases")
+
+    def test_stalled_request_is_reclaimed(self):
+        import socket as _socket
+        orig = server.Handler.timeout
+        server.Handler.timeout = 0.5  # shrink so the test runs fast
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            s = _socket.create_connection(("127.0.0.1", port), timeout=5)
+            # Send a complete request line but never the blank line that
+            # ends the headers — a classic slowloris stall.
+            s.sendall(b"GET /api/ping HTTP/1.1\r\n")
+            s.settimeout(5)
+            start = time.time()
+            try:
+                # When the header read times out at ~0.5s the server closes
+                # the connection; recv then returns b'' (clean EOF). If the
+                # timeout were missing, recv would block until our own 5s
+                # client timeout fires instead.
+                data = s.recv(1024)
+            except (ConnectionResetError, _socket.timeout):
+                data = b""
+            elapsed = time.time() - start
+            s.close()
+            self.assertLess(
+                elapsed, 3.0,
+                "stalled connection was not reclaimed near Handler.timeout "
+                "(took {:.2f}s)".format(elapsed))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.Handler.timeout = orig
+
+
 if __name__ == "__main__":
     unittest.main()
