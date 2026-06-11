@@ -2331,6 +2331,102 @@ class TestRateLimit(unittest.TestCase):
         self.assertTrue(server._check_rate_limit("10.0.0.4"))
 
 
+class TestSideChannelRateLimit(unittest.TestCase):
+    """The side-channel endpoints (ls/download/upload/tmux_capture) each
+    spawn an ssh subprocess; they get their own, higher per-IP limit so an
+    unbounded loop can't amplify into thread/process exhaustion."""
+
+    def setUp(self):
+        server._side_channel_rate_limits.clear()
+
+    def test_allowed_within_limit(self):
+        for _ in range(server.SIDE_CHANNEL_RATE_MAX):
+            self.assertTrue(server._check_side_channel_rate_limit("10.1.0.1"))
+
+    def test_blocked_over_limit(self):
+        for _ in range(server.SIDE_CHANNEL_RATE_MAX):
+            server._check_side_channel_rate_limit("10.1.0.2")
+        self.assertFalse(server._check_side_channel_rate_limit("10.1.0.2"))
+
+    def test_independent_from_connect_limiter(self):
+        server._rate_limits.clear()
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 2
+        try:
+            ip = "10.1.0.3"
+            self.assertTrue(server._check_side_channel_rate_limit(ip))
+            self.assertTrue(server._check_side_channel_rate_limit(ip))
+            self.assertFalse(server._check_side_channel_rate_limit(ip))
+            # Exhausting the side-channel bucket leaves the connect bucket
+            # for the same IP with its full budget.
+            self.assertTrue(server._check_rate_limit(ip))
+        finally:
+            server.SIDE_CHANNEL_RATE_MAX = orig
+
+    def test_ls_endpoint_returns_429_when_throttled(self):
+        # HTTP-level: the throttle fires before sid validation, so even
+        # bad-sid calls count and eventually 429 (rather than 404).
+        import http.client
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 2
+        server._side_channel_rate_limits.clear()
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            codes = []
+            for _ in range(3):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("GET", "/api/ls?session_id=bad&path=~")
+                r = c.getresponse()
+                r.read()
+                codes.append(r.status)
+                c.close()
+            self.assertEqual(codes[:2], [404, 404],
+                             "first calls pass the throttle (bad sid → 404)")
+            self.assertEqual(codes[2], 429, "3rd call throttled")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.SIDE_CHANNEL_RATE_MAX = orig
+            server._side_channel_rate_limits.clear()
+
+    def test_post_side_channel_endpoints_are_throttled(self):
+        # tmux_options / upload_finalize / upload_cancel each spawn an ssh
+        # subprocess too, so they share the same per-IP throttle — the guard
+        # fires before body parsing or any ssh work. MAX=0 blocks every
+        # side-channel call, so the first hit on each endpoint must 429.
+        import http.client
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 0
+        server._side_channel_rate_limits.clear()
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            for action in ("tmux_options", "upload_finalize", "upload_cancel"):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/api/" + action,
+                          body=b'{"session_id":"bad","tmp":"x","final":"y"}',
+                          headers={"Content-Type": "application/json"})
+                r = c.getresponse()
+                r.read()
+                c.close()
+                self.assertEqual(
+                    r.status, 429,
+                    action + " must be throttled like the other side-channel "
+                    "endpoints (got %d)" % r.status)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.SIDE_CHANNEL_RATE_MAX = orig
+            server._side_channel_rate_limits.clear()
+
+
 class TestScanPatternDetection(unittest.TestCase):
     """Unit tests for the scan-pattern detector.
 
@@ -7014,6 +7110,30 @@ class TestApiSave(unittest.TestCase):
         self.assertNotIn("identityfile", stored)
         self.assertIn("StrictHostKeyChecking", stored)
 
+    @unittest.skipUnless(server.HAS_CRYPTOGRAPHY, "needs cryptography")
+    def test_routing_and_knownhosts_options_stripped_from_saved(self):
+        # ProxyJump (deny-list bypass) and known-hosts file paths (arbitrary
+        # file write under StrictHostKeyChecking=no) are operator-only —
+        # never honored from a browser-saved card. See
+        # _VAULT_DENY_SSH_OPTIONS.
+        body, code = self._post("/api/save",
+            self._valid_body(ssh_options={
+                "ProxyJump": "bastion.internal",
+                "UserKnownHostsFile": "/home/websh/.ssh/authorized_keys",
+                "GlobalKnownHostsFile": "/tmp/evil",
+                "StrictHostKeyChecking": "no",
+            }))
+        self.assertEqual(code, 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        stored = data["vaults"][self.VAULT][self.CONN].get("ssh_options", {})
+        for k in ("ProxyJump", "proxyjump", "UserKnownHostsFile",
+                  "userknownhostsfile", "GlobalKnownHostsFile",
+                  "globalknownhostsfile"):
+            self.assertNotIn(k, stored)
+        # A benign option in the same payload still round-trips.
+        self.assertIn("StrictHostKeyChecking", stored)
+
 
 class TestApiSaveDelete(unittest.TestCase):
     """DELETE /api/save validation, reap-empty-vault, gate."""
@@ -7462,6 +7582,8 @@ class TestApiConnectSaved(unittest.TestCase):
                 "iv": base64.b64encode(iv).decode(),
                 "ct": base64.b64encode(ct).decode(),
                 "ssh_options": {"IdentityFile": "/etc/shadow",
+                                "ProxyJump": "bastion.internal",
+                                "UserKnownHostsFile": "/tmp/evil",
                                 "StrictHostKeyChecking": "yes"},
             }}},
         })
@@ -7476,8 +7598,10 @@ class TestApiConnectSaved(unittest.TestCase):
             })
             self.assertEqual(code, 200)
             opts = MockSSH.call_args.kwargs.get("ssh_options", {})
-            self.assertNotIn("IdentityFile", opts)
-            self.assertNotIn("identityfile", opts)
+            for k in ("IdentityFile", "identityfile", "ProxyJump",
+                      "proxyjump", "UserKnownHostsFile",
+                      "userknownhostsfile"):
+                self.assertNotIn(k, opts)
             self.assertIn("StrictHostKeyChecking", opts)
 
 
@@ -8252,6 +8376,133 @@ class TestTransferAccessLog(unittest.TestCase):
         self.assertEqual(r["result"], "ok")
         self.assertEqual(r["target_host"], "h.example")
         self.assertIn("drop.sh", r["path"])
+
+
+class TestTmuxCapture(unittest.TestCase):
+    """SSHSession.tmux_capture() must bound the captured scrollback so a
+    huge tmux history can't be buffered whole into server RAM."""
+
+    def _fake_session(self, tmux_cmd="tmux"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s.master_fd = -1
+        self._cp = tempfile.NamedTemporaryFile(delete=False)
+        self._cp.close()
+        s._control_path = self._cp.name  # must exist for the readiness check
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = tmux_cmd
+        return s
+
+    def tearDown(self):
+        try:
+            os.unlink(self._cp.name)
+        except Exception:
+            pass
+
+    def _run_with(self, stdout, returncode=0):
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            class R:
+                pass
+            R.returncode = returncode
+            R.stdout = stdout
+            R.stderr = b""
+            return R()
+        with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+            data, err = self._fake_session().tmux_capture()
+        return data, err, seen.get("cmd")
+
+    def test_capture_uses_bounded_line_range(self):
+        data, err, cmd = self._run_with(b"hello\n")
+        self.assertIsNone(err)
+        remote_cmd = cmd[-1]  # ssh argv ends with the remote command
+        self.assertIn(
+            "capture-pane -p -J -S -" + str(server.MAX_TMUX_CAPTURE_LINES),
+            remote_cmd)
+        # Must not be the old unbounded "from the start of history" form.
+        self.assertNotIn("-S - ", remote_cmd)
+
+    def test_capture_truncates_oversized_output(self):
+        orig = server.MAX_TMUX_CAPTURE_BYTES
+        server.MAX_TMUX_CAPTURE_BYTES = 100
+        try:
+            data, err, _ = self._run_with(b"x" * 500)
+            self.assertIsNone(err)
+            self.assertIn(b"truncated to the last 100 bytes", data)
+            # The freshest (tail) bytes are kept.
+            self.assertTrue(data.endswith(b"x" * 100))
+            # Only the small marker is added beyond the byte cap.
+            self.assertLessEqual(len(data) - 100, 80)
+        finally:
+            server.MAX_TMUX_CAPTURE_BYTES = orig
+
+    def test_capture_under_cap_is_untouched(self):
+        data, err, _ = self._run_with(b"small output\n")
+        self.assertIsNone(err)
+        self.assertEqual(data, b"small output\n")
+
+    def test_capture_not_persistent(self):
+        s = self._fake_session()
+        s.persistent = False
+        data, err = s.tmux_capture()
+        self.assertIsNone(data)
+        self.assertIn("not a persistent", err)
+
+
+class TestRequestTimeout(unittest.TestCase):
+    """A slow/stalled client must not pin a worker thread forever.
+
+    Regression guard for the missing per-connection socket timeout: with
+    Handler.timeout unset, a client that opens a connection and dribbles
+    (or never finishes) its request holds a worker until the peer goes
+    away on its own. Under the hard MAX_THREADS cap that is a trivial DoS.
+    """
+
+    def test_timeout_attribute_is_set(self):
+        self.assertIsNotNone(
+            server.Handler.timeout,
+            "Handler.timeout must be set so StreamRequestHandler bounds the "
+            "request-read/response-write phases")
+
+    def test_stalled_request_is_reclaimed(self):
+        import socket as _socket
+        orig = server.Handler.timeout
+        server.Handler.timeout = 0.5  # shrink so the test runs fast
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            s = _socket.create_connection(("127.0.0.1", port), timeout=5)
+            # Send a complete request line but never the blank line that
+            # ends the headers — a classic slowloris stall.
+            s.sendall(b"GET /api/ping HTTP/1.1\r\n")
+            s.settimeout(5)
+            start = time.time()
+            try:
+                # When the header read times out at ~0.5s the server closes
+                # the connection; recv then returns b'' (clean EOF). If the
+                # timeout were missing, recv would block until our own 5s
+                # client timeout fires instead.
+                data = s.recv(1024)
+            except (ConnectionResetError, _socket.timeout):
+                data = b""
+            elapsed = time.time() - start
+            s.close()
+            self.assertLess(
+                elapsed, 3.0,
+                "stalled connection was not reclaimed near Handler.timeout "
+                "(took {:.2f}s)".format(elapsed))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.Handler.timeout = orig
 
 
 if __name__ == "__main__":

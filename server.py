@@ -97,12 +97,6 @@ _vault_disabled = False
 
 __version__ = "0.2.0"
 
-# socket.MSG_DONTWAIT is Unix-only (Linux/BSD/macOS). On platforms that
-# don't define it (Windows, some embedded), Handler._client_gone() falls
-# back to setblocking() around a plain MSG_PEEK. Both yield the same
-# observable behaviour; the flag avoids an AttributeError at import time.
-_HAVE_MSG_DONTWAIT = hasattr(socket, "MSG_DONTWAIT")
-
 # ─── Configuration ───────────────────────────────────────────────────
 
 def _int_env(name, default):
@@ -169,6 +163,23 @@ UPLOAD_TIMEOUT = _int_env("UPLOAD_TIMEOUT", "1800")
 # separately and is bounded by MAX_UPLOAD_SIZE instead.
 MAX_BODY_SIZE = _int_env("MAX_BODY_SIZE", str(8 * 1024 * 1024))
 
+# Ceilings for /api/tmux_capture. A persistent session's tmux scrollback
+# can be enormous — history-limit is clamped only at 10M lines — and the
+# capture is buffered whole into server RAM before it is written out, so
+# an unbounded capture is a memory-exhaustion lever (the endpoint is also
+# unauthenticated beyond the session id). The line cap bounds what tmux
+# emits at the source (capture-pane -S -<N> keeps the most recent N lines
+# of history); the byte cap is the absolute ceiling against pathological
+# long lines. Output past either limit is truncated to the most recent
+# content with a marker line prepended so the export isn't silently
+# misleading.
+# max(1, …): a 0/negative override would otherwise break the tmux command
+# (`-S -0` / `-S --5`) or, for the byte cap, silently keep the whole buffer
+# (Python's data[-0:] is data[0:], i.e. everything) — defeating the cap.
+MAX_TMUX_CAPTURE_LINES = max(1, _int_env("WEBSH_TMUX_CAPTURE_LINES", "100000"))
+MAX_TMUX_CAPTURE_BYTES = max(1, _int_env("WEBSH_TMUX_CAPTURE_BYTES",
+                                         str(16 * 1024 * 1024)))
+
 # Trusted proxies (comma-separated IPs) whose X-Forwarded-For header is trusted.
 # Only requests from these IPs will have their X-Forwarded-For used for rate limiting.
 _TRUSTED_PROXIES = set(
@@ -209,6 +220,16 @@ AUTH_FAIL_PATTERNS = ("permission denied", "authentication failed",
 # Rate limiting for /api/connect
 RATE_LIMIT_WINDOW = _int_env("RATE_LIMIT_WINDOW", "60")    # seconds
 RATE_LIMIT_MAX = _int_env("RATE_LIMIT_MAX", "50")          # max connect attempts per IP per window
+
+# Rate limiting for the side-channel endpoints (ls / download / upload /
+# tmux_capture). Each of these spawns a fresh ssh subprocess and pins a
+# worker thread, but unlike /api/connect they were unthrottled — so one
+# session could fire them in an unbounded loop as a thread/process
+# amplification lever against the hard-capped worker pool. The limit is
+# far more generous than the connect limit because interactive file
+# browsing legitimately makes many ls calls in quick succession.
+SIDE_CHANNEL_RATE_WINDOW = _int_env("SIDE_CHANNEL_RATE_WINDOW", "60")   # seconds
+SIDE_CHANNEL_RATE_MAX = _int_env("SIDE_CHANNEL_RATE_MAX", "240")        # max side-channel calls per IP per window
 
 # Scan-pattern detection: an IP that has hit the deny-list on at least
 # SCAN_PATTERN_THRESHOLD distinct target hosts inside SCAN_PATTERN_WINDOW
@@ -629,20 +650,37 @@ def _access_log_emit(event, ip, **fields):
 _rate_limits = {}  # IP -> list of timestamps
 _rate_lock = Lock()
 
+_side_channel_rate_limits = {}  # IP -> list of timestamps
+_side_channel_rate_lock = Lock()
 
-def _check_rate_limit(ip):
-    """Return True if request is allowed, False if rate-limited."""
+
+def _rate_limit_take(store, lock, ip, max_n, window):
+    """Sliding-window token check. Returns True if the request is allowed
+    (and records it), False if the IP has hit max_n within the window."""
     now = time.time()
-    cutoff = now - RATE_LIMIT_WINDOW
-    with _rate_lock:
-        times = _rate_limits.get(ip, [])
-        times = [t for t in times if t > cutoff]
-        if len(times) >= RATE_LIMIT_MAX:
-            _rate_limits[ip] = times
+    cutoff = now - window
+    with lock:
+        times = [t for t in store.get(ip, []) if t > cutoff]
+        if len(times) >= max_n:
+            store[ip] = times
             return False
         times.append(now)
-        _rate_limits[ip] = times
+        store[ip] = times
         return True
+
+
+def _check_rate_limit(ip):
+    """Return True if a /api/connect request is allowed, False if rate-limited."""
+    return _rate_limit_take(_rate_limits, _rate_lock, ip,
+                            RATE_LIMIT_MAX, RATE_LIMIT_WINDOW)
+
+
+def _check_side_channel_rate_limit(ip):
+    """Return True if a side-channel (ls/download/upload/tmux_capture)
+    request is allowed, False if the IP has exceeded the higher
+    side-channel limit."""
+    return _rate_limit_take(_side_channel_rate_limits, _side_channel_rate_lock,
+                            ip, SIDE_CHANNEL_RATE_MAX, SIDE_CHANNEL_RATE_WINDOW)
 
 
 # ─── Scan-pattern detection ─────────────────────────────────────────
@@ -992,12 +1030,30 @@ _CREDS_SCHEMA_VERSION = 1
 # filling the on-disk store via repeated multi-MB ct fields.
 _MAX_VAULT_REQUEST_BYTES = 16 * 1024
 # Keys that are ALLOW-listed for connections from websh.json but
-# REJECTED inside vault-stored ssh_options: a browser-side write to the
-# vault could otherwise point ssh at an arbitrary file path and use the
-# ssh parse-error timing as a read-oracle for files readable by the
-# websh uid. Operator-managed websh.json is the trusted source for
-# file-path options.
-_VAULT_DENY_SSH_OPTIONS = frozenset({"identityfile"})
+# REJECTED inside vault-stored ssh_options. websh.json is operator-owned
+# and trusted; vault entries are written by the browser and are NOT, so
+# the connection-shape options that are safe in operator config become
+# attack surface when they come from a saved card:
+#
+#   identityfile                          — point ssh at an arbitrary file
+#       path and use ssh's parse-error timing as a read-oracle for files
+#       readable by the websh uid.
+#   userknownhostsfile / globalknownhostsfile — with the default
+#       StrictHostKeyChecking=no, ssh APPENDS the target's host key to
+#       this path, so a browser-chosen path is an arbitrary file
+#       create/append primitive on the websh host.
+#   proxyjump                             — the host deny-list only
+#       resolves and checks the final target; a jump host named here is
+#       never checked, so a saved card can reach (or pivot through) a
+#       deny-listed bastion. Operator-config jump hosts still work.
+#
+# Operator-managed websh.json remains the trusted source for all of these.
+_VAULT_DENY_SSH_OPTIONS = frozenset({
+    "identityfile",
+    "userknownhostsfile",
+    "globalknownhostsfile",
+    "proxyjump",
+})
 
 
 def _creds_path():
@@ -2016,12 +2072,15 @@ class SSHSession(object):
             return None, "not a persistent session"
         if not self._control_path or not os.path.exists(self._control_path):
             return None, "control socket not ready"
-        # `-S -` reads from the very start of history, `-J` joins lines that
-        # tmux had wrapped to fit the pane width, `-p` prints to stdout.
-        # tmux_cmd and slot_id are pre-validated regex-restricted strings,
-        # safe to inline.
+        # `-S -<N>` reads the most recent N lines of history (was `-S -`,
+        # the whole history, which on a 10M-line scrollback buffers
+        # hundreds of MB into server RAM); `-J` joins lines that tmux had
+        # wrapped to fit the pane width, `-p` prints to stdout. tmux_cmd
+        # and slot_id are pre-validated regex-restricted strings, safe to
+        # inline.
         tname = "websh-" + self.slot_id
-        remote_cmd = (self.tmux_cmd + " capture-pane -p -J -S - -t " + tname)
+        remote_cmd = (self.tmux_cmd + " capture-pane -p -J -S -" +
+                      str(MAX_TMUX_CAPTURE_LINES) + " -t " + tname)
         ssh_cmd = [
             "ssh", "-T",
             "-o", "BatchMode=yes",
@@ -2038,7 +2097,15 @@ class SSHSession(object):
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return None, "tmux exit %d: %s" % (proc.returncode, err)
-        return proc.stdout, None
+        data = proc.stdout
+        if len(data) > MAX_TMUX_CAPTURE_BYTES:
+            # Absolute byte ceiling regardless of line count (pathological
+            # very long lines). Keep the tail — the freshest scrollback —
+            # and flag the truncation so the export isn't misleading.
+            marker = ("[websh: capture truncated to the last %d bytes]\n"
+                      % MAX_TMUX_CAPTURE_BYTES).encode("utf-8")
+            data = marker + data[-MAX_TMUX_CAPTURE_BYTES:]
+        return data, None
 
     def push_tmux_options(self, options):
         """Apply per-session tmux options live, without typing into the
@@ -2528,6 +2595,12 @@ def cleanup():
                  if not any(t > cutoff for t in times)]
         for ip in stale:
             del _rate_limits[ip]
+    sc_cutoff = now - SIDE_CHANNEL_RATE_WINDOW
+    with _side_channel_rate_lock:
+        stale = [ip for ip, times in _side_channel_rate_limits.items()
+                 if not any(t > sc_cutoff for t in times)]
+        for ip in stale:
+            del _side_channel_rate_limits[ip]
     # Prune stale scan-pattern entries the same way. Without this the
     # dict grows proportionally to attacker activity and never shrinks
     # — the worst possible scaling profile for a long-running deploy.
@@ -2554,6 +2627,22 @@ def _cleanup_loop():
 # ─── HTTP handler ────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
+
+    # Per-connection socket timeout (seconds). StreamRequestHandler.setup()
+    # applies this to the client socket, so it bounds every blocking recv
+    # and send. Without it (BaseHTTPRequestHandler's default is None) a
+    # slowloris client that dribbles its request line/headers — or one that
+    # stops reading mid-response so a send blocks on a full TCP window —
+    # pins a worker thread forever; since the worker pool is hard-capped
+    # (MAX_THREADS), a handful of stuck connections make the server return
+    # 503 to everyone. 30 s comfortably exceeds the 15 s SSE keepalive and
+    # the 10 s long-poll window (both write/park on far shorter cadences),
+    # and a write timeout on a streaming response is an OSError that
+    # _stream_session/_output already treat as "client gone". It is a
+    # per-operation timeout, not a whole-request deadline, so it does not
+    # abort a slow-but-steady large upload (recv resets on any byte) — it
+    # only reclaims connections that go fully silent.
+    timeout = 30
 
     # ── HTTP plumbing ───────────────────────────────────────────────
 
@@ -2586,25 +2675,25 @@ class Handler(BaseHTTPRequestHandler):
         as 'still connected'. Used by long-running endpoints to bail
         out before draining destructive state into a dead socket.
 
-        Portable form: MSG_DONTWAIT is Unix-only (Linux/BSD/macOS), so
-        on platforms that don't define it (Windows, some embedded) we
-        fall back to flipping the socket to non-blocking around a plain
-        MSG_PEEK. Both paths behave identically on the success/EAGAIN
-        edge."""
+        The peek is made non-blocking by forcing a zero timeout for the
+        recv and restoring the connection's previous timeout afterwards.
+        We deliberately do NOT rely on MSG_DONTWAIT: when the socket
+        carries a timeout (Handler.timeout is set), CPython wraps even a
+        MSG_DONTWAIT recv in a select() that waits up to that timeout, so
+        the "non-blocking" peek would block for the whole Handler.timeout
+        window. settimeout(0.0) makes the recv truly non-blocking on every
+        platform regardless of the socket's mode."""
         sock = self.connection
+        prev = sock.gettimeout()
         try:
-            if _HAVE_MSG_DONTWAIT:
-                peek = sock.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
-            else:
-                old = sock.getblocking()
-                sock.setblocking(False)
+            sock.settimeout(0.0)
+            try:
+                peek = sock.recv(1, socket.MSG_PEEK)
+            finally:
                 try:
-                    peek = sock.recv(1, socket.MSG_PEEK)
-                finally:
-                    try:
-                        sock.setblocking(old)
-                    except OSError:
-                        pass
+                    sock.settimeout(prev)
+                except OSError:
+                    pass
             return peek == b""
         except (BlockingIOError, InterruptedError):
             return False
@@ -2790,6 +2879,16 @@ class Handler(BaseHTTPRequestHandler):
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
 
+    def _side_channel_throttled(self):
+        """Apply the per-IP side-channel rate limit. Returns True (and has
+        already written a 429) when the caller should stop. Each
+        side-channel endpoint spawns an ssh subprocess and pins a worker,
+        so this caps the amplification an unbounded loop could cause."""
+        if not _check_side_channel_rate_limit(self._client_ip()):
+            self._json({"error": "rate_limited"}, 429)
+            return True
+        return False
+
     # ── Vault save / delete ─────────────────────────────────────────
 
     def _save_credential(self):
@@ -2850,7 +2949,9 @@ class Handler(BaseHTTPRequestHandler):
         if raw_opts is not None and not isinstance(raw_opts, dict):
             return _bad("ssh_options must be an object")
         ssh_options, dropped = _filter_ssh_options(raw_opts or {})
-        # Reject vault-side identityfile (read-oracle via ssh parse timing).
+        # Reject vault-side file-path and routing options (read-oracle,
+        # arbitrary file write via known-hosts, deny-list bypass via
+        # ProxyJump). See _VAULT_DENY_SSH_OPTIONS.
         for k in list(ssh_options.keys()):
             if isinstance(k, str) and k.lower() in _VAULT_DENY_SSH_OPTIONS:
                 dropped.append(k)
@@ -3035,9 +3136,9 @@ class Handler(BaseHTTPRequestHandler):
             username = (rec.get("username") or "").strip()
             ssh_options = rec.get("ssh_options") or {}
             if isinstance(ssh_options, dict):
-                # Drop vault-side identityfile entries even if a prior version
-                # stored them; the operator config (websh.json) is the trusted
-                # source for file-path options.
+                # Drop vault-side file-path/routing entries even if a prior
+                # version stored them; the operator config (websh.json) is the
+                # trusted source for these. See _VAULT_DENY_SSH_OPTIONS.
                 ssh_options = {k: v for k, v in ssh_options.items()
                                if isinstance(k, str)
                                and k.lower() not in _VAULT_DENY_SSH_OPTIONS}
@@ -3583,6 +3684,8 @@ class Handler(BaseHTTPRequestHandler):
         """GET /api/tmux_capture?session_id=...
         Returns the full tmux pane buffer as text/plain; only valid for
         persistent sessions."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
@@ -3610,6 +3713,8 @@ class Handler(BaseHTTPRequestHandler):
         Body shape mirrors /api/connect: tmux_set_clipboard /
         tmux_history_limit. Anything else is silently ignored by the
         same allow-list used at connect time."""
+        if self._side_channel_throttled():
+            return
         try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
@@ -3639,6 +3744,8 @@ class Handler(BaseHTTPRequestHandler):
         remote host through the ControlMaster side-channel (binary, no
         PTY, no base64). Path is interpreted relative to $HOME so the
         client can't escape the user's account; we still reject `..`."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
@@ -3703,6 +3810,8 @@ class Handler(BaseHTTPRequestHandler):
         fall back to its own foreground-mv path.
 
         Body: { session_id, tmp, final }."""
+        if self._side_channel_throttled():
+            return
         try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
@@ -3751,6 +3860,8 @@ class Handler(BaseHTTPRequestHandler):
         editor). Idempotent.
 
         Body: { session_id, tmp }."""
+        if self._side_channel_throttled():
+            return
         try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
@@ -3780,6 +3891,8 @@ class Handler(BaseHTTPRequestHandler):
     def _ls(self):
         """GET /api/ls?session_id=<sid>&path=<path>
         List a remote directory via ControlMaster. path defaults to ~."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
@@ -3807,6 +3920,8 @@ class Handler(BaseHTTPRequestHandler):
     def _download(self):
         """GET /api/download?session_id=<sid>&path=<path>
         Stream a file via ControlMaster (binary, no base64)."""
+        if self._side_channel_throttled():
+            return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
