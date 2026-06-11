@@ -7014,6 +7014,29 @@ class TestApiSave(unittest.TestCase):
         self.assertNotIn("identityfile", stored)
         self.assertIn("StrictHostKeyChecking", stored)
 
+    def test_routing_and_knownhosts_options_stripped_from_saved(self):
+        # ProxyJump (deny-list bypass) and known-hosts file paths (arbitrary
+        # file write under StrictHostKeyChecking=no) are operator-only —
+        # never honored from a browser-saved card. See
+        # _VAULT_DENY_SSH_OPTIONS.
+        body, code = self._post("/api/save",
+            self._valid_body(ssh_options={
+                "ProxyJump": "bastion.internal",
+                "UserKnownHostsFile": "/home/websh/.ssh/authorized_keys",
+                "GlobalKnownHostsFile": "/tmp/evil",
+                "StrictHostKeyChecking": "no",
+            }))
+        self.assertEqual(code, 200)
+        with open(self.creds_path) as f:
+            data = json.load(f)
+        stored = data["vaults"][self.VAULT][self.CONN].get("ssh_options", {})
+        for k in ("ProxyJump", "proxyjump", "UserKnownHostsFile",
+                  "userknownhostsfile", "GlobalKnownHostsFile",
+                  "globalknownhostsfile"):
+            self.assertNotIn(k, stored)
+        # A benign option in the same payload still round-trips.
+        self.assertIn("StrictHostKeyChecking", stored)
+
 
 class TestApiSaveDelete(unittest.TestCase):
     """DELETE /api/save validation, reap-empty-vault, gate."""
@@ -7462,6 +7485,8 @@ class TestApiConnectSaved(unittest.TestCase):
                 "iv": base64.b64encode(iv).decode(),
                 "ct": base64.b64encode(ct).decode(),
                 "ssh_options": {"IdentityFile": "/etc/shadow",
+                                "ProxyJump": "bastion.internal",
+                                "UserKnownHostsFile": "/tmp/evil",
                                 "StrictHostKeyChecking": "yes"},
             }}},
         })
@@ -7476,8 +7501,10 @@ class TestApiConnectSaved(unittest.TestCase):
             })
             self.assertEqual(code, 200)
             opts = MockSSH.call_args.kwargs.get("ssh_options", {})
-            self.assertNotIn("IdentityFile", opts)
-            self.assertNotIn("identityfile", opts)
+            for k in ("IdentityFile", "identityfile", "ProxyJump",
+                      "proxyjump", "UserKnownHostsFile",
+                      "userknownhostsfile"):
+                self.assertNotIn(k, opts)
             self.assertIn("StrictHostKeyChecking", opts)
 
 
