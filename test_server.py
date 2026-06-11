@@ -8158,5 +8158,81 @@ class TestMainSigtermSubprocess(unittest.TestCase):
                 proc.stderr.decode("utf-8", "replace")))
 
 
+class TestTmuxCapture(unittest.TestCase):
+    """SSHSession.tmux_capture() must bound the captured scrollback so a
+    huge tmux history can't be buffered whole into server RAM."""
+
+    def _fake_session(self, tmux_cmd="tmux"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s.master_fd = -1
+        self._cp = tempfile.NamedTemporaryFile(delete=False)
+        self._cp.close()
+        s._control_path = self._cp.name  # must exist for the readiness check
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = tmux_cmd
+        return s
+
+    def tearDown(self):
+        try:
+            os.unlink(self._cp.name)
+        except Exception:
+            pass
+
+    def _run_with(self, stdout, returncode=0):
+        seen = {}
+        def fake_run(cmd, **kw):
+            seen["cmd"] = cmd
+            class R:
+                pass
+            R.returncode = returncode
+            R.stdout = stdout
+            R.stderr = b""
+            return R()
+        with unittest.mock.patch.object(server.subprocess, "run", fake_run):
+            data, err = self._fake_session().tmux_capture()
+        return data, err, seen.get("cmd")
+
+    def test_capture_uses_bounded_line_range(self):
+        data, err, cmd = self._run_with(b"hello\n")
+        self.assertIsNone(err)
+        remote_cmd = cmd[-1]  # ssh argv ends with the remote command
+        self.assertIn(
+            "capture-pane -p -J -S -" + str(server.MAX_TMUX_CAPTURE_LINES),
+            remote_cmd)
+        # Must not be the old unbounded "from the start of history" form.
+        self.assertNotIn("-S - ", remote_cmd)
+
+    def test_capture_truncates_oversized_output(self):
+        orig = server.MAX_TMUX_CAPTURE_BYTES
+        server.MAX_TMUX_CAPTURE_BYTES = 100
+        try:
+            data, err, _ = self._run_with(b"x" * 500)
+            self.assertIsNone(err)
+            self.assertIn(b"truncated to the last 100 bytes", data)
+            # The freshest (tail) bytes are kept.
+            self.assertTrue(data.endswith(b"x" * 100))
+            # Only the small marker is added beyond the byte cap.
+            self.assertLessEqual(len(data) - 100, 80)
+        finally:
+            server.MAX_TMUX_CAPTURE_BYTES = orig
+
+    def test_capture_under_cap_is_untouched(self):
+        data, err, _ = self._run_with(b"small output\n")
+        self.assertIsNone(err)
+        self.assertEqual(data, b"small output\n")
+
+    def test_capture_not_persistent(self):
+        s = self._fake_session()
+        s.persistent = False
+        data, err = s.tmux_capture()
+        self.assertIsNone(data)
+        self.assertIn("not a persistent", err)
+
+
 if __name__ == "__main__":
     unittest.main()
