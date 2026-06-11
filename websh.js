@@ -3078,7 +3078,17 @@ function doConnect() {
 function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
-    if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
+    if(cfg.isolate_storage) {
+      storagePrefix = location.pathname.replace(/[^/]*$/, '');
+      // `settings`/`fontSize` were loaded at module init under the empty
+      // prefix (the shared key), because the path scope is only known once
+      // /api/config returns. saveSettings() writes to the prefixed key, so
+      // without reloading here the read and write keys diverge: per-path
+      // settings never round-trip and another instance's values bleed in
+      // at boot. Re-read from the now-correct path-scoped key.
+      settings = loadSettings();
+      fontSize = settings.fontSize;
+    }
     // Re-mint the vault BroadcastChannel with the now-known storagePrefix
     // so sign-out signals don't cross path-scoped namespaces. No-op if
     // the prefix matches what the module-init open already used (i.e.
