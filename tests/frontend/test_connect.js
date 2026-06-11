@@ -4781,6 +4781,49 @@ test('connectPane reaps the orphan session when the pane is destroyed mid-connec
 });
 
 // =====================================================================
+// Connect errors on a reconnect/restore (overlay closed) must surface on
+// the pane, not the hidden #err line inside the closed overlay.
+test('connect error with the overlay closed shows the reconnect bar', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {error: 'no route to host'}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  win.document.getElementById('ov').classList.add('h');  // reconnect context
+  const p = win.createPane(win.document.getElementById('panes'));
+  await win.connectPane(p, {label: 'x', host: '10.0.0.1', user: 'a', password: 'p'});
+  await sleep(40);
+  const bar = p.el.querySelector('[data-reconnect]');
+  ok(bar && !bar.classList.contains('h'),
+     'reconnect bar shown so the user can retry after a connect error');
+  cleanup(env);
+});
+
+test('showErr falls back to a toast when the overlay is closed', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.document.getElementById('ov').classList.add('h');
+  win.showErr('boom');
+  const toasts = win.document.querySelectorAll('#toastHost .toast');
+  ok(toasts.length === 1 && /boom/.test(toasts[0].textContent),
+     'error surfaced as a toast; got ' + toasts.length);
+  ok(!win.document.getElementById('err').classList.contains('on'),
+     'hidden inline #err not used when overlay is closed');
+  cleanup(env);
+});
+
+test('showErr uses the inline error line when the overlay is open', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.document.getElementById('ov').classList.remove('h');  // form is open
+  win.showErr('formfail');
+  const err = win.document.getElementById('err');
+  ok(err.classList.contains('on') && /formfail/.test(err.textContent),
+     'inline error line used while the connect form is open');
+  cleanup(env);
+});
+
+// =====================================================================
 // The client-side upload-mv collision loop must build name(1), name(2)
 // from the original name, not strip a "(...)" suffix (which mangled real
 // names with parentheses). Mirrors the server-side finalize fix.
