@@ -1689,7 +1689,7 @@ async function connectPane(p, opts) {
       }
       console.log('connect result:', r);
       p.connecting = false;
-      if (r.error) { p.pendingSave = null; showErr(r.error); updatePaneBadge(p); return }
+      if (r.error) { p.pendingSave = null; surfaceConnectError(p, r.error, 'error'); updatePaneBadge(p); return }
       if (r.auth_failed) {
         p.pendingSave = null;
         updatePaneBadge(p);
@@ -1710,7 +1710,7 @@ async function connectPane(p, opts) {
       }
       if (r.alive === false) {
         p.pendingSave = null;
-        showErr('SSH process exited immediately');
+        surfaceConnectError(p, 'SSH process exited immediately', 'error');
         updatePaneBadge(p);
         if (p.persistent) showTmuxBar(p, 'Connection died immediately — tmux may be missing on ' + (p.host || 'target') + '.');
         return;
@@ -1756,7 +1756,7 @@ async function connectPane(p, opts) {
       // just bail rather than flashing a global error for a closed pane.
       if (panes[p.id] !== p) return;
       p.connecting = false;
-      showErr('Connection failed: ' + e.message);
+      surfaceConnectError(p, 'Connection failed: ' + e.message, 'error');
       updatePaneBadge(p);
     });
 }
@@ -2197,8 +2197,32 @@ function hideOverlay(){
   $('iKeyPw').value = '';
   $('iName').value = '';
 }
-function showErr(m){ let e=$('err'); e.textContent=m; e.classList.add('on') }
+function showErr(m){
+  // #err lives inside the connect overlay. When the overlay is closed
+  // (reconnect, F5 restore, a mid-session error), writing to it is
+  // invisible — the message would be silently swallowed. Fall back to a
+  // toast so it's always seen. When the overlay is open (the user is on
+  // the connect form), keep the inline error line as before.
+  if ($('ov').classList.contains('h')) { showToast(m, 'err'); return; }
+  let e=$('err'); e.textContent=m; e.classList.add('on');
+}
 function hideErr(){ $('err').classList.remove('on') }
+
+// Surface a connect failure on the right surface. With the connect overlay
+// open (user just clicked Connect) the message belongs in the form error
+// line so they can fix and retry. With it closed (reconnect / F5 restore /
+// auto-retry) the form is invisible — write to the pane terminal and, if
+// the pane has a target, show the reconnect bar so the user can recover
+// instead of staring at a dead pane. (showErr already falls back to a
+// toast, so even a target-less pane never loses the text.)
+function surfaceConnectError(p, msg, reason) {
+  if (!$('ov').classList.contains('h')) { showErr(msg); return; }
+  try { p.term.write('\r\n\x1b[91m--- ' + msg + ' ---\x1b[0m\r\n'); } catch (e) {}
+  if (p.host || p.connection) showReconnectBar(p, reason || 'error');
+  connectingFor = null;
+  overlayMode = null;
+  pendingSplit = null;
+}
 
 // Non-blocking notification. `kind` is one of '', 'warn', 'err'. Used by
 // background flows (e.g. /api/save failures) so the live terminal isn't
