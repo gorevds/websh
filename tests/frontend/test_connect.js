@@ -157,6 +157,8 @@ const EXPOSE = `
   });
   Object.defineProperty(window, 'selectedPrompt', {get: () => selectedPrompt, configurable: true});
   Object.defineProperty(window, 'authMode', {get: () => authMode, configurable: true});
+  Object.defineProperty(window, 'settings', {get: () => settings, configurable: true});
+  Object.defineProperty(window, 'fontSizeVal', {get: () => fontSize, configurable: true});
   Object.defineProperty(window, '_deferredAfterLegacyModal', {
     get: () => _deferredAfterLegacyModal,
     configurable: true,
@@ -4777,6 +4779,30 @@ test('connectPane reaps the orphan session when the pane is destroyed mid-connec
   ok(discs.length >= 1, 'orphan session disconnected; got ' + discs.length);
   ok(p.sid !== 'orphan-sid', 'dead pane not activated; sid=' + p.sid);
   ok(p.polling !== true, 'no polling armed on dead pane; polling=' + p.polling);
+  cleanup(env);
+});
+
+// =====================================================================
+// isolate_storage: settings are loaded at module init under the empty
+// prefix, but written (saveSettings) under the path-scoped prefix. After
+// /api/config reveals isolate_storage, loadServerConfig must reload them
+// from the path-scoped key so per-path settings round-trip instead of
+// reading the shared key forever.
+test('isolate_storage reloads settings from the path-scoped key', async () => {
+  // mkEnv URL is http://localhost/websh/ so the path-scope prefix is "/websh/".
+  const env = await mkEnv([
+    {action: 'config', response: {isolate_storage: true, restrict_hosts: false, connections: []}},
+  ]);
+  const win = env.win;
+  // Different fontSizes under the shared (unprefixed) and path-scoped keys.
+  win.localStorage.setItem('websh_settings', JSON.stringify({fontSize: 11}));
+  win.localStorage.setItem('/websh/websh_settings', JSON.stringify({fontSize: 19}));
+  win.eval('loadServerConfig()');   // fresh page-load with the prefix known
+  await sleep(40);
+  ok(win.settings.fontSize === 19,
+     'settings read from the path-scoped key; got ' + win.settings.fontSize);
+  ok(win.fontSizeVal === 19,
+     'fontSize alias re-derived from path-scoped settings; got ' + win.fontSizeVal);
   cleanup(env);
 });
 
