@@ -2393,6 +2393,39 @@ class TestSideChannelRateLimit(unittest.TestCase):
             server.SIDE_CHANNEL_RATE_MAX = orig
             server._side_channel_rate_limits.clear()
 
+    def test_post_side_channel_endpoints_are_throttled(self):
+        # tmux_options / upload_finalize / upload_cancel each spawn an ssh
+        # subprocess too, so they share the same per-IP throttle — the guard
+        # fires before body parsing or any ssh work. MAX=0 blocks every
+        # side-channel call, so the first hit on each endpoint must 429.
+        import http.client
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 0
+        server._side_channel_rate_limits.clear()
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        time.sleep(0.1)
+        try:
+            for action in ("tmux_options", "upload_finalize", "upload_cancel"):
+                c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                c.request("POST", "/api/" + action,
+                          body=b'{"session_id":"bad","tmp":"x","final":"y"}',
+                          headers={"Content-Type": "application/json"})
+                r = c.getresponse()
+                r.read()
+                c.close()
+                self.assertEqual(
+                    r.status, 429,
+                    action + " must be throttled like the other side-channel "
+                    "endpoints (got %d)" % r.status)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server.SIDE_CHANNEL_RATE_MAX = orig
+            server._side_channel_rate_limits.clear()
+
 
 class TestScanPatternDetection(unittest.TestCase):
     """Unit tests for the scan-pattern detector.

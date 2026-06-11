@@ -3713,6 +3713,8 @@ class Handler(BaseHTTPRequestHandler):
         Body shape mirrors /api/connect: tmux_set_clipboard /
         tmux_history_limit. Anything else is silently ignored by the
         same allow-list used at connect time."""
+        if self._side_channel_throttled():
+            return
         try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
@@ -3798,6 +3800,8 @@ class Handler(BaseHTTPRequestHandler):
         fall back to its own foreground-mv path.
 
         Body: { session_id, tmp, final }."""
+        if self._side_channel_throttled():
+            return
         try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
@@ -3846,6 +3850,8 @@ class Handler(BaseHTTPRequestHandler):
         editor). Idempotent.
 
         Body: { session_id, tmp }."""
+        if self._side_channel_throttled():
+            return
         try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
