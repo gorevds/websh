@@ -10,7 +10,7 @@ Environment variables for `server.py`:
 | `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
 | `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |
 | `WEBSH_CONFIG` | *(unset)* | Path to `websh.json`. `server.py` loads a config only when this is set; the PHP proxy computes a default (`../../websh.json`). |
-| `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI when `cryptography` is installed. See [`encryption.md`](encryption.md). |
+| `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI (requires `cryptography`). The bundled `websh.service` and Docker image ship the dependency and a writable creds path, so enabling the vault there is a one-line opt-in. See [`encryption.md`](encryption.md). |
 | `WEBSH_CREDS_PATH` | *(sibling of `WEBSH_CONFIG`)* | Path to the encrypted credential store `websh.creds.json`. See [`encryption.md`](encryption.md). Created lazily on first user save with mode `0600`. |
 | `WEBSH_REQUIRE_VAULT` | `0` | Set to `1` to make legacy plaintext credentials in `websh.json` a fatal startup error (forces migration to the vault) instead of a warning. See [`encryption.md`](encryption.md). |
 | `TRUSTED_PROXIES` | `127.0.0.1` | Comma-separated IPs to trust `X-Forwarded-For` from |

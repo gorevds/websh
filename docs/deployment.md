@@ -80,6 +80,15 @@ docker build -t websh .
 docker run -d -p 127.0.0.1:8765:8765 websh
 ```
 
+The image ships the vault dependency but leaves it **off** by default. To
+enable it, add `-e WEBSH_VAULT_ENABLE=1`; the encrypted store lives under
+the `/data` volume. Mount a named volume to persist it across container
+replacement:
+
+```bash
+docker run -d -p 127.0.0.1:8765:8765 -e WEBSH_VAULT_ENABLE=1 -v websh-data:/data websh
+```
+
 Open `http://localhost:8765/` — the backend serves the frontend directly.
 The container still listens on `0.0.0.0` internally so Docker port
 publishing works, but the command above binds the published host port to
@@ -96,6 +105,14 @@ mkdir -p /opt/websh
 # Copy the backend, the frontend, AND the assets/ dir (the logo lives
 # there; without it index.html 404s on assets/websh-logo.svg).
 cp -r server.py index.html websh.js assets/ /opt/websh/
+
+# Install the one optional dependency so the encrypted credential vault
+# can be enabled (it ships off by default). On Debian/Ubuntu the system
+# Python is externally managed (PEP 668), so use the distro package rather
+# than a system-wide pip; skipping this is non-fatal — the server still
+# runs and the saved-credential UI just stays hidden.
+apt install python3-cryptography   # or: pip install --break-system-packages -r requirements.txt
+
 cp websh.service /etc/systemd/system/
 systemctl enable --now websh
 ```
@@ -116,6 +133,14 @@ systemctl restart websh
 
 The bundled unit also pins `PORT`/`HOST`; change them there (or via
 `systemctl edit`) rather than relying on the in-code defaults.
+
+The unit pre-provisions a writable `/var/lib/websh` via
+`StateDirectory=websh`, but leaves the encrypted credential vault **off**
+by default. With `cryptography` installed (the optional step above),
+enabling it is one line — add `Environment=WEBSH_VAULT_ENABLE=1` in the
+same `systemctl edit` override; saved credentials then persist (encrypted)
+under `/var/lib/websh/websh.creds.json`. See
+[`encryption.md`](encryption.md).
 
 ## HTTPS via reverse proxy
 
