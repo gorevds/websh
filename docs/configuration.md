@@ -9,7 +9,7 @@ Environment variables for `server.py`:
 | `SESSION_TIMEOUT` | `300` | Idle timeout in seconds |
 | `MAX_SESSIONS` | `50` | Max concurrent SSH sessions |
 | `MAX_SESSIONS_PER_IP` | `0` | Max concurrent sessions per source IP (`0` disables; counts foreground + background together) |
-| `WEBSH_CONFIG` | *(auto-detected)* | Path to `websh.json` config file |
+| `WEBSH_CONFIG` | *(unset)* | Path to `websh.json`. `server.py` loads a config only when this is set; the PHP proxy computes a default (`../../websh.json`). |
 | `WEBSH_VAULT_ENABLE` | `0` | Set to `1` to enable the encrypted credential vault endpoints and saved-credential UI when `cryptography` is installed. See [`encryption.md`](encryption.md). |
 | `WEBSH_CREDS_PATH` | *(sibling of `WEBSH_CONFIG`)* | Path to the encrypted credential store `websh.creds.json`. See [`encryption.md`](encryption.md). Created lazily on first user save with mode `0600`. |
 | `WEBSH_REQUIRE_VAULT` | `0` | Set to `1` to make legacy plaintext credentials in `websh.json` a fatal startup error (forces migration to the vault) instead of a warning. See [`encryption.md`](encryption.md). |
@@ -22,14 +22,14 @@ Environment variables for `server.py`:
 | `WEBSH_MAX_THREADS` | `4 × (MAX_SESSIONS + MAX_BG_SESSIONS) + 64` (`464` at defaults) | Hard cap on concurrent HTTP worker threads. New requests past the cap get an immediate `503 {"error":"busy"}`. Values below `1` are clamped to `1` with a startup WARN; there is no "unlimited" mode by design. |
 | `RATE_LIMIT_MAX` | `50` | Max `/api/connect` attempts per IP per window |
 | `RATE_LIMIT_WINDOW` | `60` | Rate-limit window in seconds |
-| `SIDE_CHANNEL_RATE_MAX` | `240` | Max side-channel calls (`ls`/`download`/`upload`/`tmux_capture`) per IP per window; far higher than the connect limit because file browsing makes many `ls` calls. *(ships with [#117](https://github.com/dolonet/websh/pull/117))* |
-| `SIDE_CHANNEL_RATE_WINDOW` | `60` | Side-channel rate-limit window in seconds. *(ships with [#117](https://github.com/dolonet/websh/pull/117))* |
+| `SIDE_CHANNEL_RATE_MAX` | `240` | Max side-channel calls (`ls`/`download`/`upload`/`tmux_capture`) per IP per window; far higher than the connect limit because file browsing makes many `ls` calls. |
+| `SIDE_CHANNEL_RATE_WINDOW` | `60` | Side-channel rate-limit window in seconds. |
 | `SCAN_PATTERN_THRESHOLD` | `0` | One IP that probes at least N distinct deny-listed targets in `SCAN_PATTERN_WINDOW` seconds gets `result=scan_pattern` events emitted starting on the Nth probe; `0` disables. ANY successful connect from the same IP clears state, so legitimate users never accumulate. |
 | `SCAN_PATTERN_WINDOW` | `300` | Sliding window for scan-pattern detection, in seconds |
 | `WEBSH_TMUX_IDLE_TTL` | `259200` | Seconds a detached persistent tmux session may idle on the target before it's reaped (default 72h, `0` disables) |
 | `WEBSH_TMUX_WATCHDOG_POLL` | `300` | Seconds between idle-TTL watchdog checks on the target (clamped to a minimum of `5`) |
-| `WEBSH_TMUX_CAPTURE_LINES` | `100000` | Max lines `/api/tmux_capture` reads from the tmux scrollback (`-S -N`); bounds capture RAM. *(ships with [#116](https://github.com/dolonet/websh/pull/116))* |
-| `WEBSH_TMUX_CAPTURE_BYTES` | `16777216` (16 MiB) | Absolute byte ceiling on a tmux capture; output past it is truncated to the freshest tail with a marker. *(ships with [#116](https://github.com/dolonet/websh/pull/116))* |
+| `WEBSH_TMUX_CAPTURE_LINES` | `100000` | Max lines `/api/tmux_capture` reads from the tmux scrollback (`-S -N`); bounds capture RAM. |
+| `WEBSH_TMUX_CAPTURE_BYTES` | `16777216` (16 MiB) | Absolute byte ceiling on a tmux capture; output past it is truncated to the freshest tail with a marker. |
 | `WEBSH_ACCESS_LOG` | *(unset)* | Path to a JSON-line access log; when unset, no access log is written. See [`security.md`](security.md#access-log) for the record format. |
 
 The PHP proxy reads `WEBSH_PORT` (default `8765`) to find the backend.
