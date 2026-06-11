@@ -80,6 +80,15 @@ docker build -t websh .
 docker run -d -p 127.0.0.1:8765:8765 websh
 ```
 
+The image ships the vault dependency but leaves it **off** by default. To
+enable it, add `-e WEBSH_VAULT_ENABLE=1`; the encrypted store lives under
+the `/data` volume. Mount a named volume to persist it across container
+replacement:
+
+```bash
+docker run -d -p 127.0.0.1:8765:8765 -e WEBSH_VAULT_ENABLE=1 -v websh-data:/data websh
+```
+
 Open `http://localhost:8765/` — the backend serves the frontend directly.
 The container still listens on `0.0.0.0` internally so Docker port
 publishing works, but the command above binds the published host port to
@@ -96,19 +105,22 @@ mkdir -p /opt/websh
 cp server.py index.html websh.js /opt/websh/
 cp -r assets /opt/websh/
 
-# The bundled unit enables the encrypted credential vault by default, so
-# install the one optional dependency. Skipping this is non-fatal — the
-# server still runs and the saved-credential UI just stays hidden.
-pip install -r requirements.txt
+# Install the one optional dependency so the encrypted credential vault
+# can be enabled (it ships off by default). On Debian/Ubuntu the system
+# Python is externally managed (PEP 668), so use the distro package rather
+# than a system-wide pip; skipping this is non-fatal — the server still
+# runs and the saved-credential UI just stays hidden.
+apt install python3-cryptography   # or: pip install --break-system-packages -r requirements.txt
 
 cp websh.service /etc/systemd/system/
 systemctl enable --now websh
 ```
 
-The shipped `websh.service` sets `WEBSH_VAULT_ENABLE=1` and a
-`StateDirectory=websh`, so saved credentials persist (encrypted) under
-`/var/lib/websh/websh.creds.json`. To run without the vault, `systemctl
-edit websh` and set `Environment=WEBSH_VAULT_ENABLE=`. See
+The shipped `websh.service` ships the `cryptography` dependency and a
+`StateDirectory=websh` (a writable `/var/lib/websh`), but leaves the vault
+**off** by default. To enable it, `systemctl edit websh` and add
+`Environment=WEBSH_VAULT_ENABLE=1`; saved credentials then persist
+(encrypted) under `/var/lib/websh/websh.creds.json`. See
 [`encryption.md`](encryption.md).
 
 ## HTTPS via reverse proxy

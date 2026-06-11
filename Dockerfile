@@ -20,11 +20,13 @@ VOLUME /data
 
 USER websh
 
-# WEBSH_VAULT_ENABLE=1 + the bundled cryptography wheel make the encrypted
-# credential vault work out of the box. WEBSH_CREDS_PATH puts the store in
-# the writable /data volume (the default cwd path is not writable here).
+# The bundled cryptography wheel makes the encrypted credential vault
+# available, but it stays OFF by default. Opt in at run time with
+# `-e WEBSH_VAULT_ENABLE=1` (add `-v websh-data:/data` to persist the
+# store across container replacement). WEBSH_CREDS_PATH points the store
+# at the writable /data volume — the default cwd path is not writable here.
 ENV PORT=8765 HOST=0.0.0.0 SESSION_TIMEOUT=300 MAX_SESSIONS=10 \
-    WEBSH_VAULT_ENABLE=1 WEBSH_CREDS_PATH=/data/websh.creds.json
+    WEBSH_CREDS_PATH=/data/websh.creds.json
 
 EXPOSE 8765
 

@@ -1,12 +1,12 @@
 # Encrypted credential vault
 
-> **Status:** implemented and **on by default in the bundled `websh.service`
-> and Docker image** — both set `WEBSH_VAULT_ENABLE=1` and ship the
-> `cryptography` dependency (`requirements.txt`). A bare `python3 server.py`
-> stays opt-in: install `cryptography` and set `WEBSH_VAULT_ENABLE=1`.
-> Either way a deployment missing the dependency or flag still runs — the
-> saved-credential UI just stays hidden, and legacy plaintext entries are
-> not migrated automatically.
+> **Status:** implemented, **off by default**. The bundled `websh.service`
+> and Docker image ship the `cryptography` dependency (`requirements.txt`)
+> and a writable creds path, so enabling the vault there is a one-line
+> opt-in (`WEBSH_VAULT_ENABLE=1`); a bare `python3 server.py` additionally
+> needs `cryptography` installed. Either way a deployment missing the
+> dependency or flag still runs — the saved-credential UI just stays
+> hidden, and legacy plaintext entries are not migrated automatically.
 
 Saved SSH credentials are stored as **opaque encrypted blobs** on the
 server. The decryption key lives in the browser's IndexedDB, generated
@@ -29,8 +29,9 @@ the ~50 ms it takes to type it into the SSH PTY.
    Without it, websh keeps working — the saved-credential UI is just
    hidden. With it, the browser's "Save" checkbox enables encrypted
    storage end-to-end.
-2. Turn the vault on. The bundled `websh.service` and Docker image
-   already set this; for a bare run, opt in explicitly:
+2. Opt the vault on explicitly (the bundled `websh.service` and Docker
+   image already ship the dependency, so this flag is all that's needed
+   there):
    ```bash
    WEBSH_VAULT_ENABLE=1 python3 server.py
    ```
