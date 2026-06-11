@@ -1,4 +1,6 @@
-FROM python:3-slim
+# Pinned to a specific minor so a base rebase can't silently move Python
+# under us; 3.12 matches the upper end of the CI test matrix.
+FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
     && rm -rf /var/lib/apt/lists/*
@@ -25,7 +27,7 @@ USER websh
 # `-e WEBSH_VAULT_ENABLE=1` (add `-v websh-data:/data` to persist the
 # store across container replacement). WEBSH_CREDS_PATH points the store
 # at the writable /data volume — the default cwd path is not writable here.
-ENV PORT=8765 HOST=0.0.0.0 SESSION_TIMEOUT=300 MAX_SESSIONS=10 \
+ENV PORT=8765 HOST=0.0.0.0 SESSION_TIMEOUT=300 MAX_SESSIONS=50 \
     WEBSH_CREDS_PATH=/data/websh.creds.json
 
 EXPOSE 8765

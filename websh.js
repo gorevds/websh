@@ -359,7 +359,15 @@ function createPane(container) {
   termEl.addEventListener('contextmenu', e => {
     e.preventDefault();
     if(navigator.clipboard && navigator.clipboard.readText){
-      navigator.clipboard.readText().then(t => { if(t && p.sid) queueInput(p,t) }).catch(() => {});
+      // Route through term.paste(), not queueInput(), so multi-line
+      // clipboard content is wrapped in bracketed-paste markers when the
+      // remote app has enabled the mode (vim, psql, shells with
+      // bracketed paste on). Sending it raw executes each line
+      // immediately — the classic paste-jacking hazard, made worse here
+      // because the OSC 52 handler lets the remote host seed the
+      // clipboard. paste()'s output flows through term.onData into the
+      // same input queue (and inherits its p.sid guard).
+      navigator.clipboard.readText().then(t => { if(t && p.sid) p.term.paste(t) }).catch(() => {});
     }
   });
 
@@ -431,8 +439,7 @@ function splitPane(id, dir) {
   if (selectedPrompt) clearPromptSelection();
   showOverlay();
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1
-      && serverConfig.connections[0].kind === 'prompt'
-      && loadSaved().length === 0) {
+      && serverConfig.connections[0].kind === 'prompt') {
     selectPromptConnection(serverConfig.connections[0].name);
   }
   renderSaved();
@@ -559,6 +566,13 @@ function _destroyPane(id, terminate) {
     clearTimeout(p._stuckTimer);
     p._stuckTimer = null;
   }
+  // Deferred-save timer (scheduleSaveCommit): same rationale as the
+  // _stuckTimer above. The p.sid guard inside the timer would NOT catch
+  // a pane closed mid-window — _destroyPane leaves p.sid set (it only
+  // reads it for the disconnect body) — so without this a Save ticked
+  // then aborted by closing the pane within SAVE_COMMIT_DELAY_MS would
+  // still POST and add a card. Clearing it also drops the closure's `p` ref.
+  clearTimeout(p.saveCommitTimer);
   p._fitInFlight = false;
   // Disconnect main session
   if (p.sid) {
@@ -1012,8 +1026,27 @@ function _carryEphemeralSecrets(src, dst) {
   });
 }
 
+// The output-gated commit in handleOutputPayload only fires when the
+// session emits a terminal frame ≥SAVE_COMMIT_DELAY_MS after connect. An
+// idle session over SSE (connect, see the prompt, type nothing) emits no
+// such frame — EventSource only delivers on real output, and the 30s
+// empty-input keepalive doesn't route through handleOutputPayload — so the
+// deferred save would never land. Back it with a timer so "tick Save +
+// connect" persists regardless of output. Idempotent with the output path:
+// commitPendingSave bails once pendingSave is cleared (by the commit itself
+// or an auth failure, which also nulls p.sid), and the p.sid guard skips a
+// session that has since died.
+const SAVE_COMMIT_DELAY_MS = 2600;
+function scheduleSaveCommit(p) {
+  clearTimeout(p.saveCommitTimer);
+  p.saveCommitTimer = setTimeout(() => {
+    if (p.sid && p.pendingSave) commitPendingSave(p);
+  }, SAVE_COMMIT_DELAY_MS);
+}
+
 function commitPendingSave(p) {
   if (!p.pendingSave) return;
+  clearTimeout(p.saveCommitTimer);
   let entry = Object.assign({}, p.pendingSave);
   _carryEphemeralSecrets(p.pendingSave, entry);
   // Overwrite persistent with the actual live mode (handles tmux-skip
@@ -1274,7 +1307,15 @@ window.addEventListener('pageshow', (e) => {
 // Apply one decoded JSON payload from either transport. Returns true if
 // the session ended (auth_failed / alive=false / fatal session error)
 // so callers know to stop their read loop.
-function handleOutputPayload(p, r) {
+function handleOutputPayload(p, r, sid) {
+  // Stale-frame guard: this frame was produced for `sid`, but the pane has
+  // since moved to a different (or no) session — a rapid reconnect or a
+  // transport switch replaced it. Acting on a stale frame is harmful: a
+  // late "session not found" for the OLD sid would otherwise enter the
+  // error branch below and tear down the CURRENT session, wedging the
+  // pane. Drop it and tell the stale loop to stop. (Callers that don't
+  // pass a sid keep the previous behaviour.)
+  if (sid !== undefined && p.sid !== sid) return true;
   if (r.error) {
     // Session not found — stale restore or server restarted. Persistent
     // panes try to re-attach via tmux; short-lived panes just reconnect.
@@ -1425,7 +1466,8 @@ function startOutput(p) {
 function streamOutput(p) {
   if (!p.sid || !p.polling) return;
   closeStream(p);
-  let url = `${API}?action=stream&session_id=${encodeURIComponent(p.sid)}`;
+  let mySid = p.sid;
+  let url = `${API}?action=stream&session_id=${encodeURIComponent(mySid)}`;
   let es;
   try { es = new EventSource(url); }
   catch (e) {
@@ -1476,13 +1518,13 @@ function streamOutput(p) {
     let r;
     try { r = JSON.parse(e.data); }
     catch (err) { console.error('SSE bad payload:', err); return; }
-    handleOutputPayload(p, r);
+    handleOutputPayload(p, r, mySid);
   });
   es.addEventListener('end', e => {
     onBodyEvent();
     let r = {alive: false};
     try { r = JSON.parse(e.data); } catch (err) {}
-    handleOutputPayload(p, r);
+    handleOutputPayload(p, r, mySid);
     closeStream(p);
   });
   es.onerror = () => {
@@ -1505,9 +1547,10 @@ function streamOutput(p) {
 
 function pollOutput(p) {
   if(!p.sid || !p.polling) return;
-  api('output',{query:'&session_id='+p.sid}).then(r => {
+  let mySid = p.sid;
+  api('output',{query:'&session_id='+mySid}).then(r => {
     clearRetryClock(p);
-    if (handleOutputPayload(p, r)) return;
+    if (handleOutputPayload(p, r, mySid)) return;
     if(p.polling) pollOutput(p);
   }).catch(e => {
     let d = nextRetryDelay(p);
@@ -1543,6 +1586,16 @@ function queueInput(p, data) {
 // from IDB at every connect — caching it on the pane would let a
 // sign-out in another tab leave a stale key in memory.
 async function connectPane(p, opts) {
+  // In-flight guard: a connect is already running for this pane. A second
+  // entrant (double Reconnect click, a manual reconnect racing the
+  // session-error auto-reconnect in handleOutputPayload) would launch a
+  // second /api/connect, overwrite p.sid with the later session, and leak
+  // the first server PTY until its idle timeout. Ignore the duplicate.
+  if (p.connecting) {
+    console.log('connectPane: connect already in flight for pane ' + p.id +
+                ', ignoring duplicate');
+    return;
+  }
   p.label = opts.label || '';
   if (opts.host !== undefined) p.host = opts.host || '';
   if (opts.port !== undefined) p.port = opts.port || 22;
@@ -1644,7 +1697,7 @@ async function connectPane(p, opts) {
       }
       console.log('connect result:', r);
       p.connecting = false;
-      if (r.error) { p.pendingSave = null; showErr(r.error); updatePaneBadge(p); return }
+      if (r.error) { p.pendingSave = null; surfaceConnectError(p, r.error, 'error'); updatePaneBadge(p); return }
       if (r.auth_failed) {
         p.pendingSave = null;
         updatePaneBadge(p);
@@ -1665,7 +1718,7 @@ async function connectPane(p, opts) {
       }
       if (r.alive === false) {
         p.pendingSave = null;
-        showErr('SSH process exited immediately');
+        surfaceConnectError(p, 'SSH process exited immediately', 'error');
         updatePaneBadge(p);
         if (p.persistent) showTmuxBar(p, 'Connection died immediately — tmux may be missing on ' + (p.host || 'target') + '.');
         return;
@@ -1711,7 +1764,7 @@ async function connectPane(p, opts) {
       // just bail rather than flashing a global error for a closed pane.
       if (panes[p.id] !== p) return;
       p.connecting = false;
-      showErr('Connection failed: ' + e.message);
+      surfaceConnectError(p, 'Connection failed: ' + e.message, 'error');
       updatePaneBadge(p);
     });
 }
@@ -1970,8 +2023,10 @@ function finalizeSuccess(opts, result, run) {
   p.connectedAt = Date.now();
   p.recentOutput = '';
   p.connecting = false;
-  // Deferred save: commitPendingSave writes it to localStorage once the
-  // session has proven healthy for ≥2.5s with no auth failure. The
+  // Deferred save: commitPendingSave writes it once the session has proven
+  // healthy for ≥2.5s with no auth failure — driven both by a healthy output
+  // frame (handleOutputPayload) and an output-independent timer
+  // (scheduleSaveCommit) so an idle SSE session still commits. The
   // non-enumerable __ephemeralSecrets bag rides along (Finding 2a).
   if (opts.saveEntry) {
     let entry = Object.assign({}, opts.saveEntry);
@@ -1979,6 +2034,7 @@ function finalizeSuccess(opts, result, run) {
     entry.persistent = !!p.persistent;
     if (p.tmuxCmd && p.tmuxCmd !== 'tmux') entry.tmux_cmd = p.tmuxCmd;
     p.pendingSave = entry;
+    scheduleSaveCommit(p);
   }
 
   hideReconnectBar(p);
@@ -2149,8 +2205,32 @@ function hideOverlay(){
   $('iKeyPw').value = '';
   $('iName').value = '';
 }
-function showErr(m){ let e=$('err'); e.textContent=m; e.classList.add('on') }
+function showErr(m){
+  // #err lives inside the connect overlay. When the overlay is closed
+  // (reconnect, F5 restore, a mid-session error), writing to it is
+  // invisible — the message would be silently swallowed. Fall back to a
+  // toast so it's always seen. When the overlay is open (the user is on
+  // the connect form), keep the inline error line as before.
+  if ($('ov').classList.contains('h')) { showToast(m, 'err'); return; }
+  let e=$('err'); e.textContent=m; e.classList.add('on');
+}
 function hideErr(){ $('err').classList.remove('on') }
+
+// Surface a connect failure on the right surface. With the connect overlay
+// open (user just clicked Connect) the message belongs in the form error
+// line so they can fix and retry. With it closed (reconnect / F5 restore /
+// auto-retry) the form is invisible — write to the pane terminal and, if
+// the pane has a target, show the reconnect bar so the user can recover
+// instead of staring at a dead pane. (showErr already falls back to a
+// toast, so even a target-less pane never loses the text.)
+function surfaceConnectError(p, msg, reason) {
+  if (!$('ov').classList.contains('h')) { showErr(msg); return; }
+  try { p.term.write('\r\n\x1b[91m--- ' + msg + ' ---\x1b[0m\r\n'); } catch (e) {}
+  if (p.host || p.connection) showReconnectBar(p, reason || 'error');
+  connectingFor = null;
+  overlayMode = null;
+  pendingSplit = null;
+}
 
 // Non-blocking notification. `kind` is one of '', 'warn', 'err'. Used by
 // background flows (e.g. /api/save failures) so the live terminal isn't
@@ -2567,6 +2647,7 @@ function _disconnectVaultPaneForNoKey(p) {
     p.polling = false;
     stopKeepalive(p);
     closeStream(p);
+    clearTimeout(p.saveCommitTimer);   // drop the armed deferred-save timer
     api('disconnect', {body: {session_id: sid}}).catch(() => {});
     p.sid = null;
   }
@@ -2997,7 +3078,17 @@ function doConnect() {
 function loadServerConfig() {
   api('config').then(async cfg => {
     serverConfig=cfg;
-    if(cfg.isolate_storage) storagePrefix = location.pathname.replace(/[^/]*$/, '');
+    if(cfg.isolate_storage) {
+      storagePrefix = location.pathname.replace(/[^/]*$/, '');
+      // `settings`/`fontSize` were loaded at module init under the empty
+      // prefix (the shared key), because the path scope is only known once
+      // /api/config returns. saveSettings() writes to the prefixed key, so
+      // without reloading here the read and write keys diverge: per-path
+      // settings never round-trip and another instance's values bleed in
+      // at boot. Re-read from the now-correct path-scoped key.
+      settings = loadSettings();
+      fontSize = settings.fontSize;
+    }
     // Re-mint the vault BroadcastChannel with the now-known storagePrefix
     // so sign-out signals don't cross path-scoped namespaces. No-op if
     // the prefix matches what the module-init open already used (i.e.
@@ -4374,12 +4465,13 @@ function doAutoConnect() {
   // Single server connection with restrict_hosts:
   //   - Ready  → connect immediately (no overlay, no form).
   //   - Prompt → show the overlay with the form pre-locked, password focused.
-  //     Skip the pre-lock if saved connections exist — user can click one.
+  //     Always pre-lock: there is exactly one allowed host, so pre-filling it
+  //     is unambiguous. Saved cards still render below for one-click reconnect.
   if (serverConfig && serverConfig.restrict_hosts && serverConfig.connections.length === 1) {
     let only = serverConfig.connections[0];
     if (only.kind === 'prompt') {
       showOverlay();
-      if (loadSaved().length === 0) selectPromptConnection(only.name);
+      selectPromptConnection(only.name);
       return;
     }
     connectByName(only.name);
