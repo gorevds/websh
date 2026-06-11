@@ -4918,6 +4918,58 @@ test('connectPane reaps the orphan session when the pane is destroyed mid-connec
   cleanup(env);
 });
 
+// In-flight guard: a second connectPane for the same pane while the first
+// /api/connect is still outstanding must be ignored. Otherwise it launches
+// a second session, overwrites p.sid, and leaks the first server PTY.
+test('connectPane ignores a concurrent connect for the same pane', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-1', alive: true}, delay: 60},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'resize', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win; const log = env.log;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.connectPane(p, {label: 'x', host: '10.0.0.1', user: 'a', password: 'p'});
+  // Duplicate entrant while the first connect is still in flight.
+  win.connectPane(p, {label: 'x', host: '10.0.0.1', user: 'a', password: 'p'});
+  await sleep(140);
+  const connects = log.filter(e => e.action === 'connect');
+  ok(connects.length === 1, 'exactly one connect issued; got ' + connects.length);
+  ok(p.sid === 'sid-1', 'pane ended on the single session; sid=' + p.sid);
+  cleanup(env);
+});
+
+// Stale-frame guard: a late "session not found" for a session the pane has
+// already moved off of must NOT tear down the current session.
+test('handleOutputPayload ignores a stale frame for a replaced session', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-2'; p.polling = true; p.host = '10.0.0.1'; p.user = 'a';
+  const stopped = win.handleOutputPayload(p, {error: 'session not found'}, 'sid-1');
+  ok(stopped === true, 'stale frame tells its own loop to stop');
+  ok(p.sid === 'sid-2', 'current session preserved; sid=' + p.sid);
+  ok(p.polling === true, 'current polling not torn down');
+  cleanup(env);
+});
+
+// Positive control: an error frame whose sid matches the current session
+// still tears it down (so the guard does not over-block real errors).
+test('handleOutputPayload acts on an error frame for the current session', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  // No host/connection → error branch takes the doAutoConnect path, not a
+  // reconnect, so we don't need a connect in the plan.
+  p.sid = 'sid-cur'; p.polling = true; p.host = ''; p.connection = null;
+  const stopped = win.handleOutputPayload(p, {error: 'session not found'}, 'sid-cur');
+  ok(stopped === true, 'current error frame stops the loop');
+  ok(p.sid === null, 'current session torn down; sid=' + p.sid);
+  ok(p.polling === false, 'polling stopped');
+  cleanup(env);
+});
+
 // =====================================================================
 // The client-side upload-mv collision loop must build name(1), name(2)
 // from the original name, not strip a "(...)" suffix (which mangled real
