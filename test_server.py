@@ -8282,6 +8282,102 @@ class TestMainSigtermSubprocess(unittest.TestCase):
                 proc.stderr.decode("utf-8", "replace")))
 
 
+class TestTransferAccessLog(unittest.TestCase):
+    """Download and upload must emit access-log records so bulk data
+    transfer through a logged-in session is auditable (fail2ban /
+    forensics), with a byte count and the (sanitized) path."""
+
+    @classmethod
+    def setUpClass(cls):
+        server.HOST = "127.0.0.1"
+        cls.httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        cls.port = cls.httpd.server_address[1]
+        server.PORT = cls.port
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        time.sleep(0.2)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def setUp(self):
+        self._orig_log = server.ACCESS_LOG_PATH
+        self._logf = tempfile.NamedTemporaryFile(suffix=".log", delete=False)
+        self._logf.close()
+        server.ACCESS_LOG_PATH = self._logf.name
+
+    def tearDown(self):
+        server.ACCESS_LOG_PATH = self._orig_log
+        try:
+            os.unlink(self._logf.name)
+        except Exception:
+            pass
+
+    def _records(self, event, want=1, timeout=2.0):
+        # The download record is emitted after the response body is fully
+        # streamed, so the client's urlopen can return before the server
+        # finishes writing the log line — poll briefly for it.
+        deadline = time.time() + timeout
+        while True:
+            with open(self._logf.name) as f:
+                recs = [json.loads(line) for line in f if line.strip()]
+            hits = [r for r in recs if r.get("event") == event]
+            if len(hits) >= want or time.time() >= deadline:
+                return hits
+            time.sleep(0.02)
+
+    def test_download_emits_access_log(self):
+        from urllib.request import urlopen
+        sid = str(uuid.uuid4())
+        payload = b"secret-data-1234"
+        header = "OK\t{}\n".format(len(payload)).encode()
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout.read.side_effect = (
+            [bytes([b]) for b in header[:-1]] + [b"\n"] + [payload, b""])
+        fake_session = unittest.mock.MagicMock()
+        fake_session._host = "h.example"
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            url = "http://127.0.0.1:{}/api/download?session_id={}&path={}".format(
+                self.port, sid, "/home/alice/secret.txt")
+            with urlopen(url) as resp:
+                resp.read()
+        recs = self._records("download")
+        self.assertEqual(len(recs), 1, "one download record; got " + repr(recs))
+        r = recs[0]
+        self.assertEqual(r["sid"], sid)
+        self.assertEqual(r["bytes"], len(payload))
+        self.assertEqual(r["result"], "ok")
+        self.assertEqual(r["target_host"], "h.example")
+        self.assertIn("secret.txt", r["path"])
+
+    def test_upload_emits_access_log(self):
+        from urllib.request import urlopen, Request
+        sid = str(uuid.uuid4())
+        data = b"infiltrated-bytes!!"
+        fake_session = unittest.mock.MagicMock()
+        fake_session._host = "h.example"
+        fake_session.upload_file.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            url = "http://127.0.0.1:{}/api/upload?session_id={}&path={}".format(
+                self.port, sid, "drop.sh")
+            req = Request(url, data=data, method="POST")
+            req.add_header("Content-Type", "application/octet-stream")
+            with urlopen(req) as resp:
+                resp.read()
+        recs = self._records("upload")
+        self.assertEqual(len(recs), 1, "one upload record; got " + repr(recs))
+        r = recs[0]
+        self.assertEqual(r["sid"], sid)
+        self.assertEqual(r["bytes"], len(data))
+        self.assertEqual(r["result"], "ok")
+        self.assertEqual(r["target_host"], "h.example")
+        self.assertIn("drop.sh", r["path"])
+
+
 class TestTmuxCapture(unittest.TestCase):
     """SSHSession.tmux_capture() must bound the captured scrollback so a
     huge tmux history can't be buffered whole into server RAM."""
