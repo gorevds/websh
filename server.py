@@ -163,6 +163,23 @@ UPLOAD_TIMEOUT = _int_env("UPLOAD_TIMEOUT", "1800")
 # separately and is bounded by MAX_UPLOAD_SIZE instead.
 MAX_BODY_SIZE = _int_env("MAX_BODY_SIZE", str(8 * 1024 * 1024))
 
+# Ceilings for /api/tmux_capture. A persistent session's tmux scrollback
+# can be enormous — history-limit is clamped only at 10M lines — and the
+# capture is buffered whole into server RAM before it is written out, so
+# an unbounded capture is a memory-exhaustion lever (the endpoint is also
+# unauthenticated beyond the session id). The line cap bounds what tmux
+# emits at the source (capture-pane -S -<N> keeps the most recent N lines
+# of history); the byte cap is the absolute ceiling against pathological
+# long lines. Output past either limit is truncated to the most recent
+# content with a marker line prepended so the export isn't silently
+# misleading.
+# max(1, …): a 0/negative override would otherwise break the tmux command
+# (`-S -0` / `-S --5`) or, for the byte cap, silently keep the whole buffer
+# (Python's data[-0:] is data[0:], i.e. everything) — defeating the cap.
+MAX_TMUX_CAPTURE_LINES = max(1, _int_env("WEBSH_TMUX_CAPTURE_LINES", "100000"))
+MAX_TMUX_CAPTURE_BYTES = max(1, _int_env("WEBSH_TMUX_CAPTURE_BYTES",
+                                         str(16 * 1024 * 1024)))
+
 # Trusted proxies (comma-separated IPs) whose X-Forwarded-For header is trusted.
 # Only requests from these IPs will have their X-Forwarded-For used for rate limiting.
 _TRUSTED_PROXIES = set(
@@ -2028,12 +2045,15 @@ class SSHSession(object):
             return None, "not a persistent session"
         if not self._control_path or not os.path.exists(self._control_path):
             return None, "control socket not ready"
-        # `-S -` reads from the very start of history, `-J` joins lines that
-        # tmux had wrapped to fit the pane width, `-p` prints to stdout.
-        # tmux_cmd and slot_id are pre-validated regex-restricted strings,
-        # safe to inline.
+        # `-S -<N>` reads the most recent N lines of history (was `-S -`,
+        # the whole history, which on a 10M-line scrollback buffers
+        # hundreds of MB into server RAM); `-J` joins lines that tmux had
+        # wrapped to fit the pane width, `-p` prints to stdout. tmux_cmd
+        # and slot_id are pre-validated regex-restricted strings, safe to
+        # inline.
         tname = "websh-" + self.slot_id
-        remote_cmd = (self.tmux_cmd + " capture-pane -p -J -S - -t " + tname)
+        remote_cmd = (self.tmux_cmd + " capture-pane -p -J -S -" +
+                      str(MAX_TMUX_CAPTURE_LINES) + " -t " + tname)
         ssh_cmd = [
             "ssh", "-T",
             "-o", "BatchMode=yes",
@@ -2050,7 +2070,15 @@ class SSHSession(object):
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return None, "tmux exit %d: %s" % (proc.returncode, err)
-        return proc.stdout, None
+        data = proc.stdout
+        if len(data) > MAX_TMUX_CAPTURE_BYTES:
+            # Absolute byte ceiling regardless of line count (pathological
+            # very long lines). Keep the tail — the freshest scrollback —
+            # and flag the truncation so the export isn't misleading.
+            marker = ("[websh: capture truncated to the last %d bytes]\n"
+                      % MAX_TMUX_CAPTURE_BYTES).encode("utf-8")
+            data = marker + data[-MAX_TMUX_CAPTURE_BYTES:]
+        return data, None
 
     def push_tmux_options(self, options):
         """Apply per-session tmux options live, without typing into the
