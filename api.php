@@ -377,9 +377,15 @@ function ensure_backend($backend, $config_path) {
 
     $script = dirname(__FILE__) . '/server.py';
     if (file_exists($script)) {
+        // Pass PORT so the spawned server.py binds the SAME port this proxy
+        // pings ($BACKEND uses WEBSH_PORT). Without it the backend always
+        // binds its own default 8765, so on a non-default WEBSH_PORT the
+        // ping never succeeds, every request re-execs python3, and the
+        // browser sees permanent 502s.
         $cmd = sprintf(
-            'WEBSH_CONFIG=%s nohup python3 %s </dev/null >/dev/null 2>&1 &',
+            'WEBSH_CONFIG=%s PORT=%s nohup python3 %s </dev/null >/dev/null 2>&1 &',
             escapeshellarg($config_path),
+            escapeshellarg(getenv('WEBSH_PORT') ?: '8765'),
             escapeshellarg($script)
         );
         exec($cmd);
