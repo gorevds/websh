@@ -931,6 +931,154 @@ class TestConfigPublicKind(unittest.TestCase):
         self.assertEqual(p["kind"], "prompt")
         self.assertEqual(p["allowed_users"], ["a"])
 
+    def _config_with(self, extra):
+        path = os.path.join(self.tmpdir, "websh.json")
+        body = {"connections": []}
+        body.update(extra)
+        with open(path, "w") as f:
+            json.dump(body, f)
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        return server.config_public()
+
+    def test_form_defaults_passed_through(self):
+        pub = self._config_with({"form_defaults": {
+            "host": " 192.0.2.10 ", "port": 22, "username": "deploy"}})
+        self.assertEqual(pub["form_defaults"],
+                         {"host": "192.0.2.10", "port": 22,
+                          "username": "deploy"})
+
+    def test_form_defaults_field_level_validation(self):
+        # Bad types/ranges drop the FIELD, never the response; a section
+        # with nothing valid left is omitted entirely.
+        pub = self._config_with({"form_defaults": {
+            "host": 12345,            # not a string -> dropped
+            "port": "22",             # not an int -> dropped
+            "username": "x" * 65,     # over-long -> dropped
+        }})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({"form_defaults": {
+            "host": "ok.example", "port": 99999}})   # port out of range
+        self.assertEqual(pub["form_defaults"], {"host": "ok.example"})
+        # bool is an int subclass in Python; must NOT pass as a port.
+        pub = self._config_with({"form_defaults": {"port": True}})
+        self.assertNotIn("form_defaults", pub)
+        # Port boundaries: 1 and 65535 pass, 0 and floats don't.
+        pub = self._config_with({"form_defaults": {"port": 1}})
+        self.assertEqual(pub["form_defaults"], {"port": 1})
+        pub = self._config_with({"form_defaults": {"port": 65535}})
+        self.assertEqual(pub["form_defaults"], {"port": 65535})
+        pub = self._config_with({"form_defaults": {"port": 0}})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({"form_defaults": {"port": 22.0}})
+        self.assertNotIn("form_defaults", pub)
+        # Whitespace-only host is as good as absent.
+        pub = self._config_with({"form_defaults": {"host": "   "}})
+        self.assertNotIn("form_defaults", pub)
+
+    def test_form_defaults_non_dict_ignored(self):
+        pub = self._config_with({"form_defaults": ["not", "a", "dict"]})
+        self.assertNotIn("form_defaults", pub)
+        pub = self._config_with({})
+        self.assertNotIn("form_defaults", pub)
+
+
+
+
+class TestKnobResolution(unittest.TestCase):
+    """_knob precedence: WEBSH_<NAME> alias > bare env > websh.json
+    "server" object > default. The JSON plane is import-time static
+    (_SERVER_KNOBS); tests drive it by patching the dict."""
+
+    KNOB = "KNOB_TEST_VALUE"   # never a real knob
+
+    def setUp(self):
+        self._snap = dict(server._SERVER_KNOBS)
+        os.environ.pop(self.KNOB, None)
+        os.environ.pop("WEBSH_" + self.KNOB, None)
+
+    def tearDown(self):
+        server._SERVER_KNOBS.clear()
+        server._SERVER_KNOBS.update(self._snap)
+        os.environ.pop(self.KNOB, None)
+        os.environ.pop("WEBSH_" + self.KNOB, None)
+
+    def test_default_when_nothing_set(self):
+        self.assertEqual(server._knob(self.KNOB, "dflt"), "dflt")
+
+    def test_json_section_beats_default(self):
+        server._SERVER_KNOBS[self.KNOB] = 123
+        self.assertEqual(server._knob(self.KNOB, "dflt"), 123)
+
+    def test_bare_env_beats_json(self):
+        server._SERVER_KNOBS[self.KNOB] = 123
+        os.environ[self.KNOB] = "456"
+        self.assertEqual(server._knob(self.KNOB, "dflt"), "456")
+
+    def test_prefixed_alias_beats_bare_env(self):
+        # The unambiguous form wins: a bare generic name may belong to
+        # unrelated software in a shared environment.
+        os.environ[self.KNOB] = "456"
+        os.environ["WEBSH_" + self.KNOB] = "789"
+        self.assertEqual(server._knob(self.KNOB, "dflt"), "789")
+
+    def test_already_prefixed_name_skips_double_prefix(self):
+        os.environ.pop("WEBSH_KNOB_X", None)
+        try:
+            os.environ["WEBSH_KNOB_X"] = "1"
+            self.assertEqual(server._knob("WEBSH_KNOB_X", "d"), "1")
+        finally:
+            os.environ.pop("WEBSH_KNOB_X", None)
+
+    def test_int_env_casts_and_falls_back(self):
+        server._SERVER_KNOBS[self.KNOB] = 42
+        self.assertEqual(server._int_env(self.KNOB, "7"), 42)
+        server._SERVER_KNOBS[self.KNOB] = "not-an-int"
+        self.assertEqual(server._int_env(self.KNOB, "7"), 7)
+
+    def test_bool_knob_accepts_json_true_and_env_1(self):
+        server._SERVER_KNOBS[self.KNOB] = True
+        self.assertTrue(server._bool_knob(self.KNOB))
+        server._SERVER_KNOBS[self.KNOB] = False
+        self.assertFalse(server._bool_knob(self.KNOB))
+        os.environ[self.KNOB] = "1"
+        self.assertTrue(server._bool_knob(self.KNOB))
+        os.environ[self.KNOB] = "0"
+        self.assertFalse(server._bool_knob(self.KNOB))
+
+    def test_env_only_knobs_ignore_json_plane(self):
+        # A websh.json write primitive must not rebind HOST or take
+        # over X-Forwarded-For trust.
+        server._SERVER_KNOBS["HOST"] = "0.0.0.0"
+        server._SERVER_KNOBS["TRUSTED_PROXIES"] = "6.6.6.6"
+        self.assertEqual(server._knob("HOST", "127.0.0.1"), "127.0.0.1")
+        self.assertEqual(server._knob("TRUSTED_PROXIES", "127.0.0.1"),
+                         "127.0.0.1")
+
+    def test_server_knobs_reader(self):
+        import tempfile as _tf
+        d = _tf.mkdtemp()
+        try:
+            p = os.path.join(d, "websh.json")
+            with open(p, "w") as f:
+                json.dump({"server": {"SESSION_TIMEOUT": 60}}, f)
+            prior = os.environ.get("WEBSH_CONFIG")
+            os.environ["WEBSH_CONFIG"] = p
+            self.assertEqual(server._server_knobs(),
+                             {"SESSION_TIMEOUT": 60})
+            with open(p, "w") as f:
+                f.write("{broken json")
+            self.assertEqual(server._server_knobs(), {})
+            with open(p, "w") as f:
+                json.dump({"server": ["not", "a", "dict"]}, f)
+            self.assertEqual(server._server_knobs(), {})
+        finally:
+            if prior is None:
+                os.environ.pop("WEBSH_CONFIG", None)
+            else:
+                os.environ["WEBSH_CONFIG"] = prior
+
 
 if __name__ == "__main__":
     unittest.main()
