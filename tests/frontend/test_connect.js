@@ -2875,6 +2875,28 @@ test('legacyUpdateModal: Esc closes + Tab traps + restore focus', async () => {
   cleanup(env);
 });
 
+test('font css link tracks the active family; system font removes it', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+  ]);
+  const win = env.win;
+  await sleep(30);
+  const link = win.document.getElementById('dynFontCss');
+  ok(!!link, 'boot created the dynamic font link');
+  ok(/JetBrains\+Mono/.test(link.getAttribute('href')),
+     'default family loaded; got ' + link.getAttribute('href'));
+  ok(!/Fira\+Code/.test(link.getAttribute('href')),
+     'inactive families NOT loaded');
+  win.ensureFontLink('fira-code');
+  ok(/Fira\+Code:wght@300;400;500;700/.test(
+       win.document.getElementById('dynFontCss').getAttribute('href')),
+     'family switch swaps the href with per-family weights');
+  win.ensureFontLink('system');
+  ok(!win.document.getElementById('dynFontCss'),
+     'system font removes the link entirely');
+  cleanup(env);
+});
+
 // =====================================================================
 // Vault: manual-pane plaintext lives in sessionStorage
 // =====================================================================
