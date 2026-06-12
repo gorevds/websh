@@ -96,6 +96,13 @@ WEBSH_REQUIRE_VAULT = os.environ.get("WEBSH_REQUIRE_VAULT") == "1"
 _vault_disabled = False
 
 __version__ = "0.2.0"
+# Wire-protocol version, shipped in /api/config and /api/ping and
+# checked by the bundled client at page load. Bump it on any breaking
+# change to an endpoint's request/response shape, semantics or status
+# codes (see docs/protocol.md) so a browser that boots with a STALE
+# CACHED websh.js after a server upgrade gets a "reload the page"
+# prompt instead of failing obscurely. Additive fields do NOT bump it.
+PROTO_VERSION = 1
 
 # ─── Configuration ───────────────────────────────────────────────────
 
@@ -1233,6 +1240,7 @@ def config_public():
         "isolate_storage": cfg.get("isolate_storage", False),
         "session_timeout": SESSION_TIMEOUT,
         "version": __version__,
+        "proto": PROTO_VERSION,
         "vault_enabled": HAS_CRYPTOGRAPHY and WEBSH_VAULT_ENABLE and not _vault_disabled,
     }
 
@@ -2826,7 +2834,8 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "config":
             self._json(config_public())
         elif action == "ping":
-            self._json({"ok": True, "version": __version__})
+            self._json({"ok": True, "version": __version__,
+                        "proto": PROTO_VERSION})
         elif action == "tmux_capture":
             self._tmux_capture()
         elif action == "ls":
