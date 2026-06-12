@@ -62,10 +62,18 @@ echo "$r" | grep -q '"path": "/api/save"' || fail "save_delete path" "$r"
 echo "$r" | grep -q 'vault_id=v1' || fail "save_delete vault_id query passthrough" "$r"
 echo "$r" | grep -q 'conn_id=c1' || fail "save_delete conn_id query passthrough" "$r"
 
-# 5. Unknown action handled by api.php itself with a JSON 404.
+# 5. A well-formed but UNKNOWN action forwards to the backend (this is
+#    the zero-PHP-edits contract for new endpoints — the backend owns
+#    the 404). The echo stub answers 200 with the request description.
+r=$(curl -fsS "http://127.0.0.1:$PHP_PORT/api.php?action=brand_new_endpoint&x=1")
+echo "$r" | grep -q '"path": "/api/brand_new_endpoint"' \
+  || fail "unknown action not forwarded generically" "$r"
+echo "$r" | grep -q 'x=1' || fail "unknown action query passthrough" "$r"
+
+# 6. A MALFORMED action (regex gate) is rejected locally with JSON 404.
 code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' \
-     "http://127.0.0.1:$PHP_PORT/api.php?action=nope")
-[ "$code" = "404" ] || fail "unknown action status" "$code"
-grep -q 'unknown action' "$UNKNOWN_OUT" || fail "unknown action body" "$(cat "$UNKNOWN_OUT")"
+     "http://127.0.0.1:$PHP_PORT/api.php?action=No.Such%2FAction")
+[ "$code" = "404" ] || fail "malformed action status" "$code"
+grep -q 'unknown action' "$UNKNOWN_OUT" || fail "malformed action body" "$(cat "$UNKNOWN_OUT")"
 
 echo "PHP proxy smoke: all assertions passed"

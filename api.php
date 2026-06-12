@@ -43,25 +43,33 @@ $BACKEND = 'http://127.0.0.1:' . (getenv('WEBSH_PORT') ?: '8765');
 // Path to config file (must be OUTSIDE the web root for security).
 $WEBSH_CONFIG = getenv('WEBSH_CONFIG') ?: dirname(__FILE__) . '/../../websh.json';
 
+// Action gate: lowercase identifiers only, so the action can never
+// smuggle path segments or query metacharacters into the backend URL.
+// /D pins $ to the very end — without it PCRE's $ matches before a
+// trailing \n, letting action=config%0a smuggle a raw LF into the
+// request line on old libcurl. Gate sits BEFORE ensure_backend so
+// garbage requests can't trigger the ping/auto-start machinery.
+if (!preg_match('/^[a-z_]{1,32}$/D', $action)) {
+    header('HTTP/1.1 404 Not Found');
+    echo '{"error":"unknown action"}';
+    exit;
+}
+
 // Auto-start: launch server.py if it's not running.
 ensure_backend($BACKEND, $WEBSH_CONFIG);
 
+// Forward the browser's full query string (the backend ignores the
+// redundant `action` parameter). Rebuilding per-action parameter lists
+// here is what used to make every new endpoint require a PHP edit.
+$QS  = isset($_SERVER['QUERY_STRING']) ? $_SERVER['QUERY_STRING'] : '';
+$URL = $BACKEND . '/api/' . $action . ($QS !== '' ? '?' . $QS : '');
+
 switch ($action) {
-    case 'config':     proxy_get($BACKEND . '/api/config');     break;
-    case 'connect':    proxy_post($BACKEND . '/api/connect');    break;
-    case 'input':      proxy_post($BACKEND . '/api/input');      break;
-    case 'resize':     proxy_post($BACKEND . '/api/resize');     break;
-    case 'disconnect': proxy_post($BACKEND . '/api/disconnect'); break;
-    case 'save':       proxy_post($BACKEND . '/api/save');       break;
-    case 'tmux_options':
-        proxy_post($BACKEND . '/api/tmux_options');
-        break;
-    case 'upload_finalize':
-        proxy_post($BACKEND . '/api/upload_finalize');
-        break;
-    case 'upload_cancel':
-        proxy_post($BACKEND . '/api/upload_cancel');
-        break;
+    // Transfer modes with their own curl plumbing (streaming, raw
+    // bodies, delayed header commit) keep explicit cases:
+    case 'stream':   proxy_stream($URL);   break;
+    case 'download': proxy_download($URL); break;
+    case 'upload':   proxy_upload($URL);   break;
     case 'save_delete':
         // Browsers can't issue DELETE through form posts, so the
         // client POSTs here and we translate to a real backend DELETE.
@@ -71,42 +79,12 @@ switch ($action) {
             . '?vault_id=' . urlencode($vault)
             . '&conn_id='  . urlencode($conn));
         break;
-    case 'output':
-        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        proxy_get($BACKEND . '/api/output?session_id=' . urlencode($sid));
-        break;
-    case 'stream':
-        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        proxy_stream($BACKEND . '/api/stream?session_id=' . urlencode($sid));
-        break;
-    case 'ping':
-        proxy_get($BACKEND . '/api/ping');
-        break;
-    case 'tmux_capture':
-        $sid = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        proxy_get($BACKEND . '/api/tmux_capture?session_id=' . urlencode($sid));
-        break;
-    case 'ls':
-        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        $path = isset($_GET['path']) ? $_GET['path'] : '~';
-        proxy_get($BACKEND . '/api/ls?session_id=' . urlencode($sid)
-            . '&path=' . urlencode($path));
-        break;
-    case 'download':
-        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        $path = isset($_GET['path']) ? $_GET['path'] : '';
-        proxy_download($BACKEND . '/api/download?session_id=' . urlencode($sid)
-            . '&path=' . urlencode($path));
-        break;
-    case 'upload':
-        $sid  = isset($_GET['session_id']) ? $_GET['session_id'] : '';
-        $path = isset($_GET['path']) ? $_GET['path'] : '';
-        proxy_upload($BACKEND . '/api/upload?session_id=' . urlencode($sid)
-            . '&path=' . urlencode($path));
-        break;
     default:
-        header('HTTP/1.1 404 Not Found');
-        echo '{"error":"unknown action"}';
+        // Everything else is a JSON endpoint: forward the method, the
+        // query string and (for POST) the body verbatim. A new backend
+        // endpoint needs NO change here — an unknown action is the
+        // backend's 404 to give.
+        proxy_pass($URL);
         break;
 }
 
@@ -142,33 +120,35 @@ function ping_backend($backend) {
     return $ok;
 }
 
-function proxy_post($url) {
-    $body = file_get_contents('php://input');
-    $ch = curl_init($url);
-    curl_setopt($ch, CURLOPT_POST, true);
-    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
-    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array('Content-Type: application/json')));
-    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
-    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
-    $resp = curl_exec($ch);
-    $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-    $err  = curl_error($ch);
-    curl_close($ch);
-    if ($resp === false) {
-        header('HTTP/1.1 502 Bad Gateway');
-        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+// Generic JSON-endpoint passthrough. Forwards REQUEST_METHOD, the full
+// query string (already in $url) and, for POST, the raw body. Timeouts
+// match the old per-mode helpers: GET 50s (the /api/output long-poll
+// parks up to ~10s and proxies may add latency), POST 30s, DELETE 10s.
+function proxy_pass($url) {
+    $method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
+    if ($method !== 'GET' && $method !== 'POST' && $method !== 'DELETE') {
+        // Old proxy_post silently coerced e.g. PUT into a backend POST;
+        // answer 405 instead of guessing.
+        header('HTTP/1.1 405 Method Not Allowed');
+        echo '{"error":"method not allowed"}';
         return;
     }
-    if ($code) http_response_code($code);
-    echo $resp;
-}
-
-function proxy_get($url) {
     $ch = curl_init($url);
+    $extra = array();
+    if ($method === 'POST') {
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, file_get_contents('php://input'));
+        $extra[] = 'Content-Type: application/json';
+        $timeout = 30;
+    } elseif ($method === 'DELETE') {
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
+        $timeout = 10;
+    } else {
+        $timeout = 50;
+    }
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers());
-    curl_setopt($ch, CURLOPT_TIMEOUT, 50);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers($extra));
+    curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     $resp = curl_exec($ch);
     $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
