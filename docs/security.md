@@ -213,3 +213,29 @@ Known limitation: persistent tmux **slots** live on the target host
 keyed by slot id; ownership is enforced on websh sessions, while
 `resume_slot_id` re-attachment authenticates through ssh itself (the
 user must still hold valid credentials for the target).
+## Session recording
+
+`WEBSH_RECORD_DIR` writes one asciicast v2 file per session (output
+events; `WEBSH_RECORD_INPUT=1` adds keystrokes). Treat the directory
+as sensitive:
+
+- terminal output routinely contains secrets (cat'ed configs, env
+  dumps); with input recording on, every keystroke — including
+  passwords typed at prompts *inside* the session — is on disk;
+- files are created `0600` under the server user, but there is no
+  built-in rotation or retention — pair it with a tmpwatch/logrotate
+  policy and tell your users they are being recorded where the law
+  requires it;
+- the browser-form ssh password is not recorded as input: the
+  auto-type happens below the input tee. One caveat on the output
+  side: a malicious/non-OpenSSH target that prints a password-looking
+  prompt WITHOUT disabling terminal echo would cause the auto-typed
+  password to echo back into the output stream — and therefore into
+  the recording. A genuine OpenSSH prompt disables echo first, so the
+  standard flow never records it; the hostile-server case already
+  hands the password to the attacker, the recording merely adds local
+  persistence. Also add `WEBSH_RECORD_MAX_BYTES` (default 64 MiB) to
+  your sizing math — the cap stops a runaway recording, not the
+  session.
+
+Replay with `asciinema play <file>` or any asciicast v2 player.
