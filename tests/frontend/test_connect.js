@@ -657,6 +657,37 @@ test('finalizeSuccess arms the deferred-save timer when Save is ticked', async (
   cleanup(env);
 });
 
+test('pendingSave survives a session-error auto-reconnect (timer re-armed)', async () => {
+  // Session dies inside the 2.6s commit window → handleOutputPayload's
+  // error branch runs endSession (which clears the deferred-save timer)
+  // and auto-reconnects via connectPane. The success path must re-arm
+  // scheduleSaveCommit against the NEW sid — otherwise an idle SSE
+  // session never commits the save the user asked for.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: [],
+                                   vault_enabled: true}},
+    {action: 'connect', response: {session_id: 's-first', alive: true}, once: true},
+    {action: 'connect', response: {session_id: 's-second', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'save', response: {}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  $(win, 'iSave').checked = true; $(win, 'iName').value = 'Reconn';
+  win.doConnect();
+  await sleep(120);
+  const p = paneList(win)[0];
+  ok(!!(p && p.pendingSave), 'pendingSave armed after first connect');
+  win.handleOutputPayload(p, {error: 'session not found'}, p.sid);
+  await sleep(150);
+  ok(p.sid === 's-second', 'auto-reconnect landed; got ' + p.sid);
+  ok(!!p.pendingSave, 'pendingSave survived the reconnect');
+  ok(!!p.saveCommitTimer, 'deferred-save timer re-armed for the new sid');
+  cleanup(env);
+});
+
 test('deferred save timer: cleared when the pane is closed within the window', async () => {
   // Closing the pane within SAVE_COMMIT_DELAY_MS must NOT save a session the
   // user just tore down. _destroyPane leaves p.sid set (it only reads it for
