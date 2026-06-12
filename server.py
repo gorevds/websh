@@ -2879,6 +2879,28 @@ class Handler(BaseHTTPRequestHandler):
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
 
+    def _require_session(self, sid):
+        """Validate `sid`, look it up, and reply 404 when it does not name
+        a live session. Returns the SSHSession, or None when a response
+        has already been written.
+
+        Rejects `_SessionPlaceholder` slots too: a placeholder only exists
+        for the duration of `_connect`'s ssh spawn, and no endpoint can do
+        anything useful with one — before this helper, hitting a non-stream
+        endpoint inside that window raised AttributeError (a 500 from
+        /api/input, whose write sits in a try/except; a dropped connection
+        with no response everywhere else) instead of the 404 the registry
+        miss gets a moment later."""
+        if not self._valid_sid(sid):
+            self._json({"error": "session not found"}, 404)
+            return None
+        with sessions_lock:
+            session = sessions.get(sid)
+        if not session or isinstance(session, _SessionPlaceholder):
+            self._json({"error": "session not found"}, 404)
+            return None
+        return session
+
     def _side_channel_throttled(self):
         """Apply the per-IP side-channel rate limit. Returns True (and has
         already written a 429) when the caller should stop. Each
@@ -3375,13 +3397,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         try:
@@ -3396,13 +3413,8 @@ class Handler(BaseHTTPRequestHandler):
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
 
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         # Long-poll: wait up to POLL_TIMEOUT seconds for data. Bail
@@ -3664,13 +3676,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         cols = clamp(body.get("cols"), MIN_COLS, MAX_COLS, 80)
@@ -3689,13 +3696,8 @@ class Handler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         data, err = session.tmux_capture()
         if err:
@@ -3721,13 +3723,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "invalid json"}, 400)
             return
         sid = body.get("session_id", "")
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         opts = _validate_tmux_options(body)
         ok, err = session.push_tmux_options(opts)
@@ -3751,6 +3748,9 @@ class Handler(BaseHTTPRequestHandler):
         sid = params.get("session_id", [""])[0]
         rel_path = params.get("path", [""])[0]
 
+        # Order matters (and is pinned by the dispatch tests): sid shape,
+        # then path/size validation, then registry existence — so a bad
+        # request is called out as bad even when the session is long gone.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
@@ -3775,10 +3775,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "file too large"}, 413)
             return
 
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         ok, err = session.upload_file(rel_path, self.rfile, length)
@@ -3820,6 +3818,8 @@ class Handler(BaseHTTPRequestHandler):
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
         final = body.get("final", "")
+        # Order pinned by the dispatch tests: sid shape, then tmp/final
+        # validation, then registry existence.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
@@ -3835,10 +3835,8 @@ class Handler(BaseHTTPRequestHandler):
                 or "/" in final or "\x00" in final or final in ("..", ".")):
             self._json({"error": "invalid final"}, 400)
             return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         ok, msg = session.finalize_upload(tmp, final)
         if not ok:
@@ -3869,6 +3867,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
+        # Order pinned by the dispatch tests: sid shape, then tmp
+        # validation, then registry existence.
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
@@ -3877,10 +3877,8 @@ class Handler(BaseHTTPRequestHandler):
                 or ".." in tmp.split("/")):
             self._json({"error": "invalid tmp"}, 400)
             return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
         ok, err = session.remove_remote_tmp(tmp)
         if not ok:
@@ -3901,13 +3899,8 @@ class Handler(BaseHTTPRequestHandler):
         if "\x00" in path:
             self._json({"error": "invalid path"}, 400)
             return
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         entries, abs_path, err = session.list_dir(path)
@@ -3930,13 +3923,8 @@ class Handler(BaseHTTPRequestHandler):
         if not path or "\x00" in path:
             self._json({"error": "invalid path"}, 400)
             return
-        if not self._valid_sid(sid):
-            self._json({"error": "session not found"}, 404)
-            return
-        with sessions_lock:
-            session = sessions.get(sid)
-        if not session:
-            self._json({"error": "session not found"}, 404)
+        session = self._require_session(sid)
+        if session is None:
             return
 
         proc, err = session.download_file(path)
