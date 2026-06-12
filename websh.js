@@ -3467,6 +3467,24 @@ function closeUploadSession(u) {
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
 }
 
+// Shared tail of every transfer outcome (upload/download x finish/cancel):
+// paint the progress bar + text for this outcome, then after `delay` clear
+// the transfer slot, hide the bar and refresh the badge. Painting differs
+// per outcome and stays at the call sites via `paint(bar, text)`.
+function settleTransfer(p, slot, delay, paint) {
+  let el = p.el && p.el.querySelector('[data-upload-progress]');
+  if (el && paint) {
+    paint(el.querySelector('.upload-progress-bar'),
+          el.querySelector('.upload-progress-text'));
+  }
+  setTimeout(() => {
+    p[slot] = null;
+    hideUploadProgress(p);
+    updatePaneBadge(p);
+    if (el) el.querySelector('.upload-progress-bar').style.background = '';
+  }, delay);
+}
+
 function finishUpload(p, success, reason) {
   if (!p.upload) return;
   let u = p.upload;
@@ -3474,10 +3492,12 @@ function finishUpload(p, success, reason) {
   closeUploadSession(u);
   let staged = u.staged || [];
   let placed = u.placed || [];
-  let el = p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    let bar = el.querySelector('.upload-progress-bar');
-    let text = el.querySelector('.upload-progress-text');
+  // Banner stays visible longer when there's something the user needs to
+  // read and act on — a destination path, or a specific failure reason —
+  // so it doesn't vanish before they can take it in.
+  let dismissAfter = (!success || staged.length || placed.length === 1)
+    ? 6000 : 2000;
+  settleTransfer(p, 'upload', dismissAfter, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       if (staged.length) {
@@ -3496,18 +3516,7 @@ function finishUpload(p, success, reason) {
       bar.style.background = 'var(--dg)';
       text.textContent = reason ? 'Upload failed: ' + reason : 'Upload failed';
     }
-  }
-  // Banner stays visible longer when there's something the user needs to
-  // read and act on — a destination path, or a specific failure reason —
-  // so it doesn't vanish before they can take it in.
-  let dismissAfter = (!success || staged.length || placed.length === 1)
-    ? 6000 : 2000;
-  setTimeout(() => {
-    p.upload = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, dismissAfter);
+  });
 }
 
 function cancelUpload(id) {
@@ -3525,17 +3534,10 @@ function cancelUpload(id) {
       .catch(() => {});
   }
 
-  let el = p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    el.querySelector('.upload-progress-bar').style.background = 'var(--wn)';
-    el.querySelector('.upload-progress-text').textContent = 'Cancelled';
-  }
-  setTimeout(() => {
-    p.upload = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  settleTransfer(p, 'upload', 2000, (bar, text) => {
+    bar.style.background = 'var(--wn)';
+    text.textContent = 'Cancelled';
+  });
 }
 
 function cancelTransfer(id) {
@@ -3630,10 +3632,7 @@ function finishDownload(p, success, msg) {
   let dl = p.download;
   if (!dl) return;
   dl.cancelled = true;
-  let el = p.el && p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    let bar = el.querySelector('.upload-progress-bar');
-    let text = el.querySelector('.upload-progress-text');
+  settleTransfer(p, 'download', 2000, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       text.textContent = 'Download complete';
@@ -3641,13 +3640,7 @@ function finishDownload(p, success, msg) {
       bar.style.background = 'var(--dg)';
       text.textContent = msg || 'Download failed';
     }
-  }
-  setTimeout(() => {
-    p.download = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  });
 }
 
 function cancelDownload(id) {
@@ -3655,17 +3648,10 @@ function cancelDownload(id) {
   if (!p || !p.download) return;
   p.download.cancelled = true;
   if (p.download.abort) p.download.abort();
-  let el = p.el && p.el.querySelector('[data-upload-progress]');
-  if (el) {
-    el.querySelector('.upload-progress-bar').style.background = 'var(--wn)';
-    el.querySelector('.upload-progress-text').textContent = 'Cancelled';
-  }
-  setTimeout(() => {
-    p.download = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, 2000);
+  settleTransfer(p, 'download', 2000, (bar, text) => {
+    bar.style.background = 'var(--wn)';
+    text.textContent = 'Cancelled';
+  });
 }
 
 // ── File browser ─────────────────────────────────────────────────────
