@@ -8336,22 +8336,24 @@ class TestPhpProxyActionCoverage(unittest.TestCase):
                           special + " must keep its explicit case")
 
     def test_server_routes_are_routed_by_php_proxy(self):
-        """Every action server.py dispatches must have a case in api.php's
-        switch — otherwise the endpoint silently 404s on shared hosting
-        only. The route tables make the server-side action set machine-
-        readable; keep the PHP shim in lockstep."""
+        """The PHP shim forwards ANY well-formed action generically, so
+        the lockstep contract is now: every server-side route key must
+        satisfy the shim's gate regex (the route tables make the action
+        set machine-readable), and the transfer modes with their own
+        curl plumbing must keep explicit cases."""
         root = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(root, "api.php"), "r") as f:
             php = f.read()
         actions = set(server.Handler._POST_ROUTES)
         actions.update(server.Handler._GET_ROUTES)
-        # DELETE /api/save reaches the shim as POST ?action=save_delete,
-        # which the POST table already carries.
-        missing = sorted(
-            action for action in actions
-            if "case '{}':".format(action) not in php
-        )
-        self.assertEqual(missing, [])
+        actions.update(server.Handler._DELETE_ROUTES)
+        gate = re.compile(r"^[a-z_]{1,32}$")
+        bad = sorted(a for a in actions if not gate.match(a))
+        self.assertEqual(bad, [],
+                         "server route(s) the PHP gate would 404")
+        self.assertIn("proxy_pass($URL)", php)
+        for special in ("stream", "download", "upload", "save_delete"):
+            self.assertIn("case '{}':".format(special), php)
 
 
 class TestMainSigtermSubprocess(unittest.TestCase):
