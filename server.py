@@ -2706,6 +2706,23 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("request body too large")
         return self.rfile.read(n) if n else b""
 
+    def _json_body(self):
+        """Parse the request body as a JSON object. Returns the dict, or
+        None after replying 400. Non-dict JSON (a bare list / string /
+        number) is rejected too: every caller immediately does
+        body.get(), which previously blew up with AttributeError — a
+        dropped connection — instead of the 400 the malformed-JSON case
+        gets."""
+        try:
+            body = json.loads(self._body().decode("utf-8"))
+        except Exception:
+            self._json({"error": "invalid json"}, 400)
+            return None
+        if not isinstance(body, dict):
+            self._json({"error": "invalid json"}, 400)
+            return None
+        return body
+
     def _path(self):
         p = self.path.split("?")[0].rstrip("/")
         return p or "/"
@@ -2916,10 +2933,8 @@ class Handler(BaseHTTPRequestHandler):
         if content_length > _MAX_VAULT_REQUEST_BYTES:
             self._json({"error": "request body too large"}, 413)
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         vault_id = (body.get("vault_id") or "").strip()
         conn_id  = (body.get("conn_id") or "").strip()
@@ -3041,10 +3056,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "too many connection attempts"}, 429)
             return
 
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         cols = clamp(body.get("cols"), MIN_COLS, MAX_COLS, 80)
@@ -3652,10 +3665,8 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def _resize(self):
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         sid = body.get("session_id", "")
@@ -3700,10 +3711,8 @@ class Handler(BaseHTTPRequestHandler):
         same allow-list used at connect time."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
         session = self._require_session(sid)
@@ -3793,10 +3802,8 @@ class Handler(BaseHTTPRequestHandler):
         Body: { session_id, tmp, final }."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
@@ -3843,10 +3850,8 @@ class Handler(BaseHTTPRequestHandler):
         Body: { session_id, tmp }."""
         if self._side_channel_throttled():
             return
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
@@ -4023,10 +4028,8 @@ class Handler(BaseHTTPRequestHandler):
     # ── Disconnect ──────────────────────────────────────────────────
 
     def _disconnect(self):
-        try:
-            body = json.loads(self._body().decode("utf-8"))
-        except Exception:
-            self._json({"error": "invalid json"}, 400)
+        body = self._json_body()
+        if body is None:
             return
 
         sid = body.get("session_id", "")
