@@ -178,6 +178,18 @@ def _int_env(name, default):
 
 PORT = _int_env("PORT", "8765")
 HOST = str(_knob("HOST", "127.0.0.1"))
+# Optional header-trust authentication. When set to a header name (e.g.
+# "Remote-User" from oauth2-proxy / Authelia / authentik), every request
+# except /api/ping requires that header, its value becomes the request's
+# identity, sessions are stamped with their creator's identity at
+# connect, and every session endpoint enforces ownership (403 across
+# users). The header is only read when the TCP peer is in
+# TRUSTED_PROXIES — exactly the X-Forwarded-For trust rule — so a
+# client talking to the backend directly cannot mint identities; with
+# the feature on, an untrusted peer is simply unauthenticated (401).
+# Env-only ON PURPOSE (like HOST/TRUSTED_PROXIES): a websh.json write
+# must not be able to flip authentication semantics.
+WEBSH_AUTH_HEADER = os.environ.get("WEBSH_AUTH_HEADER", "").strip()
 SESSION_TIMEOUT = _int_env("SESSION_TIMEOUT", "300")
 MAX_SESSIONS = _int_env("MAX_SESSIONS", "50")
 # Per-source-IP active session cap. 0 disables the check (preserve legacy
@@ -648,6 +660,7 @@ _LOG_FIELD_CAPS = {
     "result": 32,
     "event": 32,
     "classification": 32,
+    "auth_user": 64,       # header-trust identity (matches target_user)
 }
 _DEFAULT_FIELD_CAP = 256
 
@@ -2948,9 +2961,17 @@ class Handler(BaseHTTPRequestHandler):
         getattr(self, name)()
 
     def do_POST(self):
+        if self._auth_gate():
+            return
         self._dispatch(self._POST_ROUTES)
 
     def do_GET(self):
+        # /api/ping stays open: docker healthchecks and the PHP shim's
+        # auto-start probe must work before any auth proxy is involved.
+        # It reveals only liveness + version, which the proxy-protected
+        # deployment model already exposes to the proxy itself.
+        if self._resolve_action() != "ping" and self._auth_gate():
+            return
         static = _STATIC_FILES.get(self._path())
         if static:
             self._serve_static(*static)
@@ -2958,6 +2979,8 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch(self._GET_ROUTES)
 
     def do_DELETE(self):
+        if self._auth_gate():
+            return
         self._dispatch(self._DELETE_ROUTES)
 
     def _config(self):
@@ -3000,6 +3023,34 @@ class Handler(BaseHTTPRequestHandler):
                     return token
         return peer
 
+    def _client_identity(self):
+        """The authenticated identity, or "" when unauthenticated.
+        Only meaningful when WEBSH_AUTH_HEADER is configured; the header
+        is read exclusively from trusted proxies (same rule as
+        X-Forwarded-For) so a direct client cannot mint identities."""
+        if not WEBSH_AUTH_HEADER:
+            return ""
+        if self.client_address[0] not in _TRUSTED_PROXIES:
+            return ""
+        values = self.headers.get_all(WEBSH_AUTH_HEADER) or []
+        if len(values) > 1:
+            # A proxy that APPENDS its trusted header after a
+            # client-smuggled one would otherwise let the client's
+            # first value win (headers.get returns the first).
+            # Duplicates mean the proxy is not overwriting — refuse.
+            return ""
+        return (values[0] if values else "").strip()[:256]
+
+    def _auth_gate(self):
+        """401 unless the request carries an identity. True = blocked
+        (response already written). No-op when the feature is off."""
+        if not WEBSH_AUTH_HEADER:
+            return False
+        if self._client_identity():
+            return False
+        self._json({"error": "unauthorized"}, 401)
+        return True
+
     def _valid_sid(self, sid):
         return bool(sid and _UUID_RE.match(sid))
 
@@ -3022,6 +3073,16 @@ class Handler(BaseHTTPRequestHandler):
             session = sessions.get(sid)
         if not session or isinstance(session, _SessionPlaceholder):
             self._json({"error": "session not found"}, 404)
+            return None
+        if WEBSH_AUTH_HEADER and \
+                getattr(session, "owner", "") != self._client_identity():
+            # Another user's session: deny without confirming existence
+            # beyond the 403 (the sid itself was a 128-bit secret only
+            # its owner should hold; a cross-user probe is noteworthy —
+            # hence the audit record).
+            _access_log_emit("authz_denied", self._client_ip(),
+                             sid=sid, auth_user=self._client_identity())
+            self._json({"error": "forbidden"}, 403)
             return None
         return session
 
@@ -3457,6 +3518,10 @@ class Handler(BaseHTTPRequestHandler):
                 tmux_options=tmux_options,
                 client_ip=ip,
             )
+            # Identity stamp for header-trust auth: every session
+            # endpoint compares this against the request's identity.
+            # Empty when the feature is off (and never compared then).
+            session.owner = self._client_identity()
             with sessions_lock:
                 # Swap placeholder for the real Session. The slot was
                 # already counted under the gate lock, so this never
@@ -3470,6 +3535,7 @@ class Handler(BaseHTTPRequestHandler):
             # Successful connect forgives the IP — see _forgive_scan_for_ip.
             _forgive_scan_for_ip(ip)
             _access_log_emit("connect", ip, result="ok", sid=sid,
+                             auth_user=self._client_identity(),
                              target_host=host, target_user=username,
                              persistent=persistent,
                              latency_ms=int((time.time() - t0) * 1000))
@@ -3595,6 +3661,20 @@ class Handler(BaseHTTPRequestHandler):
         if not self._valid_sid(sid):
             self._json({"error": "session not found"}, 404)
             return
+        if WEBSH_AUTH_HEADER:
+            # Ownership BEFORE the slot-acquisition loop: a non-owner
+            # must not be able to (a) momentarily steal the stream slot
+            # or (b) learn streaming-vs-idle from a 409-vs-403 split.
+            with sessions_lock:
+                probe = sessions.get(sid)
+            if (probe is not None
+                    and not isinstance(probe, _SessionPlaceholder)
+                    and getattr(probe, "owner", "")
+                        != self._client_identity()):
+                _access_log_emit("authz_denied", self._client_ip(),
+                                 sid=sid, auth_user=self._client_identity())
+                self._json({"error": "forbidden"}, 403)
+                return
         # Acquire the per-session stream slot under sessions_lock. A second
         # /api/stream for the same session is mostly the *legitimate*
         # client reconnecting (visibility resume, network blip, EventSource
@@ -4136,7 +4216,20 @@ class Handler(BaseHTTPRequestHandler):
         sid = body.get("session_id", "")
         terminate = bool(body.get("terminate", False))
         with sessions_lock:
-            session = sessions.pop(sid, None)
+            session = sessions.get(sid)
+            if (session is not None and WEBSH_AUTH_HEADER
+                    and getattr(session, "owner", "")
+                        != self._client_identity()):
+                session = None
+                forbidden = True
+            else:
+                forbidden = False
+                sessions.pop(sid, None)
+        if forbidden:
+            _access_log_emit("authz_denied", self._client_ip(),
+                             sid=sid, auth_user=self._client_identity())
+            self._json({"error": "forbidden"}, 403)
+            return
         if session:
             # Snapshot attacker-relevant state up front: if cleanup
             # raises we still want the access-log entry, with `error`
@@ -4155,6 +4248,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 fields = {"sid": sid, "terminate": terminate,
                           "target_host": host_for_log,
+                          "auth_user": self._client_identity(),
                           "result": "terminated" if terminate else "closed"}
                 if err is not None:
                     fields["error"] = err
