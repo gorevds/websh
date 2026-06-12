@@ -8218,6 +8218,11 @@ class TestPhpProxyActionCoverage(unittest.TestCase):
     frontend can call."""
 
     def test_frontend_actions_are_routed_by_php_proxy(self):
+        """The proxy forwards ANY well-formed action generically (the
+        regex gate + proxy_pass default), so per-action coverage now
+        means: every action the frontend emits must satisfy the gate
+        regex, and the transfer modes that need special curl plumbing
+        must keep their explicit cases."""
         root = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(root, "api.php"), "r") as f:
             php = f.read()
@@ -8225,14 +8230,16 @@ class TestPhpProxyActionCoverage(unittest.TestCase):
             js = f.read()
         actions = set(re.findall(r"action=([A-Za-z0-9_]+)", js))
         actions.update(re.findall(r"api\('([A-Za-z0-9_]+)'", js))
-        # config is built by loadServerConfig via api('config'), and
-        # ping is used by the PHP proxy itself rather than the browser.
         actions.update(["config", "ping"])
-        missing = sorted(
-            action for action in actions
-            if "case '{}':".format(action) not in php
-        )
-        self.assertEqual(missing, [])
+        gate = re.compile(r"^[a-z_]{1,32}$")
+        bad = sorted(a for a in actions if not gate.match(a))
+        self.assertEqual(bad, [],
+                         "frontend action(s) the PHP regex gate would 404")
+        self.assertIn("proxy_pass($URL)", php,
+                      "generic passthrough default missing")
+        for special in ("stream", "download", "upload", "save_delete"):
+            self.assertIn("case '{}':".format(special), php,
+                          special + " must keep its explicit case")
 
 
 class TestMainSigtermSubprocess(unittest.TestCase):
