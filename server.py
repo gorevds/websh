@@ -2745,9 +2745,32 @@ class SSHSession(object):
             return False, "rm exit %d" % proc.returncode
         return True, ""
 
-    def list_dir(self, remote_path):
+    def pane_cwd_expr(self):
+        """Shell snippet that assigns the pane's current working
+        directory to $D, or the empty string when this session has no
+        way to know it.
+
+        Only tmux-backed (persistent) sessions can answer: the
+        interactive shell runs on the remote host as a child of sshd,
+        so the local side has no view of its cwd, but tmux tracks it
+        for us in `#{pane_current_path}`. Non-persistent panes fall
+        back to $HOME here — the frontend has a second source (OSC 7)
+        that covers them when the remote shell emits it."""
+        if not self.persistent or not self.slot_id:
+            return ""
+        return ('D=$(' + self.tmux_cmd + ' display -p -t websh-' +
+                self.slot_id + ' "#{pane_current_path}" 2>/dev/null); ')
+
+    def list_dir(self, remote_path, pane_cwd=False):
         """List a directory via the ControlMaster side-channel.
         remote_path may be absolute, ~, ~/sub, or relative-to-$HOME.
+
+        With pane_cwd=True the listing starts from the pane's current
+        working directory instead of remote_path, falling back to $HOME
+        when this session can't resolve one. The resolution happens
+        inside the same remote command as the listing, so "where am I"
+        and "what's there" stay a single ssh roundtrip.
+
         Returns (entries, abs_path, error_string)."""
         if not self._mux_ready():
             return None, None, "control socket not ready"
@@ -2761,14 +2784,26 @@ class SSHSession(object):
         # `stat -c` covers GNU + BusyBox; `stat -f` is the BSD/macOS
         # fallback; final fallback yields "0 0" so a host without stat
         # at all still returns a usable listing (size/mtime degraded).
+        if pane_cwd:
+            # $D comes from tmux (empty for a session that can't tell us);
+            # the [ -n ] guard turns "no answer" into the historical $HOME
+            # start point rather than a cd to "". The leading `D=` clears
+            # any inherited value first — without it, a remote profile
+            # that happens to export D would silently become the start
+            # directory for every session that can't ask tmux.
+            resolve = 'D=; ' + self.pane_cwd_expr() + '[ -n "$D" ] || D="$HOME"; '
+        else:
+            resolve = (
+                'P=$(printf %s ' + b64 + ' | base64 -d); '
+                'case "$P" in '
+                  '/*) D="$P";; '
+                  '"~") D="$HOME";; '
+                  '"~/"*) D="$HOME/${P#~/}";; '
+                  '*) D="$HOME/$P";; '
+                'esac; '
+            )
         remote_cmd = (
-            'P=$(printf %s ' + b64 + ' | base64 -d); '
-            'case "$P" in '
-              '/*) D="$P";; '
-              '"~") D="$HOME";; '
-              '"~/"*) D="$HOME/${P#~/}";; '
-              '*) D="$HOME/$P";; '
-            'esac; '
+            resolve +
             'cd "$D" 2>/dev/null || exit 1; '
             'printf "PWD:%s\\n" "$(pwd)"; '
             'for f in * .[!.]* ..?*; do '
@@ -2817,6 +2852,49 @@ class SSHSession(object):
             })
         entries.sort(key=lambda e: (e["type"] != "d", e["name"].lower()))
         return entries, abs_path, None
+
+    def remove_path(self, abs_path):
+        """Delete one absolute path via the ControlMaster side-channel.
+        Returns (ok, error_string).
+
+        Grants no privilege the session doesn't already have — the user
+        is sitting at an interactive shell on the same host as the same
+        account and could type `rm` themselves. What this does buy is
+        that the delete is keystroke-free, so it can't disturb a vim /
+        less / htop running in the foreground PTY.
+
+        Deliberately NOT recursive. A directory is removed with rmdir,
+        so a mis-click on a populated tree fails loudly instead of
+        destroying it; the user can still `rm -rf` in the terminal when
+        they mean it. Symlinks are unlinked, never followed — hence the
+        `! -L` guard, without which a link to a directory would send
+        rmdir at the link's target."""
+        if not self._mux_ready():
+            return False, "control socket not ready"
+
+        b64 = base64.b64encode(abs_path.encode("utf-8")).decode("ascii")
+        # Distinct exit codes so the caller can explain the failure
+        # instead of surfacing a bare "exit 1". Every `--` guards a
+        # filename that begins with a dash.
+        remote_cmd = (
+            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            '[ -e "$P" ] || [ -L "$P" ] || exit 3; '
+            'if [ -d "$P" ] && [ ! -L "$P" ]; then '
+              'rmdir -- "$P" 2>/dev/null || exit 4; '
+            'else '
+              'rm -f -- "$P" 2>/dev/null || exit 5; '
+            'fi'
+        )
+        proc, err = self._mux_run(remote_cmd, 10, "rm timeout")
+        if err:
+            return False, err
+        if proc.returncode == 0:
+            return True, ""
+        return False, {
+            3: "no such file or directory",
+            4: "directory not empty or not writable",
+            5: "permission denied",
+        }.get(proc.returncode, "delete failed (exit %d)" % proc.returncode)
 
     def download_file(self, remote_path):
         """Stream a file via ControlMaster. Returns (Popen, error).
@@ -3144,6 +3222,7 @@ class Handler(BaseHTTPRequestHandler):
         "upload_finalize": "_upload_finalize",
         "upload_cancel":   "_upload_cancel",
         "tmux_options":    "_tmux_options",
+        "rm":              "_rm",
         "save":            "_save_credential",
         # Compatibility with the bundled frontend in Python-only mode.
         # The PHP shim translates POST ?action=save_delete into
@@ -4281,14 +4360,17 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"ok": True})
 
     def _ls(self):
-        """GET /api/ls?session_id=<sid>&path=<path>
-        List a remote directory via ControlMaster. path defaults to ~."""
+        """GET /api/ls?session_id=<sid>&path=<path>[&cwd=1]
+        List a remote directory via ControlMaster. path defaults to ~.
+        cwd=1 ignores path and starts from the pane's working directory
+        (tmux-backed sessions; $HOME elsewhere)."""
         if self._side_channel_throttled():
             return
         params = urllib.parse.parse_qs(
             urllib.parse.urlparse(self.path).query)
         sid = params.get("session_id", [""])[0]
         path = params.get("path", ["~"])[0] or "~"
+        pane_cwd = params.get("cwd", [""])[0] == "1"
 
         if "\x00" in path:
             self._json({"error": "invalid path"}, 400)
@@ -4297,12 +4379,43 @@ class Handler(BaseHTTPRequestHandler):
         if session is None:
             return
 
-        entries, abs_path, err = session.list_dir(path)
+        entries, abs_path, err = session.list_dir(path, pane_cwd=pane_cwd)
         if err:
             self._json({"error": err}, 502)
             return
         session.last_activity = time.time()
         self._json({"path": abs_path, "entries": entries})
+
+    def _rm(self):
+        """POST /api/rm {session_id, path}
+        Delete one remote file, symlink, or empty directory via
+        ControlMaster. Non-recursive — see SSHSession.remove_path."""
+        if self._side_channel_throttled():
+            return
+        body = self._json_body()
+        if body is None:
+            return
+        sid = body.get("session_id", "")
+        path = body.get("path", "")
+
+        # Absolute-only: the file browser always has a resolved path, and
+        # refusing everything else keeps this endpoint from quietly
+        # deleting a $HOME-relative name the caller didn't mean. The
+        # bare-root check stops a delete that could only be a bug.
+        if (not isinstance(path, str) or not path.startswith("/")
+                or "\x00" in path or path.rstrip("/") == ""):
+            self._json({"error": "invalid path"}, 400)
+            return
+        session = self._require_session(sid)
+        if session is None:
+            return
+
+        ok, err = session.remove_path(path)
+        if not ok:
+            self._json({"error": err}, 502)
+            return
+        session.last_activity = time.time()
+        self._json({"ok": True})
 
     def _download(self):
         """GET /api/download?session_id=<sid>&path=<path>

@@ -5493,6 +5493,342 @@ test('document title follows the active pane across switches', async () => {
 });
 
 // =====================================================================
+// File browser: open-at-cwd, sorting, delete
+// =====================================================================
+
+// A plan that connects one pane and answers /api/ls with `entries`.
+const FB_PLAN = (entries, path) => ([
+  {action: 'config', response: {restrict_hosts: false, connections: []}},
+  {action: 'connect', response: {session_id: 'sa', alive: true}},
+  {action: 'resize', response: {ok: true}},
+  {action: 'output', response: {data: '', alive: true}},
+  {action: 'ls', response: {path: path || '/home/alice', entries: entries || []}},
+  {action: 'rm', response: {ok: true}},
+  {action: 'disconnect', response: {ok: true}},
+]);
+
+// makeFetch's log records {action, body} but not the query string, and
+// the pane-cwd flag rides in the query. Wrap fetch to keep the URLs.
+function recordUrls(win) {
+  const urls = [];
+  const inner = win.fetch;
+  win.fetch = function(url, init) { urls.push(String(url)); return inner(url, init); };
+  return urls;
+}
+
+async function _onePane(win) {
+  $(win, 'iH').value = 'a.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  return paneList(win)[0];
+}
+
+const FB_ENTRIES = [
+  {name: 'zeta.txt',  type: 'f', size: 10,   mtime: 3000},
+  {name: 'alpha.txt', type: 'f', size: 5000, mtime: 1000},
+  {name: 'mid.txt',   type: 'f', size: 700,  mtime: 2000},
+  {name: 'zdir',      type: 'd', size: 4096, mtime: 9000},
+  {name: 'adir',      type: 'd', size: 4096, mtime: 8000},
+];
+const names = win => Array.from(
+  $(win, 'fbList').querySelectorAll('.fb-nm')).map(n => n.textContent);
+
+test('file browser sorts newest-first by default, directories pinned on top', async () => {
+  // The default exists because the reason to open the browser is
+  // usually a file that was just written; alphabetical order buries it.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  ok(!!p && !!p.sid, 'pane connected');
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const got = names(win);
+  ok(got[0] === '..', 'parent entry first; got ' + JSON.stringify(got));
+  // Directories (mtime 9000, 8000) before files, each group newest-first.
+  ok(JSON.stringify(got.slice(1)) ===
+     JSON.stringify(['zdir', 'adir', 'zeta.txt', 'mid.txt', 'alpha.txt']),
+     'dirs pinned, then files newest-first; got ' + JSON.stringify(got));
+  cleanup(env);
+});
+
+test('file browser sort: name and size modes, and direction toggling', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+
+  win.setFbSort('name'); await sleep(30);
+  ok(JSON.stringify(names(win).slice(1)) ===
+     JSON.stringify(['adir', 'zdir', 'alpha.txt', 'mid.txt', 'zeta.txt']),
+     'name ascending; got ' + JSON.stringify(names(win)));
+  ok(win.settings.fbSortDir === 1, 'switching to name starts ascending');
+
+  // Clicking the active column flips it.
+  win.setFbSort('name'); await sleep(30);
+  ok(JSON.stringify(names(win).slice(1)) ===
+     JSON.stringify(['zdir', 'adir', 'zeta.txt', 'mid.txt', 'alpha.txt']),
+     'name descending after re-click; got ' + JSON.stringify(names(win)));
+
+  win.setFbSort('size'); await sleep(30);
+  ok(win.settings.fbSortDir === -1, 'switching to size starts descending');
+  ok(JSON.stringify(names(win).slice(3)) ===
+     JSON.stringify(['alpha.txt', 'mid.txt', 'zeta.txt']),
+     'files largest-first; got ' + JSON.stringify(names(win)));
+  cleanup(env);
+});
+
+test('file browser sort choice persists to settings', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok(win.settings.fbSort === 'mtime', 'default is date');
+  win.setFbSort('size'); await sleep(30);
+  const raw = win.localStorage.getItem(
+    Object.keys(win.localStorage).find(k => k.indexOf('settings') >= 0));
+  ok(raw && JSON.parse(raw).fbSort === 'size',
+     'sort column written to localStorage; got ' + raw);
+  cleanup(env);
+});
+
+test('file browser sort: equal keys fall back to name order', async () => {
+  // A tarball unpacked in one second gives every file the same mtime.
+  // Without the tiebreak the order is whatever the server happened to
+  // send, which reshuffles between listings.
+  const same = [
+    {name: 'c.txt', type: 'f', size: 1, mtime: 5000},
+    {name: 'a.txt', type: 'f', size: 1, mtime: 5000},
+    {name: 'b.txt', type: 'f', size: 1, mtime: 5000},
+  ];
+  const env = await mkEnv(FB_PLAN(same)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok(JSON.stringify(names(win).slice(1)) ===
+     JSON.stringify(['a.txt', 'b.txt', 'c.txt']),
+     'identical mtimes break to name ascending; got ' + JSON.stringify(names(win)));
+  cleanup(env);
+});
+
+test('OSC 7 tracks the remote working directory', async () => {
+  const env = await mkEnv(FB_PLAN()); const win = env.win;
+  const p = await _onePane(win);
+  ok(p.cwd === '', 'cwd starts unknown');
+  ok(p.term.parser._fireOsc(7, 'file://boxy/srv/app') === true,
+     'OSC 7 is claimed');
+  ok(p.cwd === '/srv/app', 'path extracted, host ignored; got ' + p.cwd);
+  // Percent-encoding is normal in OSC 7 payloads.
+  p.term.parser._fireOsc(7, 'file://boxy/srv/my%20dir');
+  ok(p.cwd === '/srv/my dir', 'percent-decoded; got ' + p.cwd);
+  // Junk from a hostile or broken remote must be declined, and must
+  // not overwrite a good value.
+  const before = p.cwd;
+  ok(p.term.parser._fireOsc(7, 'http://boxy/etc') === false, 'non-file:// declined');
+  ok(p.term.parser._fireOsc(7, 'file://boxy') === false, 'no path component declined');
+  ok(p.term.parser._fireOsc(7, 'file://b/a%ZZ') === false, 'bad escape declined');
+  ok(p.term.parser._fireOsc(7, 'file://b' + '/x'.repeat(4000)) === false,
+     'oversize payload declined');
+  ok(p.cwd === before, 'declined payloads left cwd untouched; got ' + p.cwd);
+  cleanup(env);
+});
+
+test('file browser opens at the OSC 7 cwd, without asking the server', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/srv/app')); const win = env.win;
+  const p = await _onePane(win);
+  p.term.parser._fireOsc(7, 'file://boxy/srv/app');
+  const urls = recordUrls(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const ls = urls.find(u => u.indexOf('action=ls') >= 0);
+  ok(!!ls, 'a listing was requested');
+  ok(ls.indexOf(encodeURIComponent('/srv/app')) >= 0,
+     'listing asked for the tracked cwd; got ' + ls);
+  ok(ls.indexOf('cwd=1') < 0,
+     'no server-side cwd resolution needed when OSC 7 already told us');
+  cleanup(env);
+});
+
+test('file browser asks the server for the pane cwd when OSC 7 is silent', async () => {
+  // Non-persistent shells that emit no OSC 7, and every pane before its
+  // first prompt. The server can still answer for tmux-backed sessions.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  ok(p.cwd === '', 'no OSC 7 seen');
+  const urls = recordUrls(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const ls = urls.find(u => u.indexOf('action=ls') >= 0);
+  ok(!!ls && ls.indexOf('cwd=1') >= 0,
+     'falls back to server-side cwd resolution; got ' + ls);
+  // The header must show where we actually landed, not the '~' we asked with.
+  ok($(win, 'fbPath').textContent === '/home/alice',
+     'header shows the resolved path; got ' + $(win, 'fbPath').textContent);
+  cleanup(env);
+});
+
+test('disconnect clears the tracked cwd', async () => {
+  // Otherwise a reconnect — which starts in $HOME, or on another host
+  // entirely — would open the browser at the dead shell's directory.
+  const env = await mkEnv(FB_PLAN()); const win = env.win;
+  const p = await _onePane(win);
+  p.term.parser._fireOsc(7, 'file://boxy/srv/app');
+  ok(p.cwd === '/srv/app', 'cwd tracked');
+  win.endSession(p, {});
+  ok(p.cwd === '', 'cwd cleared with the session; got ' + p.cwd);
+  cleanup(env);
+});
+
+test('file browser delete: confirm strip, then POST /api/rm', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const rows = $(win, 'fbList').querySelectorAll('.fb-row');
+  // Row 0 is '..' and must not offer a delete at all.
+  ok(!rows[0].querySelector('[data-fb-del]'), 'parent row has no delete button');
+  ok(!!rows[0].querySelector('.fb-del-sp'), 'parent row keeps the column spacer');
+
+  const target = Array.from(rows).find(
+    r => r.querySelector('.fb-nm') &&
+         r.querySelector('.fb-nm').textContent === 'zeta.txt');
+  ok(!!target, 'found the zeta.txt row');
+  target.querySelector('[data-fb-del]').click();
+  ok(target.classList.contains('fb-confirm'), 'row switched to confirm mode');
+  ok(target.textContent.indexOf('zeta.txt') >= 0,
+     'confirm keeps the filename visible; got ' + target.textContent);
+
+  // A click on the row while confirming must not start a download.
+  const dl = [];
+  win.startFastDownload = (id, path) => dl.push(path);
+  target.click();
+  ok(dl.length === 0, 'row is inert while confirming; got ' + JSON.stringify(dl));
+
+  const before = env.log.filter(e => e.action === 'rm').length;
+  target.querySelector('.fb-cf-yes').click();
+  await sleep(40);
+  const rms = env.log.filter(e => e.action === 'rm');
+  ok(rms.length === before + 1, 'exactly one rm POSTed; got ' + rms.length);
+  ok(rms[rms.length - 1].body.path === '/home/alice/zeta.txt',
+     'absolute path sent; got ' + JSON.stringify(rms[rms.length - 1].body));
+  ok(rms[rms.length - 1].body.session_id === 'sa', 'session id sent');
+  cleanup(env);
+});
+
+test('file browser delete: cancel restores the row and sends nothing', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const target = Array.from($(win, 'fbList').querySelectorAll('.fb-row')).find(
+    r => r.querySelector('.fb-nm') &&
+         r.querySelector('.fb-nm').textContent === 'mid.txt');
+  target.querySelector('[data-fb-del]').click();
+  target.querySelector('.fb-cf-no').click();
+  ok(!target.classList.contains('fb-confirm'), 'confirm mode left');
+  ok(target.querySelector('.fb-nm').textContent === 'mid.txt',
+     'row contents restored');
+  ok(env.log.filter(e => e.action === 'rm').length === 0, 'no rm sent');
+
+  // The restored row must still be usable: delete re-arms...
+  target.querySelector('[data-fb-del]').click();
+  ok(target.classList.contains('fb-confirm'), 'delete re-arms after a cancel');
+  target.querySelector('.fb-cf-no').click();
+  // ...and so does the download action.
+  const dl = [];
+  win.startFastDownload = (id, path) => dl.push(path);
+  target.click();
+  ok(dl.length === 1 && dl[0] === '/home/alice/mid.txt',
+     'download works again after cancel; got ' + JSON.stringify(dl));
+  cleanup(env);
+});
+
+test('file browser delete: a failure restores the row and reports why', async () => {
+  const plan = FB_PLAN(FB_ENTRIES);
+  plan.find(e => e.action === 'rm').response =
+    {error: 'directory not empty or not writable'};
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const toasts = [];
+  win.showToast = (m, k) => toasts.push(k + ':' + m);
+  const target = Array.from($(win, 'fbList').querySelectorAll('.fb-row')).find(
+    r => r.querySelector('.fb-nm') &&
+         r.querySelector('.fb-nm').textContent === 'zdir');
+  target.querySelector('[data-fb-del]').click();
+  target.querySelector('.fb-cf-yes').click();
+  await sleep(40);
+  ok(toasts.some(t => t.indexOf('not empty') >= 0),
+     'the server reason reaches the user; got ' + JSON.stringify(toasts));
+  ok(!target.classList.contains('fb-confirm'), 'row left confirm mode');
+  ok(target.querySelector('.fb-nm') &&
+     target.querySelector('.fb-nm').textContent === 'zdir',
+     'row restored so the entry is still visible and actionable');
+  cleanup(env);
+});
+
+test('file browser delete: Escape answers the confirm, not the browser', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const target = Array.from($(win, 'fbList').querySelectorAll('.fb-row')).find(
+    r => r.querySelector('.fb-nm') &&
+         r.querySelector('.fb-nm').textContent === 'zeta.txt');
+  target.querySelector('[data-fb-del]').click();
+  ok(target.classList.contains('fb-confirm'), 'armed');
+
+  const esc = () => win.document.dispatchEvent(new win.KeyboardEvent(
+    'keydown', {key: 'Escape', bubbles: true}));
+  esc();
+  ok(!target.classList.contains('fb-confirm'), 'first Escape cancels the confirm');
+  ok(!hidden($(win, 'fbOv')), 'the browser itself stays open');
+  ok(env.log.filter(e => e.action === 'rm').length === 0, 'nothing deleted');
+
+  // A second Escape, with nothing armed, closes the browser as before.
+  esc();
+  ok(hidden($(win, 'fbOv')), 'second Escape closes the browser');
+  cleanup(env);
+});
+
+test('file browser delete: arming a second row disarms the first', async () => {
+  // Two open "Delete?" prompts at once is an easy way to answer the
+  // wrong one.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const rowFor = n => Array.from($(win, 'fbList').querySelectorAll('.fb-row')).find(
+    r => r.querySelector('.fb-nm') && r.querySelector('.fb-nm').textContent === n);
+  const a = rowFor('zeta.txt'), b = rowFor('mid.txt');
+  a.querySelector('[data-fb-del]').click();
+  b.querySelector('[data-fb-del]').click();
+  ok(b.classList.contains('fb-confirm'), 'second row armed');
+  ok(!a.classList.contains('fb-confirm'), 'first row disarmed');
+  ok(a.querySelector('.fb-nm').textContent === 'zeta.txt',
+     'first row restored intact');
+  ok($(win, 'fbList').querySelectorAll('.fb-confirm').length === 1,
+     'exactly one confirmation on screen');
+  cleanup(env);
+});
+
+test('file browser survives a malformed listing response', async () => {
+  // Regression guard: a response missing `path`/`entries` used to reach
+  // the renderer, which then built "undefined/name" download targets.
+  const plan = FB_PLAN(FB_ENTRIES);
+  plan.find(e => e.action === 'ls').response = {alive: false};
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok($(win, 'fbList').querySelector('.fb-msg.err'),
+     'an error message is shown instead of a broken listing');
+  ok($(win, 'fbList').querySelectorAll('.fb-row').length === 0,
+     'no rows rendered from a malformed response');
+  cleanup(env);
+});
+
+// =====================================================================
 (async () => {
   for (const s of scenarios) {
     console.log('\n=== ' + s.name + ' ===');

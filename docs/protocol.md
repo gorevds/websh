@@ -102,7 +102,7 @@ allow-list as connect). Reply `{"ok": true, "applied": [names]}`.
 
 ## File-transfer endpoints
 
-All side-channel endpoints (`upload*`, `ls`, `download`,
+All side-channel endpoints (`upload*`, `ls`, `rm`, `download`,
 `tmux_capture`, `tmux_options`) share a per-IP rate limit →
 `429 {"error": "rate_limited"}`.
 
@@ -122,9 +122,37 @@ foreground tmux pane's cwd with collision auto-increment. Reply
 Body: `session_id`, `tmp`. Best-effort `rm` of the staged file.
 Reply `{"ok": true}`.
 
-### GET /api/ls?session_id=&path=
+### GET /api/ls?session_id=&path=[&cwd=1]
 Remote directory listing. Reply: `{"path": abs, "entries":
 [{"name", "type": "d|f|l|o", "size", "mtime"}, ...]}`.
+
+`cwd=1` ignores `path` and lists the pane's current working directory
+instead, so "where am I" and "what is there" stay one ssh roundtrip.
+Only tmux-backed sessions can resolve one (via `#{pane_current_path}`);
+everything else falls back to `$HOME`. `path` is still required as the
+fallback value and must be present. The reply's `path` is always the
+directory actually listed — clients should read their position back
+from it rather than assuming the request was honoured.
+
+Entries arrive sorted directories-first by name. Clients are free to
+re-sort (the bundled one sorts by `mtime` descending by default).
+
+### POST /api/rm
+Body: `session_id`, `path` (absolute). Deletes exactly one entry over
+the ControlMaster side channel: `rm -f` for files and symlinks,
+`rmdir` for directories. **Never recursive** — deleting a populated
+directory fails rather than taking the tree with it. Symlinks are
+unlinked, never followed.
+
+Reply `{"ok": true}`, or `502 {"error": msg}` where msg distinguishes
+"no such file or directory", "directory not empty or not writable",
+and "permission denied". `400` for a relative path, bare `/`, an
+embedded NUL, or a non-string.
+
+Grants no privilege the session lacks — the user has an interactive
+shell on that host as that account. The reason it exists is that the
+delete is keystroke-free, so it cannot disturb a full-screen program
+running in the foreground PTY.
 
 ### GET /api/download?session_id=&path=
 Streams the file as `application/octet-stream` with
