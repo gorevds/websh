@@ -72,7 +72,9 @@ const DEFAULT_SETTINGS = {
   // File-browser sort. Newest-first by default: the reason to open the
   // browser is usually a file that was just written, and alphabetical
   // order buries it. 'name' | 'size' | 'mtime'; dir -1 = descending.
-  fbSort: 'mtime', fbSortDir: -1
+  fbSort: 'mtime', fbSortDir: -1,
+  // Dotfiles hidden by default, as in every file manager and `ls`.
+  fbShowHidden: false
 };
 // id → [label, webfont-name-or-null, fallback-stack, google-weights]
 // webfont-name is the family loaded via Google Fonts; null = system
@@ -3882,13 +3884,18 @@ function cancelDownload(id) {
 
 // ── File browser ─────────────────────────────────────────────────────
 let _fbId = null;
+// The directory the browser is currently showing (absolute, server-
+// resolved). Breadcrumbs, "up", reload, and new-folder all read it
+// rather than scraping it back out of the DOM.
+let _fbCurPath = '';
 
-// The `done` closure of the row currently showing a delete confirmation,
-// or null. At most one row is armed at a time — arming a second disarms
-// the first, so there is never more than one pending "Delete?" on screen.
+// The `done` closure of the row currently showing an inline editor — a
+// delete confirmation, a rename field, or the new-folder input — or
+// null. At most one is open at a time: opening a second runs this to
+// dismiss the first, so the list never shows two competing editors.
 let _fbConfirm = null;
 
-// Escape while a row is armed answers that question ("no") instead of
+// Escape while an inline editor is open dismisses it ("no") instead of
 // closing the whole browser, which is what the user means and saves
 // re-navigating to the directory they were in.
 function cancelFbConfirm() {
@@ -3912,11 +3919,49 @@ function showFileBrowser(id) {
   // neither worked); focus starts in the manual-path input.
   _fbTrap.open(() => $('fbManual'));
   syncFbSortUi();
+  syncFbHiddenUi();
+  let f = $('fbFilter'); if (f) f.value = '';
   // Open where the user is standing, not at $HOME. Three sources, best
   // first: OSC 7 told us directly; the server can ask tmux; otherwise
   // fall back to the historical ~.
   if (p.cwd) loadFbDir(p.cwd);
   else loadFbDir('~', {paneCwd: true});
+}
+
+// Store the resolved directory and repaint the breadcrumb trail. The
+// full path also lands in data-path on the <nav> so scripts and tests
+// have one unambiguous place to read it.
+function setFbPath(path) {
+  _fbCurPath = path || '';
+  let nav = $('fbPath');
+  if (!nav) return;
+  nav.innerHTML = '';
+  nav.setAttribute('data-path', _fbCurPath);
+  if (!_fbCurPath) return;               // loading (pane-cwd not resolved yet)
+  let parts = _fbCurPath.split('/').filter(s => s.length);
+  let crumb = (label, full, cur) => {
+    let b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'fb-crumb' + (cur ? ' cur' : '');
+    b.textContent = label;
+    if (!cur) b.addEventListener('click', () => loadFbDir(full));
+    return b;
+  };
+  // Root "/" first; its trailing slash doubles as the separator before
+  // the first segment, so separators are only drawn between segments.
+  nav.appendChild(crumb('/', '/', parts.length === 0));
+  let acc = '';
+  parts.forEach((seg, i) => {
+    if (i > 0) {
+      let sep = document.createElement('span');
+      sep.className = 'fb-crumb-sep'; sep.textContent = '/';
+      nav.appendChild(sep);
+    }
+    acc += '/' + seg;
+    nav.appendChild(crumb(seg, acc, i === parts.length - 1));
+  });
+  // Keep the deepest crumb in view on a long path.
+  nav.scrollLeft = nav.scrollWidth;
 }
 
 function closeFb() {
@@ -3929,7 +3974,7 @@ function closeFb() {
 }
 
 function fbUp() {
-  let cur = $('fbPath').textContent;
+  let cur = _fbCurPath;
   if (!cur || cur === '/') return;
   let parent = cur.lastIndexOf('/') > 0 ? cur.substring(0, cur.lastIndexOf('/')) : '/';
   loadFbDir(parent);
@@ -3945,7 +3990,10 @@ function loadFbDir(path, o) {
   if (!p) return;
   let list = $('fbList');
   list.innerHTML = '<div class="fb-msg">Loading…</div>';
-  $('fbPath').textContent = (o && o.paneCwd) ? '' : path;
+  setFbPath((o && o.paneCwd) ? '' : path);
+  // A fresh directory starts unfiltered — a filter left over from the
+  // previous listing would silently hide most of the new one.
+  let f = $('fbFilter'); if (f) f.value = '';
   fetch(API + '?action=ls&session_id=' + encodeURIComponent(p.sid) +
         '&path=' + encodeURIComponent(path) +
         ((o && o.paneCwd) ? '&cwd=1' : ''))
@@ -3962,7 +4010,7 @@ function loadFbDir(path, o) {
         list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
         return;
       }
-      $('fbPath').textContent = r.path;
+      setFbPath(r.path);
       renderFbEntries(r.entries, r.path);
     })
     .catch(() => {
@@ -3970,11 +4018,10 @@ function loadFbDir(path, o) {
     });
 }
 
-// Re-list whatever the header currently points at. Used after a delete
-// so the view reflects the remote rather than a locally patched guess.
+// Re-list the current directory. Used after a create/rename/delete so
+// the view reflects the remote rather than a locally patched guess.
 function reloadFbDir() {
-  let cur = $('fbPath').textContent;
-  if (cur) loadFbDir(cur);
+  if (_fbCurPath) loadFbDir(_fbCurPath);
 }
 
 function renderFbEntries(entries, absPath) {
@@ -3986,18 +4033,22 @@ function renderFbEntries(entries, absPath) {
   if (absPath !== '/') {
     let parent = absPath.lastIndexOf('/') > 0
       ? absPath.substring(0, absPath.lastIndexOf('/')) : '/';
-    let row = makeFbRow('d', '..', null, null, {noDelete: true});
+    let row = makeFbRow('d', '..', null, null, {noActions: true});
+    // Marked so the dotfile/filter visibility pass never hides it — ".."
+    // both starts with a dot and matches no filter term.
+    row.dataset.parent = '1';
     row.addEventListener('click', () => loadFbDir(parent));
     list.appendChild(row);
   }
   for (let e of sortFbEntries(entries)) {
     let fullPath = absPath.endsWith('/') ? absPath + e.name : absPath + '/' + e.name;
     let row = makeFbRow(e.type, e.name, e.type !== 'd' ? e.size : null, e.mtime);
-    // While the row is showing its delete confirmation it stops being a
-    // download/navigate target — otherwise the click that lands next to
-    // "Delete foo?" would fetch foo instead of answering the question.
+    // While a row is showing an inline editor (delete-confirm or rename)
+    // it stops being a download/navigate target — otherwise the click
+    // that lands next to the editor would act on the row underneath.
     let activate = fn => row.addEventListener('click', () => {
-      if (row.classList.contains('fb-confirm')) return;
+      if (row.classList.contains('fb-confirm') ||
+          row.classList.contains('fb-edit')) return;
       fn();
     });
     if (e.type === 'd') {
@@ -4010,6 +4061,7 @@ function renderFbEntries(entries, absPath) {
       });
     }
     wireFbDelete(row, fullPath, e.name);
+    wireFbRename(row, fullPath, e.name, e.type);
     list.appendChild(row);
   }
   if (!entries.length) {
@@ -4017,6 +4069,8 @@ function renderFbEntries(entries, absPath) {
     m.className = 'fb-msg'; m.textContent = 'Empty directory';
     list.appendChild(m);
   }
+  // Apply the dotfile toggle and any active name filter to the fresh rows.
+  applyFbVisibility();
 }
 
 function makeFbRow(type, name, size, mtime, o) {
@@ -4030,19 +4084,22 @@ function makeFbRow(type, name, size, mtime, o) {
     else if (size < 1073741824) sizeStr = (size / 1048576).toFixed(1) + ' MB';
     else sizeStr = (size / 1073741824).toFixed(1) + ' GB';
   }
-  // Delete sits at the far right, after the metadata columns. The ".."
-  // row gets no button — a fixed-width spacer keeps the row height and
-  // the size/date columns from reflowing when it's absent.
-  let del = (o && o.noDelete)
-    ? '<span class="fb-del-sp"></span>'
-    : '<button type="button" class="fb-del" data-fb-del ' +
+  // Rename + delete live in a fixed-width group at the far right, after
+  // the metadata columns. The ".." row gets no buttons, but the empty
+  // group keeps its width so the size/date columns stay aligned.
+  let acts = (o && o.noActions) ? '' :
+    '<button type="button" class="fb-ren" data-fb-ren ' +
+      'title="Rename" aria-label="Rename ' + esc(name) + '">&#x270E;</button>' +
+    '<button type="button" class="fb-del" data-fb-del ' +
       'title="Delete" aria-label="Delete ' + esc(name) + '">&#x00D7;</button>';
   row.innerHTML =
     '<span class="fb-ic">' + icon + '</span>' +
     '<span class="fb-nm">' + esc(name) + '</span>' +
     '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
     '<span class="fb-dt">' + esc(fbDate(mtime)) + '</span>' +
-    del;
+    '<span class="fb-act">' + acts + '</span>';
+  // The visibility pass (dotfile toggle + name filter) reads the name here.
+  row.dataset.name = name;
   return row;
 }
 
@@ -4177,6 +4234,179 @@ function doFbDelete(row, fullPath, name, undo) {
     })
     .catch(e => {
       showToast('Delete failed: ' + (e.message || 'error'), 'err');
+      undo();
+    });
+}
+
+// ── File browser: dotfile toggle + name filter ──────────────────────
+// Both are pure client-side view state layered on the already-fetched
+// rows: no roundtrip, so typing in the filter or flipping "Hidden" is
+// instant even on a directory of hundreds of entries.
+function applyFbVisibility() {
+  let list = $('fbList'); if (!list) return;
+  let fInp = $('fbFilter');
+  let filt = (fInp && fInp.value || '').trim().toLowerCase();
+  let showHidden = !!settings.fbShowHidden;
+  for (let row of list.querySelectorAll('.fb-row')) {
+    // ".." and an open editor row are always shown.
+    if (row.dataset.parent === '1' || row.classList.contains('fb-edit')) {
+      row.classList.remove('fb-hide'); continue;
+    }
+    let name = row.dataset.name || '';
+    let hideDot = !showHidden && name.charAt(0) === '.';
+    let hideFilt = filt && name.toLowerCase().indexOf(filt) < 0;
+    row.classList.toggle('fb-hide', !!(hideDot || hideFilt));
+  }
+}
+function applyFbFilter() { applyFbVisibility(); }
+
+function toggleFbHidden() {
+  settings.fbShowHidden = !settings.fbShowHidden;
+  saveSettings();
+  syncFbHiddenUi();
+  applyFbVisibility();
+}
+function syncFbHiddenUi() {
+  let b = $('fbHidden'); if (!b) return;
+  let on = !!settings.fbShowHidden;
+  b.classList.toggle('on', on);
+  b.setAttribute('aria-pressed', on ? 'true' : 'false');
+}
+
+// ── File browser: rename (mv) ───────────────────────────────────────
+function wireFbRename(row, fullPath, name, type) {
+  let btn = row.querySelector('[data-fb-ren]');
+  if (!btn) return;
+  btn.addEventListener('click', ev => {
+    ev.stopPropagation();               // don't navigate/download the row
+    askFbRename(row, fullPath, name, type);
+  });
+}
+
+function askFbRename(row, fullPath, name, type) {
+  if (row.classList.contains('fb-edit')) return;
+  cancelFbConfirm();                    // close any other open editor
+  let restore = row.innerHTML;
+  let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
+  row.classList.add('fb-edit');
+  row.innerHTML =
+    '<span class="fb-ic">' + icon + '</span>' +
+    '<input type="text" class="fb-ed-inp" aria-label="New name">' +
+    '<button type="button" class="fb-ed-no">Cancel</button>' +
+    '<button type="button" class="fb-ed-ok">Save</button>';
+  let inp = row.querySelector('.fb-ed-inp');
+  inp.value = name;
+  let done = () => {
+    _fbConfirm = null;
+    row.classList.remove('fb-edit');
+    row.innerHTML = restore;
+    wireFbDelete(row, fullPath, name);
+    wireFbRename(row, fullPath, name, type);
+  };
+  _fbConfirm = done;
+  let commit = () => {
+    let next = inp.value.trim();
+    // Nothing to do if the name is empty or unchanged.
+    if (!next || next === name) { done(); return; }
+    if (next.indexOf('/') >= 0) {
+      showToast('Name cannot contain "/"', 'err'); return;
+    }
+    doFbRename(row, fullPath, next, done);
+  };
+  row.querySelector('.fb-ed-no').addEventListener('click', ev => {
+    ev.stopPropagation(); done();
+  });
+  row.querySelector('.fb-ed-ok').addEventListener('click', ev => {
+    ev.stopPropagation(); commit();
+  });
+  inp.addEventListener('keydown', ev => {
+    ev.stopPropagation();               // keep Escape/Enter out of the modal trap
+    if (ev.key === 'Enter') commit();
+    else if (ev.key === 'Escape') done();
+  });
+  // Select the basename (name minus extension) so a quick retype keeps
+  // the suffix — the common case is fixing the stem, not the ".txt".
+  try {
+    inp.focus();
+    let dot = name.lastIndexOf('.');
+    inp.setSelectionRange(0, dot > 0 ? dot : name.length);
+  } catch (e) {}
+}
+
+function doFbRename(row, fullPath, newName, undo) {
+  let p = _fbId && panes[_fbId];
+  if (!p || !p.sid) return;
+  row.innerHTML = '<span class="fb-cf-q">Renaming…</span>';
+  api('mv', {body: {session_id: p.sid, path: fullPath, name: newName}})
+    .then(r => {
+      if (r && r.error) throw new Error(r.error);
+      showToast('Renamed to ' + newName, 'ok');
+      reloadFbDir();
+    })
+    .catch(e => {
+      showToast('Rename failed: ' + (e.message || 'error'), 'err');
+      undo();
+    });
+}
+
+// ── File browser: new folder (mkdir) ────────────────────────────────
+// An editor row inserted at the top of the list, above the entries.
+function fbNewFolder() {
+  let list = $('fbList');
+  if (!list || !_fbCurPath) return;
+  cancelFbConfirm();
+  let row = document.createElement('div');
+  row.className = 'fb-row fb-edit';
+  row.innerHTML =
+    '<span class="fb-ic">📁</span>' +
+    '<input type="text" class="fb-ed-inp" placeholder="Folder name" aria-label="Folder name">' +
+    '<button type="button" class="fb-ed-no">Cancel</button>' +
+    '<button type="button" class="fb-ed-ok">Create</button>';
+  // Above everything, including "..", so it's where the eye already is.
+  list.insertBefore(row, list.firstChild);
+  let inp = row.querySelector('.fb-ed-inp');
+  let done = () => {
+    _fbConfirm = null;
+    if (row.parentNode) row.parentNode.removeChild(row);
+  };
+  _fbConfirm = done;
+  let commit = () => {
+    let name = inp.value.trim();
+    if (!name) { done(); return; }
+    if (name.indexOf('/') >= 0) {
+      showToast('Name cannot contain "/"', 'err'); return;
+    }
+    doFbMkdir(row, name, done);
+  };
+  row.querySelector('.fb-ed-no').addEventListener('click', ev => {
+    ev.stopPropagation(); done();
+  });
+  row.querySelector('.fb-ed-ok').addEventListener('click', ev => {
+    ev.stopPropagation(); commit();
+  });
+  inp.addEventListener('keydown', ev => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') commit();
+    else if (ev.key === 'Escape') done();
+  });
+  try { inp.focus(); } catch (e) {}
+}
+
+function doFbMkdir(row, name, undo) {
+  let p = _fbId && panes[_fbId];
+  if (!p || !p.sid) return;
+  // Join onto the current directory; avoid a double slash at the root.
+  let base = _fbCurPath === '/' ? '' : _fbCurPath;
+  let full = base + '/' + name;
+  row.innerHTML = '<span class="fb-ic">📁</span><span class="fb-cf-q">Creating…</span>';
+  api('mkdir', {body: {session_id: p.sid, path: full}})
+    .then(r => {
+      if (r && r.error) throw new Error(r.error);
+      showToast('Created ' + name, 'ok');
+      reloadFbDir();
+    })
+    .catch(e => {
+      showToast('Create failed: ' + (e.message || 'error'), 'err');
       undo();
     });
 }
