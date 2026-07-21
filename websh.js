@@ -4030,17 +4030,19 @@ function makeFbRow(type, name, size, mtime, o) {
     else if (size < 1073741824) sizeStr = (size / 1048576).toFixed(1) + ' MB';
     else sizeStr = (size / 1073741824).toFixed(1) + ' GB';
   }
-  // The delete control is a placeholder span on ".." so every row keeps
-  // the same left inset and the icon column stays aligned.
+  // Delete sits at the far right, after the metadata columns. The ".."
+  // row gets no button — a fixed-width spacer keeps the row height and
+  // the size/date columns from reflowing when it's absent.
   let del = (o && o.noDelete)
     ? '<span class="fb-del-sp"></span>'
     : '<button type="button" class="fb-del" data-fb-del ' +
       'title="Delete" aria-label="Delete ' + esc(name) + '">&#x00D7;</button>';
-  row.innerHTML = del +
+  row.innerHTML =
     '<span class="fb-ic">' + icon + '</span>' +
     '<span class="fb-nm">' + esc(name) + '</span>' +
     '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
-    '<span class="fb-dt">' + esc(fbDate(mtime)) + '</span>';
+    '<span class="fb-dt">' + esc(fbDate(mtime)) + '</span>' +
+    del;
   return row;
 }
 

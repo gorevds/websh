@@ -259,10 +259,10 @@
        files isn't a wall of red crosses, but never display:none — it
        has to stay reachable by keyboard and obvious on touch, where
        there is no hover at all. */
-    .fb-del{background:none;border:none;color:var(--dim);opacity:.45;cursor:pointer;padding:0 2px;font-size:15px;line-height:1;flex-shrink:0;width:18px;border-radius:3px;transition:.12s}
+    .fb-del{background:none;border:none;color:var(--dim);opacity:.45;cursor:pointer;padding:0 2px;font-size:15px;line-height:1;flex-shrink:0;width:18px;margin-left:4px;border-radius:3px;transition:.12s}
     .fb-row:hover .fb-del{opacity:.8}
     .fb-del:hover,.fb-del:focus-visible{color:var(--dg);opacity:1;outline:none}
-    .fb-del-sp{width:18px;flex-shrink:0}
+    .fb-del-sp{width:18px;margin-left:4px;flex-shrink:0}
     /* Inline delete confirmation — replaces the row's contents so the
        filename stays visible next to the choice. */
     .fb-row.fb-confirm{cursor:default;background:rgba(255,80,80,.08);gap:6px}

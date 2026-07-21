@@ -5692,6 +5692,11 @@ test('file browser delete: confirm strip, then POST /api/rm', async () => {
     r => r.querySelector('.fb-nm') &&
          r.querySelector('.fb-nm').textContent === 'zeta.txt');
   ok(!!target, 'found the zeta.txt row');
+  // The delete control lives at the far right — it must be the row's
+  // last child, after the size and date columns.
+  ok(target.lastElementChild &&
+     target.lastElementChild.hasAttribute('data-fb-del'),
+     'delete button is the rightmost element in a file row');
   target.querySelector('[data-fb-del]').click();
   ok(target.classList.contains('fb-confirm'), 'row switched to confirm mode');
   ok(target.textContent.indexOf('zeta.txt') >= 0,
