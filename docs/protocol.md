@@ -102,8 +102,8 @@ allow-list as connect). Reply `{"ok": true, "applied": [names]}`.
 
 ## File-transfer endpoints
 
-All side-channel endpoints (`upload*`, `ls`, `rm`, `download`,
-`tmux_capture`, `tmux_options`) share a per-IP rate limit →
+All side-channel endpoints (`upload*`, `ls`, `rm`, `mkdir`, `mv`,
+`download`, `tmux_capture`, `tmux_options`) share a per-IP rate limit →
 `429 {"error": "rate_limited"}`.
 
 ### POST /api/upload?session_id=&path=
@@ -153,6 +153,23 @@ Grants no privilege the session lacks — the user has an interactive
 shell on that host as that account. The reason it exists is that the
 delete is keystroke-free, so it cannot disturb a full-screen program
 running in the foreground PTY.
+
+### POST /api/mkdir
+Body: `session_id`, `path` (absolute). Creates one directory,
+**non-recursive** (`mkdir`, not `mkdir -p`) — a mistyped path fails
+rather than silently building a chain. The final path segment may not
+be `.` or `..`. Reply `{"ok": true}`, or `502 {"error": msg}` ("name
+already exists" / "could not create …"); `400` for a bad path.
+
+### POST /api/mv
+Body: `session_id`, `path` (absolute source), `name` (bare filename).
+Renames the entry to a **sibling** in the same directory — the
+destination is always `dirname(path)/name`, so it cannot move an entry
+elsewhere; `name` is rejected if it contains `/`, is `.`/`..`, is
+empty, holds a NUL, or exceeds 255 bytes. Refuses to overwrite an
+existing target. Reply `{"ok": true}`, or `502 {"error": msg}` ("a
+file with that name already exists" / "permission denied" / "no such
+file"); `400` for a bad path or name.
 
 ### GET /api/download?session_id=&path=
 Streams the file as `application/octet-stream` with

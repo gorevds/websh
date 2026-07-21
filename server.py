@@ -2896,6 +2896,62 @@ class SSHSession(object):
             5: "permission denied",
         }.get(proc.returncode, "delete failed (exit %d)" % proc.returncode)
 
+    def make_dir(self, abs_path):
+        """Create one directory via the ControlMaster side-channel.
+        Non-recursive `mkdir` — the parent (the directory the browser is
+        showing) already exists, and refusing to create intermediate
+        levels keeps a fat-fingered path from quietly making a tree.
+        Returns (ok, error_string)."""
+        if not self._mux_ready():
+            return False, "control socket not ready"
+
+        b64 = base64.b64encode(abs_path.encode("utf-8")).decode("ascii")
+        remote_cmd = (
+            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            'if [ -e "$P" ] || [ -L "$P" ]; then exit 4; fi; '
+            'mkdir -- "$P" 2>/dev/null || exit 5'
+        )
+        proc, err = self._mux_run(remote_cmd, 10, "mkdir timeout")
+        if err:
+            return False, err
+        if proc.returncode == 0:
+            return True, ""
+        return False, {
+            4: "name already exists",
+            5: "could not create (permission denied or missing parent)",
+        }.get(proc.returncode, "mkdir failed (exit %d)" % proc.returncode)
+
+    def rename_entry(self, abs_path, new_name):
+        """Rename one entry within its own directory. new_name is a bare
+        filename — the destination is always dirname(abs_path)/new_name,
+        so this can't move an entry elsewhere or be tricked into writing
+        an attacker-chosen absolute path (the HTTP layer also rejects a
+        new_name containing '/'). Refuses to clobber an existing target.
+        Returns (ok, error_string)."""
+        if not self._mux_ready():
+            return False, "control socket not ready"
+
+        b_src = base64.b64encode(abs_path.encode("utf-8")).decode("ascii")
+        b_name = base64.b64encode(new_name.encode("utf-8")).decode("ascii")
+        remote_cmd = (
+            'S=$(printf %s ' + b_src + ' | base64 -d); '
+            'N=$(printf %s ' + b_name + ' | base64 -d); '
+            'D=$(dirname -- "$S"); '
+            'if [ ! -e "$S" ] && [ ! -L "$S" ]; then exit 3; fi; '
+            'if [ -e "$D/$N" ] || [ -L "$D/$N" ]; then exit 4; fi; '
+            'mv -- "$S" "$D/$N" 2>/dev/null || exit 5'
+        )
+        proc, err = self._mux_run(remote_cmd, 10, "rename timeout")
+        if err:
+            return False, err
+        if proc.returncode == 0:
+            return True, ""
+        return False, {
+            3: "no such file or directory",
+            4: "a file with that name already exists",
+            5: "permission denied",
+        }.get(proc.returncode, "rename failed (exit %d)" % proc.returncode)
+
     def download_file(self, remote_path):
         """Stream a file via ControlMaster. Returns (Popen, error).
         Subprocess stdout starts with a header "OK\\t<size>\\n" or
@@ -3223,6 +3279,8 @@ class Handler(BaseHTTPRequestHandler):
         "upload_cancel":   "_upload_cancel",
         "tmux_options":    "_tmux_options",
         "rm":              "_rm",
+        "mkdir":           "_mkdir",
+        "mv":              "_mv",
         "save":            "_save_credential",
         # Compatibility with the bundled frontend in Python-only mode.
         # The PHP shim translates POST ?action=save_delete into
@@ -4411,6 +4469,77 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         ok, err = session.remove_path(path)
+        if not ok:
+            self._json({"error": err}, 502)
+            return
+        session.last_activity = time.time()
+        self._json({"ok": True})
+
+    @staticmethod
+    def _bad_abs_path(path):
+        """True when `path` is not usable as an absolute remote path.
+        Shared by the mutating side-channel endpoints (rm/mkdir/mv)."""
+        return (not isinstance(path, str) or not path.startswith("/")
+                or "\x00" in path or path.rstrip("/") == "")
+
+    @staticmethod
+    def _bad_name(name):
+        """True when `name` is not a usable bare filename. Rejects the
+        path separator (so a rename/mkdir can't escape its directory),
+        the . / .. specials, NUL, empty, and anything over 255 bytes
+        (the ext4/xfs limit — a longer name can only fail remotely)."""
+        return (not isinstance(name, str) or name == "" or "/" in name
+                or "\x00" in name or name in (".", "..")
+                or len(name.encode("utf-8")) > 255)
+
+    def _mkdir(self):
+        """POST /api/mkdir {session_id, path}
+        Create one directory (non-recursive) via ControlMaster."""
+        if self._side_channel_throttled():
+            return
+        body = self._json_body()
+        if body is None:
+            return
+        sid = body.get("session_id", "")
+        path = body.get("path", "")
+        # The new directory's own name must be a real name, not . / ..
+        if self._bad_abs_path(path) or self._bad_name(path.rstrip("/").rsplit("/", 1)[-1]):
+            self._json({"error": "invalid path"}, 400)
+            return
+        session = self._require_session(sid)
+        if session is None:
+            return
+
+        ok, err = session.make_dir(path)
+        if not ok:
+            self._json({"error": err}, 502)
+            return
+        session.last_activity = time.time()
+        self._json({"ok": True})
+
+    def _mv(self):
+        """POST /api/mv {session_id, path, name}
+        Rename `path` to a sibling `name` (same directory) via
+        ControlMaster. See SSHSession.rename_entry."""
+        if self._side_channel_throttled():
+            return
+        body = self._json_body()
+        if body is None:
+            return
+        sid = body.get("session_id", "")
+        path = body.get("path", "")
+        name = body.get("name", "")
+        if self._bad_abs_path(path):
+            self._json({"error": "invalid path"}, 400)
+            return
+        if self._bad_name(name):
+            self._json({"error": "invalid name"}, 400)
+            return
+        session = self._require_session(sid)
+        if session is None:
+            return
+
+        ok, err = session.rename_entry(path, name)
         if not ok:
             self._json({"error": err}, 502)
             return

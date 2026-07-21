@@ -5504,6 +5504,8 @@ const FB_PLAN = (entries, path) => ([
   {action: 'output', response: {data: '', alive: true}},
   {action: 'ls', response: {path: path || '/home/alice', entries: entries || []}},
   {action: 'rm', response: {ok: true}},
+  {action: 'mkdir', response: {ok: true}},
+  {action: 'mv', response: {ok: true}},
   {action: 'disconnect', response: {ok: true}},
 ]);
 
@@ -5533,6 +5535,16 @@ const FB_ENTRIES = [
 ];
 const names = win => Array.from(
   $(win, 'fbList').querySelectorAll('.fb-nm')).map(n => n.textContent);
+// Only the rows the user can actually see — excludes anything the
+// dotfile toggle or the name filter has hidden with .fb-hide.
+const visNames = win => Array.from(
+  $(win, 'fbList').querySelectorAll('.fb-row'))
+    .filter(r => !r.classList.contains('fb-hide') && r.querySelector('.fb-nm'))
+    .map(r => r.querySelector('.fb-nm').textContent);
+const rowFor = (win, n) => Array.from(
+  $(win, 'fbList').querySelectorAll('.fb-row')).find(
+    r => r.querySelector('.fb-nm') &&
+         r.querySelector('.fb-nm').textContent === n);
 
 test('file browser sorts newest-first by default, directories pinned on top', async () => {
   // The default exists because the reason to open the browser is
@@ -5684,19 +5696,23 @@ test('file browser delete: confirm strip, then POST /api/rm', async () => {
   win.showFileBrowser(p.id);
   await sleep(30);
   const rows = $(win, 'fbList').querySelectorAll('.fb-row');
-  // Row 0 is '..' and must not offer a delete at all.
+  // Row 0 is '..' and must not offer rename or delete, but keeps the
+  // fixed-width action group so columns stay aligned.
   ok(!rows[0].querySelector('[data-fb-del]'), 'parent row has no delete button');
-  ok(!!rows[0].querySelector('.fb-del-sp'), 'parent row keeps the column spacer');
+  ok(!rows[0].querySelector('[data-fb-ren]'), 'parent row has no rename button');
+  ok(!!rows[0].querySelector('.fb-act'), 'parent row keeps the action group');
 
   const target = Array.from(rows).find(
     r => r.querySelector('.fb-nm') &&
          r.querySelector('.fb-nm').textContent === 'zeta.txt');
   ok(!!target, 'found the zeta.txt row');
-  // The delete control lives at the far right — it must be the row's
-  // last child, after the size and date columns.
+  // The actions live at the far right — the group is the row's last
+  // child, and delete is the last button inside it (rename precedes it).
   ok(target.lastElementChild &&
-     target.lastElementChild.hasAttribute('data-fb-del'),
-     'delete button is the rightmost element in a file row');
+     target.lastElementChild.classList.contains('fb-act'),
+     'action group is the rightmost element in a file row');
+  ok(target.querySelector('.fb-act').lastElementChild.hasAttribute('data-fb-del'),
+     'delete is the last action, after rename');
   target.querySelector('[data-fb-del]').click();
   ok(target.classList.contains('fb-confirm'), 'row switched to confirm mode');
   ok(target.textContent.indexOf('zeta.txt') >= 0,
@@ -5830,6 +5846,187 @@ test('file browser survives a malformed listing response', async () => {
      'an error message is shown instead of a broken listing');
   ok($(win, 'fbList').querySelectorAll('.fb-row').length === 0,
      'no rows rendered from a malformed response');
+  cleanup(env);
+});
+
+// ── breadcrumbs, filter, hidden toggle, mkdir, rename ────────────────
+
+const FB_DOTS = [
+  {name: '.bashrc',   type: 'f', size: 10, mtime: 1000},
+  {name: '.config',   type: 'd', size: 4096, mtime: 2000},
+  {name: 'report.txt', type: 'f', size: 20, mtime: 3000},
+  {name: 'notes.md',  type: 'f', size: 30, mtime: 4000},
+];
+
+test('file browser breadcrumbs: segments are clickable and navigate', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice/projects'));
+  const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const nav = $(win, 'fbPath');
+  ok(nav.getAttribute('data-path') === '/home/alice/projects',
+     'full path recorded in data-path; got ' + nav.getAttribute('data-path'));
+  const crumbs = Array.from(nav.querySelectorAll('.fb-crumb')).map(c => c.textContent);
+  ok(JSON.stringify(crumbs) === JSON.stringify(['/', 'home', 'alice', 'projects']),
+     'root + one crumb per segment; got ' + JSON.stringify(crumbs));
+  const last = nav.querySelectorAll('.fb-crumb');
+  ok(last[last.length - 1].classList.contains('cur'),
+     'the deepest segment is marked current');
+
+  // Clicking "alice" navigates there.
+  const urls = recordUrls(win);
+  Array.from(nav.querySelectorAll('.fb-crumb')).find(c => c.textContent === 'alice').click();
+  await sleep(30);
+  const ls = urls.reverse().find(u => u.indexOf('action=ls') >= 0);
+  ok(ls.indexOf(encodeURIComponent('/home/alice')) >= 0 &&
+     ls.indexOf(encodeURIComponent('/home/alice/projects')) < 0,
+     'clicking a crumb lists that ancestor; got ' + ls);
+  cleanup(env);
+});
+
+test('file browser hides dotfiles by default, toggle reveals them', async () => {
+  const env = await mkEnv(FB_PLAN(FB_DOTS)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok(win.settings.fbShowHidden === false, 'hidden off by default');
+  // .bashrc and .config are present in the DOM but not visible.
+  ok(names(win).indexOf('.bashrc') >= 0, 'dotfile row exists in the DOM');
+  ok(visNames(win).indexOf('.bashrc') < 0, '.bashrc hidden from view');
+  ok(visNames(win).indexOf('..') >= 0, '".." is never hidden as a dotfile');
+  ok(visNames(win).indexOf('report.txt') >= 0, 'regular files stay visible');
+
+  win.toggleFbHidden(); await sleep(10);
+  ok(win.settings.fbShowHidden === true, 'toggle flips the setting');
+  ok(visNames(win).indexOf('.bashrc') >= 0, '.bashrc visible after toggle');
+  ok(visNames(win).indexOf('.config') >= 0, 'hidden dir visible too');
+  // Persisted so the next session remembers it.
+  const raw = win.localStorage.getItem(
+    Object.keys(win.localStorage).find(k => k.indexOf('settings') >= 0));
+  ok(raw && JSON.parse(raw).fbShowHidden === true, 'choice persisted');
+  cleanup(env);
+});
+
+test('file browser name filter narrows the list live, without a roundtrip', async () => {
+  const env = await mkEnv(FB_PLAN(FB_DOTS)); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const before = env.log.filter(e => e.action === 'ls').length;
+  $(win, 'fbFilter').value = 'report';
+  win.applyFbFilter();
+  ok(visNames(win).filter(n => n !== '..').join(',') === 'report.txt',
+     'only the match remains; got ' + JSON.stringify(visNames(win)));
+  ok(visNames(win).indexOf('..') >= 0, '".." stays visible while filtering');
+  ok(env.log.filter(e => e.action === 'ls').length === before,
+     'filtering is client-side — no new ls');
+
+  // Clearing restores everything (minus still-hidden dotfiles).
+  $(win, 'fbFilter').value = '';
+  win.applyFbFilter();
+  ok(visNames(win).indexOf('notes.md') >= 0, 'clearing the filter restores rows');
+  cleanup(env);
+});
+
+test('file browser new folder: inline input POSTs mkdir under the current dir', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  win.fbNewFolder();
+  const inp = $(win, 'fbList').querySelector('.fb-ed-inp');
+  ok(!!inp, 'an inline editor row appeared');
+  inp.value = 'newstuff';
+  $(win, 'fbList').querySelector('.fb-ed-ok').click();
+  await sleep(40);
+  const mk = env.log.filter(e => e.action === 'mkdir');
+  ok(mk.length === 1, 'exactly one mkdir POSTed; got ' + mk.length);
+  ok(mk[0].body.path === '/home/alice/newstuff',
+     'created under the current dir; got ' + JSON.stringify(mk[0].body));
+  cleanup(env);
+});
+
+test('file browser new folder: root path joins without a double slash', async () => {
+  const env = await mkEnv(FB_PLAN([], '/')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  win.fbNewFolder();
+  const inp = $(win, 'fbList').querySelector('.fb-ed-inp');
+  inp.value = 'srv';
+  $(win, 'fbList').querySelector('.fb-ed-ok').click();
+  await sleep(40);
+  const mk = env.log.filter(e => e.action === 'mkdir');
+  ok(mk[0].body.path === '/srv',
+     'root + name has no double slash; got ' + JSON.stringify(mk[0].body));
+  cleanup(env);
+});
+
+test('file browser rename: pencil opens an editor and POSTs mv', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const row = rowFor(win, 'zeta.txt');
+  row.querySelector('[data-fb-ren]').click();
+  ok(row.classList.contains('fb-edit'), 'row switched to edit mode');
+  const inp = row.querySelector('.fb-ed-inp');
+  ok(inp.value === 'zeta.txt', 'editor prefilled with the current name');
+  inp.value = 'omega.txt';
+  row.querySelector('.fb-ed-ok').click();
+  await sleep(40);
+  const mv = env.log.filter(e => e.action === 'mv');
+  ok(mv.length === 1, 'one mv POSTed; got ' + mv.length);
+  ok(mv[0].body.path === '/home/alice/zeta.txt' && mv[0].body.name === 'omega.txt',
+     'source path + bare new name; got ' + JSON.stringify(mv[0].body));
+  cleanup(env);
+});
+
+test('file browser rename: unchanged or empty name sends nothing', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const row = rowFor(win, 'mid.txt');
+  row.querySelector('[data-fb-ren]').click();
+  // Same name → no-op, editor closes.
+  row.querySelector('.fb-ed-ok').click();
+  await sleep(20);
+  ok(env.log.filter(e => e.action === 'mv').length === 0, 'unchanged name: no mv');
+  ok(!row.classList.contains('fb-edit'), 'editor closed');
+  cleanup(env);
+});
+
+test('file browser rename: Escape in the field cancels without closing the browser', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const row = rowFor(win, 'zeta.txt');
+  row.querySelector('[data-fb-ren]').click();
+  const inp = row.querySelector('.fb-ed-inp');
+  inp.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true}));
+  ok(!row.classList.contains('fb-edit'), 'editor closed on Escape');
+  ok(!hidden($(win, 'fbOv')), 'the browser stays open');
+  ok(row.querySelector('.fb-nm') && row.querySelector('.fb-nm').textContent === 'zeta.txt',
+     'the row is restored intact');
+  cleanup(env);
+});
+
+test('file browser: opening rename cancels an open delete confirm', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const a = rowFor(win, 'zeta.txt'), b = rowFor(win, 'mid.txt');
+  a.querySelector('[data-fb-del]').click();
+  ok(a.classList.contains('fb-confirm'), 'delete confirm armed on A');
+  b.querySelector('[data-fb-ren]').click();
+  ok(b.classList.contains('fb-edit'), 'rename editor opened on B');
+  ok(!a.classList.contains('fb-confirm'), 'A delete confirm was dismissed');
+  ok($(win, 'fbList').querySelectorAll('.fb-confirm, .fb-edit').length === 1,
+     'only one inline editor open at a time');
   cleanup(env);
 });
 
