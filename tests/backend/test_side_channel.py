@@ -1305,6 +1305,429 @@ class TestLsHTTPDispatch(LiveServerCase):
         self.assertIn("error", r)
 
 
+class TestListDirPaneCwd(unittest.TestCase):
+    """list_dir(pane_cwd=True) — start the listing where the pane is."""
+
+    def _session(self, persistent=True, slot_id="ok"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-cwd"
+        s.persistent = persistent
+        s.slot_id = slot_id
+        s.alive = True
+        s._control_path = "/tmp/fake.sock"
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        s.tmux_cmd = "tmux"
+        return s
+
+    def _run_and_capture(self, session, **kw):
+        """Return the remote command string list_dir handed to ssh."""
+        seen = {}
+        result = unittest.mock.MagicMock()
+        result.returncode = 0
+        result.stdout = b"PWD:/srv/app\n"
+
+        def fake_run(argv, **_):
+            seen["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            entries, abs_path, err = session.list_dir("~", **kw)
+        return seen["argv"][-1], entries, abs_path, err
+
+    def test_persistent_asks_tmux_for_pane_path(self):
+        s = self._session()
+        cmd, entries, abs_path, err = self._run_and_capture(s, pane_cwd=True)
+        self.assertIsNone(err)
+        self.assertIn("pane_current_path", cmd)
+        self.assertIn("websh-ok", cmd)
+        # $HOME remains the fallback when tmux answers with nothing.
+        self.assertIn('[ -n "$D" ] || D="$HOME"', cmd)
+        # The requested path is ignored in this mode — no case/esac
+        # expansion of $P into $D.
+        self.assertNotIn('"~/"*) D=', cmd)
+        self.assertEqual(abs_path, "/srv/app")
+
+    def test_non_persistent_falls_back_to_home(self):
+        """No tmux means no pane path to ask for; the command must still
+        be valid and must land on $HOME rather than cd'ing to ""."""
+        s = self._session(persistent=False, slot_id=None)
+        cmd, _entries, _abs, err = self._run_and_capture(s, pane_cwd=True)
+        self.assertIsNone(err)
+        self.assertNotIn("pane_current_path", cmd)
+        self.assertIn('[ -n "$D" ] || D="$HOME"', cmd)
+        # An inherited $D from the remote profile must not survive to
+        # become the start directory.
+        self.assertTrue(cmd.startswith("D=; "), "cmd=" + cmd[:60])
+
+    def test_default_still_resolves_the_requested_path(self):
+        s = self._session()
+        cmd, _entries, _abs, err = self._run_and_capture(s)
+        self.assertIsNone(err)
+        self.assertNotIn("pane_current_path", cmd)
+        self.assertIn('"~/"*) D=', cmd)
+
+
+class TestRemovePath(unittest.TestCase):
+    """SSHSession.remove_path() — single-entry delete, non-recursive."""
+
+    def _session(self, control_path="/tmp/fake.sock"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-rm"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def _run(self, returncode, capture=None):
+        s = self._session()
+        result = unittest.mock.MagicMock()
+        result.returncode = returncode
+        result.stdout = b""
+        result.stderr = b""
+
+        def fake_run(argv, **_):
+            if capture is not None:
+                capture["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            return s.remove_path("/home/alice/file.txt")
+
+    def test_no_socket_errors(self):
+        s = self._session(control_path="/nonexistent/mux.sock")
+        ok, err = s.remove_path("/home/alice/f")
+        self.assertFalse(ok)
+        self.assertIn("control socket", err)
+
+    def test_success(self):
+        ok, err = self._run(0)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_exit_codes_map_to_distinct_messages(self):
+        """Each failure mode gets its own message — a bare "exit 1"
+        leaves the user unable to tell "already gone" from "not empty"
+        from "not yours"."""
+        seen = set()
+        for code, needle in ((3, "no such file"),
+                             (4, "not empty"),
+                             (5, "permission")):
+            ok, err = self._run(code)
+            self.assertFalse(ok)
+            self.assertIn(needle, err)
+            seen.add(err)
+        self.assertEqual(len(seen), 3, "messages must be distinguishable")
+
+    def test_unknown_exit_code_still_reports(self):
+        ok, err = self._run(9)
+        self.assertFalse(ok)
+        self.assertIn("9", err)
+
+    def test_timeout_returns_error(self):
+        s = self._session()
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run",
+                                 side_effect=subprocess.TimeoutExpired("ssh", 10)):
+            ok, err = s.remove_path("/home/alice/f")
+        self.assertFalse(ok)
+        self.assertEqual(err, "rm timeout")
+
+    def test_command_is_non_recursive_and_symlink_safe(self):
+        cap = {}
+        self._run(0, capture=cap)
+        cmd = cap["argv"][-1]
+        # rmdir, never `rm -r`: a mis-click must not be able to take a
+        # populated tree with it.
+        self.assertIn("rmdir --", cmd)
+        self.assertNotIn("-r", cmd.replace("printf", ""))
+        # `[ ! -L ]` keeps a symlink-to-a-directory on the rm branch, so
+        # we unlink the link instead of rmdir'ing its target.
+        self.assertIn('[ ! -L "$P" ]', cmd)
+        # The path travels base64-encoded, never interpolated into the
+        # command text.
+        self.assertNotIn("/home/alice/file.txt", cmd)
+
+    def test_shell_metacharacters_are_not_interpolated(self):
+        s = self._session()
+        cap = {}
+        result = unittest.mock.MagicMock()
+        result.returncode = 0
+        result.stdout = result.stderr = b""
+
+        def fake_run(argv, **_):
+            cap["argv"] = argv
+            return result
+
+        nasty = '/home/alice/"; rm -rf / #'
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            s.remove_path(nasty)
+        self.assertNotIn("rm -rf /", cap["argv"][-1])
+
+
+class TestRmHTTPDispatch(LiveServerCase):
+    """HTTP-level tests for POST /api/rm."""
+
+    def _post_rm(self, body):
+        payload, _code = LiveServerCase._post(self, "/api/rm", body)
+        return payload
+
+    def test_relative_path_rejected(self):
+        """Absolute-only: a relative name would be resolved against
+        whatever $HOME the side channel lands in, which is not what the
+        caller pointed at."""
+        r = self._post_rm({"session_id": str(uuid.uuid4()),
+                           "path": "notes.txt"})
+        self.assertIn("error", r)
+        self.assertIn("invalid path", r["error"])
+
+    def test_bare_root_rejected(self):
+        for p in ("/", "//", "///"):
+            r = self._post_rm({"session_id": str(uuid.uuid4()), "path": p})
+            self.assertIn("error", r)
+            self.assertIn("invalid path", r["error"])
+
+    def test_nul_in_path_rejected(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4()),
+                           "path": "/home/alice/a\x00b"})
+        self.assertIn("error", r)
+        self.assertIn("invalid path", r["error"])
+
+    def test_missing_path_rejected(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4())})
+        self.assertIn("error", r)
+
+    def test_non_string_path_rejected(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4()), "path": 42})
+        self.assertIn("error", r)
+
+    def test_unknown_session_id(self):
+        r = self._post_rm({"session_id": str(uuid.uuid4()),
+                           "path": "/home/alice/f"})
+        self.assertIn("error", r)
+
+    def test_dispatches_to_session(self):
+        sid = str(uuid.uuid4())
+        fake_session = unittest.mock.MagicMock()
+        fake_session.remove_path.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._post_rm({"session_id": sid, "path": "/home/alice/f"})
+        self.assertTrue(r.get("ok"))
+        fake_session.remove_path.assert_called_once_with("/home/alice/f")
+
+    def test_session_error_propagated(self):
+        sid = str(uuid.uuid4())
+        fake_session = unittest.mock.MagicMock()
+        fake_session.remove_path.return_value = (False, "permission denied")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            r = self._post_rm({"session_id": sid, "path": "/home/alice/f"})
+        self.assertIn("error", r)
+        self.assertIn("permission denied", r["error"])
+
+
+class TestMakeDir(unittest.TestCase):
+    """SSHSession.make_dir() — single non-recursive mkdir."""
+
+    def _session(self, control_path="/tmp/fake.sock"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-mkdir"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def _run(self, returncode, capture=None):
+        s = self._session()
+        result = unittest.mock.MagicMock()
+        result.returncode = returncode
+        result.stdout = result.stderr = b""
+
+        def fake_run(argv, **_):
+            if capture is not None:
+                capture["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            return s.make_dir("/home/alice/newdir")
+
+    def test_no_socket_errors(self):
+        s = self._session(control_path="/nonexistent/mux.sock")
+        ok, err = s.make_dir("/home/alice/d")
+        self.assertFalse(ok)
+        self.assertIn("control socket", err)
+
+    def test_success(self):
+        ok, err = self._run(0)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_exists_and_perm_map_distinctly(self):
+        ok4, err4 = self._run(4)
+        ok5, err5 = self._run(5)
+        self.assertFalse(ok4)
+        self.assertFalse(ok5)
+        self.assertIn("exists", err4)
+        self.assertNotEqual(err4, err5)
+
+    def test_command_is_non_recursive(self):
+        cap = {}
+        self._run(0, capture=cap)
+        cmd = cap["argv"][-1]
+        # Plain mkdir, never `mkdir -p`: a typo'd path must fail loudly,
+        # not silently create a chain of directories.
+        self.assertIn("mkdir --", cmd)
+        self.assertNotIn("-p", cmd)
+        # The name travels base64-encoded, never interpolated.
+        self.assertNotIn("/home/alice/newdir", cmd)
+
+
+class TestRenameEntry(unittest.TestCase):
+    """SSHSession.rename_entry() — same-directory mv."""
+
+    def _session(self, control_path="/tmp/fake.sock"):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "fake-mv"
+        s.persistent = True
+        s.slot_id = "ok"
+        s.alive = True
+        s._control_path = control_path
+        s._host = "host.example"
+        s._port = 22
+        s._username = "alice"
+        return s
+
+    def _run(self, returncode, capture=None):
+        s = self._session()
+        result = unittest.mock.MagicMock()
+        result.returncode = returncode
+        result.stdout = result.stderr = b""
+
+        def fake_run(argv, **_):
+            if capture is not None:
+                capture["argv"] = argv
+            return result
+
+        with unittest.mock.patch("os.path.exists", return_value=True), \
+             unittest.mock.patch("subprocess.run", side_effect=fake_run):
+            return s.rename_entry("/home/alice/old.txt", "new.txt")
+
+    def test_success(self):
+        ok, err = self._run(0)
+        self.assertTrue(ok)
+        self.assertEqual(err, "")
+
+    def test_exit_codes_distinct(self):
+        seen = set()
+        for code, needle in ((3, "no such"), (4, "already exists"),
+                             (5, "permission")):
+            ok, err = self._run(code)
+            self.assertFalse(ok)
+            self.assertIn(needle, err)
+            seen.add(err)
+        self.assertEqual(len(seen), 3)
+
+    def test_destination_is_a_sibling(self):
+        """The new name is joined onto dirname(src) inside the shell, so
+        the destination can never escape the source's directory."""
+        cap = {}
+        self._run(0, capture=cap)
+        cmd = cap["argv"][-1]
+        self.assertIn('D=$(dirname -- "$S")', cmd)
+        self.assertIn('mv -- "$S" "$D/$N"', cmd)
+        # Refuses to clobber an existing target.
+        self.assertIn('[ -e "$D/$N" ]', cmd)
+        # Both operands travel base64-encoded, never interpolated.
+        self.assertNotIn("old.txt", cmd)
+        self.assertNotIn("new.txt", cmd)
+
+
+class TestMkdirMvHTTPDispatch(LiveServerCase):
+    """HTTP-level tests for POST /api/mkdir and /api/mv."""
+
+    def _post(self, action, body):
+        payload, _code = LiveServerCase._post(self, "/api/" + action, body)
+        return payload
+
+    def test_mkdir_relative_rejected(self):
+        r = self._post("mkdir", {"session_id": str(uuid.uuid4()),
+                                "path": "sub"})
+        self.assertIn("error", r)
+
+    def test_mkdir_dotdot_name_rejected(self):
+        """A path whose final segment is . or .. is a navigation, not a
+        new directory name."""
+        for p in ("/home/alice/..", "/home/alice/."):
+            r = self._post("mkdir", {"session_id": str(uuid.uuid4()),
+                                    "path": p})
+            self.assertIn("error", r)
+
+    def test_mkdir_dispatches(self):
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake.make_dir.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            r = self._post("mkdir", {"session_id": sid,
+                                    "path": "/home/alice/newdir"})
+        self.assertTrue(r.get("ok"))
+        fake.make_dir.assert_called_once_with("/home/alice/newdir")
+
+    def test_mv_rejects_slash_in_name(self):
+        """A name with '/' would move the entry to another directory —
+        the endpoint only renames in place."""
+        r = self._post("mv", {"session_id": str(uuid.uuid4()),
+                              "path": "/home/alice/a", "name": "sub/b"})
+        self.assertIn("error", r)
+        self.assertIn("invalid name", r["error"])
+
+    def test_mv_rejects_dotdot_name(self):
+        for n in ("..", ".", "", "a\x00b"):
+            r = self._post("mv", {"session_id": str(uuid.uuid4()),
+                                  "path": "/home/alice/a", "name": n})
+            self.assertIn("error", r)
+
+    def test_mv_rejects_relative_source(self):
+        r = self._post("mv", {"session_id": str(uuid.uuid4()),
+                              "path": "a", "name": "b"})
+        self.assertIn("error", r)
+        self.assertIn("invalid path", r["error"])
+
+    def test_mv_dispatches(self):
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake.rename_entry.return_value = (True, "")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            r = self._post("mv", {"session_id": sid,
+                                  "path": "/home/alice/old.txt",
+                                  "name": "new.txt"})
+        self.assertTrue(r.get("ok"))
+        fake.rename_entry.assert_called_once_with(
+            "/home/alice/old.txt", "new.txt")
+
+    def test_mv_error_propagated(self):
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock()
+        fake.rename_entry.return_value = (False, "a file with that name already exists")
+        with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+            r = self._post("mv", {"session_id": sid,
+                                  "path": "/home/alice/old.txt",
+                                  "name": "new.txt"})
+        self.assertIn("error", r)
+        self.assertIn("already exists", r["error"])
+
+
 class TestDownloadHTTPDispatch(LiveServerCase):
     """HTTP-level tests for GET /api/download."""
 
