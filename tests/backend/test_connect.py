@@ -1374,7 +1374,6 @@ class TestRestrictHostsDoesNotFeedScanPattern(LiveServerCase):
                          .format(scan))
 
 
-
 class TestHeaderTrustAuth(unittest.TestCase):
     """WEBSH_AUTH_HEADER: 401 without the header, identity stamping at
     connect, 403 across users, ping exempt, untrusted peer ignored."""

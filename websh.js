@@ -3313,6 +3313,11 @@ function loadServerConfig() {
       // at boot. Re-read from the now-correct path-scoped key.
       settings = loadSettings();
       fontSize = settings.fontSize;
+      // The module-init ensureFontLink() above ran under the empty prefix,
+      // so it loaded the default family; refresh it to the path-scoped font
+      // before any pane materializes (fitPaneWhenStable's document.fonts.load
+      // gate then resolves against the correct face).
+      ensureFontLink(settings.font);
     }
     // Re-mint the vault BroadcastChannel with the now-known storagePrefix
     // so sign-out signals don't cross path-scoped namespaces. No-op if

@@ -120,8 +120,12 @@ _SERVER_KNOBS = _server_knobs()
 # Knobs that must NOT be settable from websh.json: a config-file write
 # primitive should not be able to rebind the loopback-only server to a
 # public interface or take over X-Forwarded-For trust (rate-limit /
-# per-IP-cap spoofing). Env only.
-_ENV_ONLY_KNOBS = frozenset({"HOST", "TRUSTED_PROXIES"})
+# per-IP-cap spoofing), nor redirect the filesystem paths the server
+# writes to — WEBSH_ACCESS_LOG (arbitrary-path O_APPEND|O_CREAT) and
+# WEBSH_CREDS_PATH (where the vault's _save_creds_atomic os.replace()
+# lands, i.e. arbitrary-path file overwrite). All env only.
+_ENV_ONLY_KNOBS = frozenset({
+    "HOST", "TRUSTED_PROXIES", "WEBSH_ACCESS_LOG", "WEBSH_CREDS_PATH"})
 
 
 def _knob(name, default):
@@ -187,20 +191,22 @@ HOST = str(_knob("HOST", "127.0.0.1"))
 # TRUSTED_PROXIES — exactly the X-Forwarded-For trust rule — so a
 # client talking to the backend directly cannot mint identities; with
 # the feature on, an untrusted peer is simply unauthenticated (401).
-# Env-only ON PURPOSE (like HOST/TRUSTED_PROXIES): a websh.json write
-# must not be able to flip authentication semantics.
 WEBSH_AUTH_HEADER = os.environ.get("WEBSH_AUTH_HEADER", "").strip()
 # Opt-in session recording (asciicast v2, one .cast file per session,
 # created 0600). OFF unless WEBSH_RECORD_DIR names a directory the
-# server user can write. Output-only by default: WEBSH_RECORD_INPUT=1
-# additionally records keystrokes — leave it off unless you understand
-# that EVERYTHING the user types into the remote shell (incl. any
-# password typed at a sudo/login prompt INSIDE the session) lands in
-# the file. The browser-form ssh password is never recorded either way
-# (it is auto-typed below the input tee). Recording is best-effort: a
-# write failure disables it for that session and never kills the PTY.
+# server user can write. Recording is OUTPUT-ONLY; keystroke/input
+# recording is hard-disabled (see WEBSH_RECORD_INPUT below). Recording is
+# best-effort: a write failure disables it for that session, never the PTY.
 WEBSH_RECORD_DIR = os.environ.get("WEBSH_RECORD_DIR", "").strip()
-WEBSH_RECORD_INPUT = os.environ.get("WEBSH_RECORD_INPUT") == "1"
+# Input recording (keystrokes — which include any password typed at a
+# sudo/login prompt INSIDE the session) is HARD-DISABLED. Capturing
+# keystrokes to disk on a public-facing deployment is a liability we do
+# not accept, so recording is always output-only regardless of the
+# environment. The env var is read ONLY to warn an operator who sets it
+# (see main()). The browser-form ssh password was never recorded either
+# way (it is auto-typed below the input tee).
+_WEBSH_RECORD_INPUT_REQUESTED = os.environ.get("WEBSH_RECORD_INPUT") == "1"
+WEBSH_RECORD_INPUT = False
 # Per-file ceiling. A `cat /dev/urandom` session would otherwise write
 # unbounded (and invalid UTF-8 inflates ~3-5x through replacement +
 # JSON escaping). Hitting the cap stops the recording with one WARN;
@@ -2358,8 +2364,9 @@ class SSHSession(object):
             self.alive = False
             return False
         self.last_activity = time.time()
-        if WEBSH_RECORD_INPUT:
-            self._record("i", data)
+        # Input recording (keystrokes — which include passwords typed at
+        # prompts inside the session) is hard-disabled; see WEBSH_RECORD_INPUT.
+        # The 'i' event is never written — recording is output-only.
         try:
             os.write(self.master_fd, data)
             return True
@@ -3337,8 +3344,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(config_public())
 
     def _ping(self):
-        self._json({"ok": True, "version": __version__,
-                    "proto": PROTO_VERSION})
+        self._json({"ok": True, "version": __version__, "proto": PROTO_VERSION})
 
     # ── Source-IP / session-ID validation ───────────────────────────
 
@@ -4897,6 +4903,21 @@ def _close_all_sessions():
 
 
 def main():
+    # Header-trust auth and the credential vault are mutually exclusive for
+    # now. The vault is keyed by a client-supplied vault_id, NOT by the
+    # authenticated identity (see _save_credential / _delete_credential), so
+    # with WEBSH_AUTH_HEADER on any authenticated user could enumerate or
+    # delete another user's vault entries (host/user/port metadata; the
+    # secret itself stays passphrase-protected client-side). Until the vault
+    # is scoped per identity, refuse to start the unsafe combination loudly
+    # rather than ship a silent cross-user data path.
+    if WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE:
+        _log("ERROR",
+             "refusing to start: WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE are "
+             "both set, but the vault is keyed by client-supplied vault_id, "
+             "not by identity — an authenticated user could reach another "
+             "user's vault entries. Disable one until the vault is per-user.")
+        raise SystemExit(1)
     _warn_per_ip_misconfig()
     _warn_max_threads_misconfig()
     # Start background cleanup thread
@@ -4940,6 +4961,10 @@ def main():
         _log("INFO", "credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)")
     else:
         _log("INFO", "credential vault: enabled")
+    if _WEBSH_RECORD_INPUT_REQUESTED:
+        _log("WARN", "WEBSH_RECORD_INPUT is set but IGNORED: keystroke/input "
+                     "recording is hard-disabled (recording is output-only). "
+                     "Unset it to silence this warning.")
 
     stop_event.wait()
     _log("INFO", "shutting down")

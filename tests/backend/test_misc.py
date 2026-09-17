@@ -460,5 +460,82 @@ class TestMainSigtermSubprocess(unittest.TestCase):
                 proc.stderr.decode("utf-8", "replace")))
 
 
+
+class TestInstanceTemplateUnit(unittest.TestCase):
+    """websh@.service must isolate each instance's writable state and
+    credential vault. A leftover shared StateDirectory/WEBSH_CREDS_PATH
+    (the bug this guards) makes every template instance — and the
+    single-instance websh.service — write its vault to one shared
+    /var/lib/websh/websh.creds.json, silently bleeding credentials
+    across instances. systemd-analyze cannot catch this (the duplicate
+    is syntactically valid), so it is asserted here."""
+
+    def _directives(self, name):
+        path = os.path.join(REPO_ROOT, name)
+        out = {}
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out.setdefault(k.strip(), []).append(v.strip())
+        return out
+
+    def test_template_state_and_vault_are_per_instance(self):
+        d = self._directives("websh@.service")
+        # Exactly one StateDirectory, and it is per-instance.
+        self.assertEqual(d.get("StateDirectory"), ["websh-%i"],
+                         "template StateDirectory must be the single "
+                         "per-instance websh-%%i (got %r)"
+                         % (d.get("StateDirectory"),))
+        creds = [v for v in d.get("Environment", [])
+                 if v.startswith("WEBSH_CREDS_PATH=")]
+        self.assertEqual(len(creds), 1,
+                         "exactly one WEBSH_CREDS_PATH expected; got %r"
+                         % (creds,))
+        self.assertIn("%i", creds[0],
+                      "template WEBSH_CREDS_PATH must be per-instance "
+                      "(contain %%i); got %r" % (creds[0],))
+        # The shared single-instance path must never appear in the template.
+        with open(os.path.join(REPO_ROOT, "websh@.service"),
+                  encoding="utf-8") as f:
+            body = f.read()
+        self.assertNotIn("/var/lib/websh/websh.creds.json", body,
+                         "template must not reference the shared vault path")
+        self.assertNotRegex(body, r"(?m)^StateDirectory=websh$",
+                            "template must not also create the shared "
+                            "/var/lib/websh state directory")
+
+    def test_single_instance_unit_keeps_its_own_path(self):
+        # The non-template websh.service is the one-box default and
+        # legitimately owns /var/lib/websh; guard we did not %i-ify it.
+        d = self._directives("websh.service")
+        self.assertEqual(d.get("StateDirectory"), ["websh"])
+
+
+class TestAuthVaultStartupGuard(unittest.TestCase):
+    """main() refuses to start when WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE
+    are both set: the vault is keyed by client-supplied vault_id, not by the
+    authenticated identity, so the combination would let an authenticated
+    user reach another user's vault entries. The guard exits 1 before binding
+    (a clean start would instead serve forever)."""
+
+    def test_auth_plus_vault_refuses_to_start(self):
+        env = dict(os.environ)
+        env["PORT"] = "0"
+        env["WEBSH_AUTH_HEADER"] = "Remote-User"
+        env["WEBSH_VAULT_ENABLE"] = "1"
+        env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.run(
+            [sys.executable, "-c", "import server; server.main()"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        self.assertEqual(
+            proc.returncode, 1,
+            "guard must exit 1 (a clean start would block/serve); stderr=%r"
+            % proc.stderr.decode("utf-8", "replace"))
+        self.assertIn(b"refusing to start", proc.stderr)
+        self.assertIn(b"WEBSH_AUTH_HEADER", proc.stderr)
+
 if __name__ == "__main__":
     unittest.main()

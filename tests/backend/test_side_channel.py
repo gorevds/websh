@@ -2070,7 +2070,6 @@ class TestUploadRenameCollision(unittest.TestCase):
              'printf %s "$f"')
 
     def _resolve(self, existing, final):
-        import shutil
         tmp = tempfile.mkdtemp()
         try:
             for name in existing:
