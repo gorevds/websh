@@ -6030,6 +6030,80 @@ test('file browser: opening rename cancels an open delete confirm', async () => 
   cleanup(env);
 });
 
+test('isolate_storage: font link refreshes to the path-scoped family at boot (#152)', async () => {
+  // Under isolate_storage the path-scoped settings (incl. font) are only
+  // known after /api/config returns. The module-init ensureFontLink ran
+  // under the empty prefix and loaded the DEFAULT family; loadServerConfig
+  // must refresh the link to the path-scoped font, or an isolate_storage
+  // user who picked a non-default font gets the default face every reload.
+  const plan = [{action: 'config', response: {restrict_hosts: false,
+                                              connections: [], isolate_storage: true}}];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                               url: 'http://localhost/p/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.localStorage.clear();
+  // Seed the path-scoped settings (storagePrefix '/p/') with a non-default
+  // font BEFORE boot; the empty-prefix key is left at the default.
+  win.localStorage.setItem('/p/websh_settings', JSON.stringify({font: 'fira-code'}));
+  win.eval(js + EXPOSE);
+  await sleep(30);
+  const link = win.document.getElementById('dynFontCss');
+  ok(!!link, 'font link present after boot');
+  ok(/Fira\+Code/.test(link.getAttribute('href')),
+     'link tracks the path-scoped fira-code, not the empty-prefix default; got '
+     + link.getAttribute('href'));
+  ok(!/JetBrains\+Mono/.test(link.getAttribute('href')),
+     'default family must not stay active under isolate_storage');
+  dom.window.close();
+});
+
+test('transportFatal no-ops on a torn-down transport (stale reconnect guard, #134)', async () => {
+  // After endSession tears a pane down (p.polling=false), an in-flight
+  // auto-reconnect sets p.connecting=true. A late fetch/SSE rejection from
+  // the OLD transport must NOT re-banner the pane and must NOT reset
+  // p.connecting — that would defuse connectPane's duplicate-connect guard
+  // and re-open the double-/api/connect + leaked-PTY race. This pins the
+  // endSession refactor's `if (!p.polling) return` guard.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-tf', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = 'h'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  ok(!!p, 'pane up');
+
+  // Reconnect window: endSession dropped polling; connectPane set connecting.
+  p.polling = false;
+  p.connecting = true;
+  p.sid = 's-stale';
+  const writes = [];
+  p.term.write = (s) => { writes.push(String(s)); };
+
+  win.transportFatal(p, new Error('fetch failed 502'));
+  ok(writes.length === 0,
+     'guarded: no banner on a torn-down transport; got ' + JSON.stringify(writes));
+  ok(p.connecting === true,
+     'guarded: p.connecting preserved (in-flight reconnect guard intact)');
+  ok(p.sid === 's-stale', 'guarded: p.sid not nulled');
+
+  // Positive control: a LIVE transport (polling=true) must still surface.
+  p.polling = true;
+  win.transportFatal(p, new Error('fetch failed 502'));
+  ok(writes.some(s => /backend restarted|connection lost/.test(s)),
+     'live transport still banners; got ' + JSON.stringify(writes));
+  ok(p.polling === false, 'live transportFatal tore the pane down via endSession');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

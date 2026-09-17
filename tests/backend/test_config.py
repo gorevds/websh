@@ -35,7 +35,6 @@ class TestConfigLoading(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
 
     def _write_config(self, data):
@@ -202,7 +201,6 @@ class TestFindConfigConnection(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -223,7 +221,6 @@ class TestIsHostAllowed(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -651,7 +648,6 @@ class TestDeniedHosts(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -826,7 +822,6 @@ class TestConnectionKinds(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -906,7 +901,6 @@ class TestConfigPublicKind(unittest.TestCase):
         server._config_mtime = 0
 
     def tearDown(self):
-        import shutil
         shutil.rmtree(self.tmpdir)
         os.environ.pop("WEBSH_CONFIG", None)
 
@@ -984,8 +978,6 @@ class TestConfigPublicKind(unittest.TestCase):
         self.assertNotIn("form_defaults", pub)
 
 
-
-
 class TestKnobResolution(unittest.TestCase):
     """_knob precedence: WEBSH_<NAME> alias > bare env > websh.json
     "server" object > default. The JSON plane is import-time static
@@ -1056,14 +1048,23 @@ class TestKnobResolution(unittest.TestCase):
         self.assertEqual(server._knob("TRUSTED_PROXIES", "127.0.0.1"),
                          "127.0.0.1")
 
+    def test_filesystem_path_knobs_are_env_only(self):
+        # A websh.json write must not redirect where the server appends its
+        # access log (arbitrary-path O_APPEND|O_CREAT) or writes the vault
+        # (WEBSH_CREDS_PATH -> _save_creds_atomic os.replace, an arbitrary-
+        # path file overwrite). Both stay env-only.
+        server._SERVER_KNOBS["WEBSH_ACCESS_LOG"] = "/tmp/evil.log"
+        server._SERVER_KNOBS["WEBSH_CREDS_PATH"] = "/tmp/evil.creds.json"
+        self.assertIsNone(server._knob("WEBSH_ACCESS_LOG", None))
+        self.assertIsNone(server._knob("WEBSH_CREDS_PATH", None))
+
     def test_server_knobs_reader(self):
-        import tempfile as _tf
-        d = _tf.mkdtemp()
+        d = tempfile.mkdtemp()
+        prior = os.environ.get("WEBSH_CONFIG")
         try:
             p = os.path.join(d, "websh.json")
             with open(p, "w") as f:
                 json.dump({"server": {"SESSION_TIMEOUT": 60}}, f)
-            prior = os.environ.get("WEBSH_CONFIG")
             os.environ["WEBSH_CONFIG"] = p
             self.assertEqual(server._server_knobs(),
                              {"SESSION_TIMEOUT": 60})
@@ -1078,6 +1079,7 @@ class TestKnobResolution(unittest.TestCase):
                 os.environ.pop("WEBSH_CONFIG", None)
             else:
                 os.environ["WEBSH_CONFIG"] = prior
+            shutil.rmtree(d, ignore_errors=True)
 
 
 if __name__ == "__main__":

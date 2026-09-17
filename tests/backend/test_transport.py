@@ -777,7 +777,6 @@ class TestSessionNotify(unittest.TestCase):
         deadline. We simulate FIN by half-closing one end of a
         socketpair and passing the other to wait_for_data via a
         caller-owned selector."""
-        import socket
         a, b = socket.socketpair()
         s = self._fake()
         try:
@@ -889,7 +888,6 @@ class TestSessionNotify(unittest.TestCase):
         wait_for_data calls. This avoids per-call epoll_create1+ctl+
         close overhead. Verify the wakeup contract still holds when
         this path is exercised."""
-        import socket
         a, b = socket.socketpair()
         s = self._fake()
         try:
@@ -997,7 +995,6 @@ class TestWatchdogRuntime(unittest.TestCase):
             os.kill(pid, signal.SIGTERM)
         except (OSError, ValueError):
             pass
-        import shutil
         shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def _run(self, cmd, timeout=5):
@@ -1892,7 +1889,12 @@ class TestSessionRecording(unittest.TestCase):
         finally:
             server.WEBSH_RECORD_DIR = orig
 
-    def test_input_not_recorded_by_default(self):
+    def test_input_is_never_recorded_even_when_flag_forced(self):
+        # Keystroke/input recording is hard-disabled (compiled out): the 'i'
+        # event is never written, so a password typed at an in-session prompt
+        # cannot reach disk. The env var can't enable it; this forces the
+        # in-process flag True to prove the input tee itself is gone. Output
+        # recording still works (the control assertion).
         d = tempfile.mkdtemp()
         orig_dir = server.WEBSH_RECORD_DIR
         orig_in = server.WEBSH_RECORD_INPUT
@@ -1902,16 +1904,17 @@ class TestSessionRecording(unittest.TestCase):
             s._rec_open(80, 24)
             r, w = os.pipe()
             s.master_fd = w
-            server.WEBSH_RECORD_INPUT = False
+            server.WEBSH_RECORD_INPUT = True   # force-enable: must STILL not record
             s.write(b"secret-keystrokes")
-            server.WEBSH_RECORD_INPUT = True
-            s.write(b"audited-keystrokes")
+            s._record("o", b"server-output")   # output IS recorded (control)
             s._rec_close()
             os.close(r); os.close(w)
             body = open(os.path.join(d, os.listdir(d)[0]),
                         encoding="utf-8").read()
-            self.assertNotIn("secret-keystrokes", body)
-            self.assertIn("audited-keystrokes", body)
+            self.assertNotIn("secret-keystrokes", body,
+                             "input must never be recorded (hard-disabled)")
+            self.assertIn("server-output", body,
+                          "output recording still works")
         finally:
             server.WEBSH_RECORD_DIR = orig_dir
             server.WEBSH_RECORD_INPUT = orig_in
