@@ -298,6 +298,7 @@
     .fb-cf-yes:hover{background:var(--dg)!important;color:#fff!important}
     /* Hidden by the name filter or the dotfile toggle. */
     .fb-row.fb-hide{display:none}
+    .fb-row:focus-visible{outline:2px solid var(--ac);outline-offset:-2px}
     .fb-msg{padding:20px;text-align:center;color:var(--dim);font-size:13px}
     .fb-msg.err{color:var(--dg)}
     .fb-ft{display:flex;gap:8px;padding:10px 14px;border-top:1px solid var(--bd);flex-shrink:0}
@@ -565,13 +566,13 @@
 
 <!-- File browser modal -->
 <div id="fbOv" class="ov h" onclick="if(event.target===this)closeFb()">
-  <div class="fb-panel">
+  <div class="fb-panel" role="dialog" aria-modal="true" aria-label="File browser">
     <div class="fb-hd">
-      <button class="fb-up" onclick="fbUp()" title="Parent directory">&#x2191;</button>
-      <!-- Clickable path segments (breadcrumbs), rendered by renderFbCrumbs.
+      <button class="fb-up" onclick="fbUp()" title="Parent directory" aria-label="Parent directory">&#x2191;</button>
+      <!-- Clickable path segments (breadcrumbs), rendered by setFbPath.
            data-path carries the full resolved path for scripts/tests. -->
       <nav class="fb-path" id="fbPath" aria-label="Current path"></nav>
-      <button class="panel-close" onclick="closeFb()">&#x00D7;</button>
+      <button class="panel-close" onclick="closeFb()" title="Close" aria-label="Close file browser">&#x00D7;</button>
     </div>
     <div class="fb-tools">
       <button type="button" class="fb-tool" onclick="fbNewFolder()" title="Create a folder here">&#x002B; Folder</button>

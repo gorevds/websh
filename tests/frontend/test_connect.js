@@ -6358,6 +6358,46 @@ test('file browser: a filter with no matches says so; an armed delete stays visi
   cleanup(env);
 });
 
+test('file browser a11y: rows work from the keyboard, focus comes back after editors', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const key = (el, k) => el.dispatchEvent(new win.KeyboardEvent('keydown', {key: k, bubbles: true}));
+  const dir = rowFor(win, 'adir');
+  ok(dir.tabIndex === 0 && dir.getAttribute('role') === 'button', 'rows are focusable buttons');
+  const lsBefore = env.log.filter(e => e.action === 'ls').length;
+  key(dir, 'Enter');
+  await sleep(20);
+  ok(env.log.filter(e => e.action === 'ls').length === lsBefore + 1, 'Enter on a folder row opens it');
+  await sleep(30);
+  // Enter on the ✎ button inside a row must NOT also activate the row.
+  const row = rowFor(win, 'mid.txt');
+  const ren = row.querySelector('[data-fb-ren]');
+  const lsNow = env.log.filter(e => e.action === 'ls').length;
+  key(ren, 'Enter');
+  await sleep(20);
+  ok(!$(win, 'fbOv').hidden && env.log.filter(e => e.action === 'ls').length === lsNow,
+     'keys on an inner button do not activate the row');
+  // Delete -> Cancel with focus inside the editor: focus returns to ✕.
+  row.querySelector('[data-fb-del]').click();
+  row.querySelector('.fb-cf-no').focus();
+  row.querySelector('.fb-cf-no').click();
+  ok(win.document.activeElement === row.querySelector('[data-fb-del]'),
+     'focus back on the delete button, not <body>; got ' + win.document.activeElement.tagName);
+  // Dialog semantics + labels.
+  const panel = $(win, 'fbOv').querySelector('.fb-panel');
+  ok(panel.getAttribute('role') === 'dialog' && panel.getAttribute('aria-modal') === 'true', 'dialog semantics');
+  ok($(win, 'fbOv').querySelector('.panel-close').getAttribute('aria-label'), 'close button labelled');
+  win.toggleFbHidden();
+  ok($(win, 'fbHidden').title === 'Hide dotfiles', 'Hidden title follows its state');
+  win.toggleFbHidden();
+  const cur = $(win, 'fbPath').querySelector('.fb-crumb.cur');
+  ok(cur && cur.getAttribute('aria-current') === 'location' && cur.tabIndex === -1,
+     'current crumb announced, not a dead tab stop');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

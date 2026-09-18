@@ -4003,6 +4003,11 @@ function setFbPath(path) {
     b.type = 'button';
     b.className = 'fb-crumb' + (cur ? ' cur' : '');
     b.textContent = label;
+    if (cur) {
+      // Where you already are: announced, but not a do-nothing Tab stop.
+      b.setAttribute('aria-current', 'location');
+      b.tabIndex = -1;
+    }
     if (!cur) b.addEventListener('click', () => loadFbDir(full));
     return b;
   };
@@ -4130,6 +4135,7 @@ function renderFbEntries(entries, absPath) {
     // both starts with a dot and matches no filter term.
     row.dataset.parent = '1';
     row.addEventListener('click', () => loadFbDir(parent));
+    makeFbRowKeyboardable(row);
     list.appendChild(row);
   }
   for (let e of sortFbEntries(entries)) {
@@ -4164,6 +4170,7 @@ function renderFbEntries(entries, absPath) {
       });
     }
     wireFbRow(row, fullPath, e.name, e.type);
+    makeFbRowKeyboardable(row);
     list.appendChild(row);
   }
   if (!entries.length) {
@@ -4173,6 +4180,22 @@ function renderFbEntries(entries, absPath) {
   }
   // Apply the dotfile toggle and any active name filter to the fresh rows.
   applyFbVisibility();
+}
+
+// Rows were plain <div>s with a click handler: a keyboard user could
+// reach the ✎/✕ buttons but never open a folder or download a file.
+// Enter/Space on the ROW itself (not on a button or editor inside it,
+// whose own keys must keep their meaning) acts like a click.
+function makeFbRowKeyboardable(row) {
+  row.tabIndex = 0;
+  row.setAttribute('role', 'button');
+  row.addEventListener('keydown', ev => {
+    if (ev.target !== row) return;
+    if (ev.key === 'Enter' || ev.key === ' ') {
+      ev.preventDefault();
+      row.click();
+    }
+  });
 }
 
 function makeFbRow(type, name, size, mtime, o) {
@@ -4345,11 +4368,18 @@ function askFbDelete(row, fullPath, name, type) {
     '<button type="button" class="fb-cf-no">Cancel</button>' +
     '<button type="button" class="fb-cf-yes">Delete</button>';
   let done = () => {
+    // Only pull focus back if it was inside this editor - an editor
+    // closed because the user started one on another row must not
+    // yank focus away from where they now are.
+    let hadFocus = row.contains(document.activeElement);
     _fbConfirm = null;
     row.classList.remove('fb-confirm');
     row.innerHTML = restore;
     wireFbRow(row, fullPath, name, type);
     applyFbVisibility();
+    // The focused Cancel button was just destroyed; without this, focus
+    // fell to <body> and the next Tab restarted at the top of the modal.
+    if (hadFocus) { let b = row.querySelector('[data-fb-del]'); if (b) b.focus(); }
   };
   _fbConfirm = done;
   row.querySelector('.fb-cf-no').addEventListener('click', ev => {
@@ -4439,6 +4469,7 @@ function syncFbHiddenUi() {
   let on = !!settings.fbShowHidden;
   b.classList.toggle('on', on);
   b.setAttribute('aria-pressed', on ? 'true' : 'false');
+  b.title = on ? 'Hide dotfiles' : 'Show dotfiles';
 }
 
 // ── File browser: rename (mv) ───────────────────────────────────────
@@ -4465,11 +4496,13 @@ function askFbRename(row, fullPath, name, type) {
   let inp = row.querySelector('.fb-ed-inp');
   inp.value = name;
   let done = () => {
+    let hadFocus = row.contains(document.activeElement);
     _fbConfirm = null;
     row.classList.remove('fb-edit');
     row.innerHTML = restore;
     wireFbRow(row, fullPath, name, type);
     applyFbVisibility();
+    if (hadFocus) { let b = row.querySelector('[data-fb-ren]'); if (b) b.focus(); }
   };
   _fbConfirm = done;
   let commit = () => {
@@ -4534,8 +4567,13 @@ function fbNewFolder() {
   list.insertBefore(row, list.firstChild);
   let inp = row.querySelector('.fb-ed-inp');
   let done = () => {
+    let hadFocus = row.contains(document.activeElement);
     _fbConfirm = null;
     if (row.parentNode) row.parentNode.removeChild(row);
+    if (hadFocus) {
+      let b = document.querySelector('.fb-tool[onclick^="fbNewFolder"]');
+      if (b) b.focus();
+    }
   };
   _fbConfirm = done;
   let commit = () => {
