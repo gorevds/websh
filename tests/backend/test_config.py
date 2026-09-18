@@ -161,7 +161,15 @@ class TestConfigLoading(unittest.TestCase):
                      and "plaintext credentials" in c.args[1]]
             self.assertEqual(warns, [])
 
-    def test_require_vault_makes_plaintext_a_startup_error(self):
+    def test_require_vault_rejects_plaintext_without_killing_the_caller(self):
+        # WEBSH_REQUIRE_VAULT used to `raise SystemExit(1)` inside
+        # load_config(). main() never called load_config(), so the exit
+        # fired on a request thread: /api/ping stayed green while every
+        # config-touching endpoint dropped the connection, and the ERROR
+        # re-fired on each request. Now load_config() records the
+        # rejection, serves an empty config and logs once per file
+        # version; main() turns the flag into a real startup refusal
+        # (covered by TestRequireVaultStartupGuard in test_misc).
         self._write_config({
             "connections": [
                 {"name": "Production", "host": "p", "username": "u",
@@ -175,11 +183,19 @@ class TestConfigLoading(unittest.TestCase):
                                                        "websh.json")
             server._config_cache = None
             server._config_mtime = 0
-            with self.assertRaises(SystemExit) as ctx:
-                server.load_config()
-            self.assertEqual(ctx.exception.code, 1)
+            server._config_rejected = None
+            with unittest.mock.patch.object(server, "_log") as log:
+                cfg = server.load_config()
+                cfg2 = server.load_config()   # same mtime: cached, no relog
+            self.assertEqual(cfg["connections"], [])
+            self.assertEqual(cfg2["connections"], [])
+            self.assertIn("Production", server._config_rejected)
+            errors = [c for c in log.call_args_list
+                      if c.args[0] == "ERROR" and "rejected" in c.args[1]]
+            self.assertEqual(len(errors), 1, log.call_args_list)
         finally:
             server.WEBSH_REQUIRE_VAULT = original
+            server._config_rejected = None
 
 
 class TestFindConfigConnection(unittest.TestCase):
