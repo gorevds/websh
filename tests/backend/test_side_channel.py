@@ -2439,6 +2439,20 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
                              sorted(weird), sh)
             shutil.rmtree(d)
 
+    def test_pane_cwd_that_no_longer_exists_falls_back_to_home(self):
+        # tmux reports a deleted cwd as "path (deleted)"; an unreadable
+        # cwd can't be entered. Pane-cwd mode must land in $HOME rather
+        # than fail the whole listing. An explicit path still fails.
+        for sh in self.SHELLS:
+            s = self._session(sh)
+            s.pane_cwd_expr = lambda: 'D="/nonexistent/gone (deleted)"; '
+            entries, path, err = s.list_dir("~", pane_cwd=True)
+            self.assertIsNone(err, sh)
+            self.assertEqual(os.path.realpath(path),
+                             os.path.realpath(os.path.expanduser("~")), sh)
+            entries, path, err = s.list_dir("/nonexistent/explicit")
+            self.assertEqual(err, "directory not found", sh)
+
     def test_rename_refuses_to_clobber_and_stays_in_dir(self):
         for sh in self.SHELLS:
             self._touch("a", "b")

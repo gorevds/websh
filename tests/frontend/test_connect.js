@@ -6398,6 +6398,35 @@ test('file browser a11y: rows work from the keyboard, focus comes back after edi
   cleanup(env);
 });
 
+test('file browser: a failed navigation keeps the listing; a stale OSC 7 start falls back', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sa', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    // 1st: the OSC 7 directory is gone -> error; 2nd: pane-cwd fallback.
+    {action: 'ls', once: true, response: {error: 'directory not found'}},
+    {action: 'ls', once: true, response: {path: '/home/alice', entries: FB_ENTRIES}},
+    // 3rd: clicking into an unreadable folder fails.
+    {action: 'ls', once: true, response: {error: 'directory not found'}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  p.cwd = '/tmp/deleted-dir';
+  win.showFileBrowser(p.id);
+  await sleep(60);
+  const ls = env.log.filter(e => e.action === 'ls');
+  ok(ls.length === 2, 'fell back to a second listing; got ' + ls.length);
+  ok($(win, 'fbPath').getAttribute('data-path') === '/home/alice', 'landed in the pane dir');
+  ok(names(win).includes('zeta.txt'), 'rows shown');
+  rowFor(win, 'adir').click();
+  await sleep(40);
+  ok(names(win).includes('zeta.txt'), 'failed navigation kept the previous listing');
+  ok($(win, 'fbPath').getAttribute('data-path') === '/home/alice', 'breadcrumbs still usable');
+  ok(!/fb-msg err/.test($(win, 'fbList').innerHTML), 'no error replaced the list');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
