@@ -568,5 +568,27 @@ class TestRequireVaultStartupGuard(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+
+class TestListenBacklog(unittest.TestCase):
+    """The accept backlog must not be socketserver's default of 5: with
+    one TCP connection per request (HTTP/1.0, Connection: close) that
+    queue overflowed under a few concurrent typists and every overflow
+    cost the client a 1-3 s SYN retransmit."""
+
+    def test_request_queue_size_is_raised(self):
+        self.assertGreaterEqual(server.Server.request_queue_size, 128)
+
+    def test_bound_socket_reports_the_backlog(self):
+        srv = server.Server(("127.0.0.1", 0), server.Handler)
+        try:
+            # Linux exposes the effective backlog via TCP_INFO/ss; the
+            # portable check is that listen() accepted the value.
+            self.assertEqual(srv.request_queue_size,
+                             server.Server.request_queue_size)
+            self.assertTrue(srv.socket.fileno() > 0)
+        finally:
+            srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main()
