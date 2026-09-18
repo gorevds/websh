@@ -27,6 +27,22 @@ from tests.backend._base import (  # noqa: F401
 import server
 
 
+def _pipe_stdout(*chunks):
+    """A real pipe pre-filled with `chunks` (writer closed after), wrapped
+    like Popen.stdout. _download reads the raw fd under select(), so a
+    MagicMock with read.side_effect no longer models it."""
+    r, w = os.pipe()
+    data = b"".join(chunks)
+
+    def feed():
+        try:
+            os.write(w, data)
+        finally:
+            os.close(w)
+    threading.Thread(target=feed, daemon=True).start()
+    return os.fdopen(r, "rb", buffering=0)
+
+
 class TestAccessLogEmit(unittest.TestCase):
     """Unit tests for _access_log_emit (the JSON-line writer)."""
 
@@ -574,8 +590,7 @@ class TestTransferAccessLog(LiveServerCase):
         payload = b"secret-data-1234"
         header = "OK\t{}\n".format(len(payload)).encode()
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = (
-            [bytes([b]) for b in header[:-1]] + [b"\n"] + [payload, b""])
+        fake_proc.stdout = _pipe_stdout(header, payload)
         fake_session = unittest.mock.MagicMock()
         fake_session._host = "h.example"
         fake_session.download_file.return_value = (fake_proc, None)
