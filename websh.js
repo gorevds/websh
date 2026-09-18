@@ -3927,6 +3927,16 @@ let _fbId = null;
 // resolved). Breadcrumbs, "up", reload, and new-folder all read it
 // rather than scraping it back out of the DOM.
 let _fbCurPath = '';
+// Request generation for /api/ls. Only the newest request may paint:
+// a slow reply from an earlier directory (or an earlier pane) used to
+// overwrite a newer listing - and the breadcrumbs with it, so nothing
+// looked wrong while rm/mv/mkdir then targeted the wrong directory, or
+// the wrong HOST when the browser had been reopened on another pane.
+let _fbSeq = 0;
+// The session id whose listing is on screen. Every mutating action is
+// checked against it so a row from pane A can never be deleted through
+// pane B's session.
+let _fbListedSid = null;
 
 // The `done` closure of the row currently showing an inline editor — a
 // delete confirmation, a rename field, or the new-folder input — or
@@ -3953,6 +3963,13 @@ function showFileBrowser(id) {
   let p = panes[id];
   if (!p || !p.sid) return;
   _fbId = id;
+  // A fresh open never shows another pane's rows: clear the previous
+  // listing (and invalidate its in-flight request) before the first
+  // load, so the keep-while-loading logic has nothing stale to keep.
+  _fbSeq++;
+  _fbListedSid = null;
+  $('fbList').innerHTML = '';
+  setFbPath('');
   $('fbManual').value = '';
   // Escape now closes the browser and Tab cycles inside it (previously
   // neither worked); focus starts in the manual-path input.
@@ -4010,6 +4027,8 @@ function closeFb() {
   _fbConfirm = null;
   _fbTrap.close();
   _fbId = null;
+  _fbSeq++;              // a reply still in flight must not paint a closed browser
+  _fbListedSid = null;
 }
 
 function fbUp() {
@@ -4026,18 +4045,27 @@ function fbUp() {
 // way.
 function loadFbDir(path, o) {
   let p = _fbId && panes[_fbId];
-  if (!p) return;
+  if (!p || !p.sid) return;
   let list = $('fbList');
-  list.innerHTML = '<div class="fb-msg">Loading…</div>';
-  setFbPath((o && o.paneCwd) ? '' : path);
-  // A fresh directory starts unfiltered — a filter left over from the
-  // previous listing would silently hide most of the new one.
-  let f = $('fbFilter'); if (f) f.value = '';
-  fetch(API + '?action=ls&session_id=' + encodeURIComponent(p.sid) +
+  let req = ++_fbSeq, reqPane = _fbId, reqSid = p.sid;
+  // Keep the current listing on screen until the new one arrives, then
+  // swap path + rows in one go. Replacing the list with a "Loading…"
+  // line made the panel collapse and repaint on every navigation,
+  // delete and rename; the only time a placeholder is shown is when
+  // there is nothing to keep (first open).
+  if (!list.querySelector('.fb-row')) {
+    list.innerHTML = '<div class="fb-msg">Loading…</div>';
+  }
+  list.setAttribute('aria-busy', 'true');
+  let stale = () => req !== _fbSeq || _fbId !== reqPane ||
+                    !panes[reqPane] || panes[reqPane].sid !== reqSid;
+  fetch(API + '?action=ls&session_id=' + encodeURIComponent(reqSid) +
         '&path=' + encodeURIComponent(path) +
         ((o && o.paneCwd) ? '&cwd=1' : ''))
     .then(r => r.json())
     .then(r => {
+      if (stale()) return;
+      list.removeAttribute('aria-busy');
       if (r.error) {
         list.innerHTML = '<div class="fb-msg err">' + esc(r.error) + '</div>';
         return;
@@ -4049,12 +4077,33 @@ function loadFbDir(path, o) {
         list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
         return;
       }
+      // A fresh directory starts unfiltered — a filter left over from
+      // the previous listing would silently hide most of the new one.
+      // A re-list of the SAME directory (after rm/mv/mkdir) keeps it.
+      if (r.path !== _fbCurPath) {
+        let f = $('fbFilter'); if (f) f.value = '';
+      }
       setFbPath(r.path);
+      _fbListedSid = reqSid;
       renderFbEntries(r.entries, r.path);
     })
     .catch(() => {
+      if (stale()) return;
+      list.removeAttribute('aria-busy');
       list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
     });
+}
+
+// The pane whose listing is on screen - or null (with a reload kicked
+// off) when the session has changed underneath the rows, so a queued
+// rm/mv/mkdir can never run against a different host than the one the
+// user was looking at.
+function fbSessionForAction() {
+  let p = _fbId && panes[_fbId];
+  if (p && p.sid && p.sid === _fbListedSid) return p;
+  showToast('Listing is out of date — reloading', 'warn');
+  reloadFbDir();
+  return null;
 }
 
 // Re-list the current directory. Used after a create/rename/delete so
@@ -4280,8 +4329,8 @@ function askFbDelete(row, fullPath, name, type) {
 }
 
 function doFbDelete(row, fullPath, name, undo) {
-  let p = _fbId && panes[_fbId];
-  if (!p || !p.sid) return;
+  let p = fbSessionForAction();
+  if (!p) return;
   row.innerHTML = '<span class="fb-cf-q">Deleting ' + esc(name) + '…</span>';
   api('rm', {body: {session_id: p.sid, path: fullPath}})
     .then(r => {
@@ -4393,8 +4442,8 @@ function askFbRename(row, fullPath, name, type) {
 }
 
 function doFbRename(row, fullPath, newName, undo) {
-  let p = _fbId && panes[_fbId];
-  if (!p || !p.sid) return;
+  let p = fbSessionForAction();
+  if (!p) return;
   row.innerHTML = '<span class="fb-cf-q">Renaming…</span>';
   api('mv', {body: {session_id: p.sid, path: fullPath, name: newName}})
     .then(r => {
@@ -4452,8 +4501,8 @@ function fbNewFolder() {
 }
 
 function doFbMkdir(row, name, undo) {
-  let p = _fbId && panes[_fbId];
-  if (!p || !p.sid) return;
+  let p = fbSessionForAction();
+  if (!p) return;
   // Join onto the current directory; avoid a double slash at the root.
   let base = _fbCurPath === '/' ? '' : _fbCurPath;
   let full = base + '/' + name;
