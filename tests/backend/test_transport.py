@@ -2261,5 +2261,112 @@ class TestParkedWaiterWake(unittest.TestCase):
         self.assertFalse(s._data_event.is_set(), "event consumed")
 
 
+
+class TestPasswordAutoTypeWindow(unittest.TestCase):
+    """The stored password is typed only at ssh's own login prompt. It
+    used to stay armed for the whole session when auth completed
+    without prompting, and the first later "password:" on screen (sudo,
+    a nested ssh, `cat` of a file containing the word) got it typed
+    into the shell. Now: bounded by output bytes / seconds without a
+    prompt, and by any real keystroke from the user."""
+
+    def _session(self, master, pid):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.master_fd = master; s.pid = pid; s.id = "pw-window"
+        s.alive = True; s.is_background = False
+        s._password = "S3cret"; s._password_sent = False; s._pw_buf = b""
+        s._pw_armed_at = time.time(); s._pw_bytes_seen = 0
+        s.auth_failed = False; s._auth_buf = b""; s._auth_bytes_seen = 0
+        s.output_buf = b""; s.buf_lock = threading.Lock()
+        s._exit_status = None; s._reap_lock = threading.Lock()
+        s._child_reaped = False; s._signal = lambda: None
+        s._record = lambda *a: None
+        s.last_activity = time.time()
+        return s
+
+    def _run(self, child_script, user_input=None, timeout=8):
+        """Fork a child on a pty that runs `child_script(slave_fd)` and
+        echoes everything it reads back to us prefixed with GOT:. Returns
+        the bytes the parent read (what the child printed + echoes)."""
+        import pty, select
+        master, slave = pty.openpty()
+        pid = os.fork()
+        if pid == 0:
+            os.close(master)
+            try:
+                child_script(slave)
+                # Echo any input the parent typed, then linger briefly.
+                end = time.time() + 3
+                while time.time() < end:
+                    r, _, _ = select.select([slave], [], [], 0.2)
+                    if r:
+                        d = os.read(slave, 4096)
+                        if not d:
+                            break
+                        os.write(slave, b"GOT:" + d)
+            finally:
+                os._exit(0)
+        os.close(slave)
+        s = self._session(master, pid)
+        t = threading.Thread(target=s._read_loop, daemon=True)
+        t.start()
+        if user_input is not None:
+            time.sleep(0.3)
+            s.write(user_input)
+        t.join(timeout)
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        with s.buf_lock:
+            return s, s.output_buf
+
+    def test_prompt_at_login_is_answered(self):
+        def child(fd):
+            os.write(fd, b"alice@host's password: ")
+            time.sleep(0.5)
+        s, out = self._run(child)
+        self.assertTrue(s._password_sent)
+        self.assertIn(b"GOT:S3cret", out)
+
+    def test_prompt_after_lots_of_output_is_not_answered(self):
+        def child(fd):
+            for _ in range(40):                       # 20 KB, no prompt
+                os.write(fd, b"x" * 512 + b"\r\n")
+                time.sleep(0.01)
+            time.sleep(0.3)
+            os.write(fd, b"[sudo] password for alice: ")  # too late
+            time.sleep(0.5)
+        s, out = self._run(child)
+        self.assertFalse(s._password_sent)
+        self.assertIsNone(s._password, "password must be dropped, not kept")
+        self.assertNotIn(b"S3cret", out)
+
+    def test_user_keystroke_disarms(self):
+        def child(fd):
+            os.write(fd, b"Welcome. $ ")              # shell, no prompt
+            time.sleep(1.0)
+            os.write(fd, b"Password: ")               # nested ssh / sudo
+            time.sleep(0.5)
+        s, out = self._run(child, user_input=b"sudo ls\r")
+        self.assertFalse(s._password_sent)
+        self.assertNotIn(b"S3cret", out)
+        self.assertIn(b"GOT:sudo ls", out)
+
+    def test_bare_enter_does_not_disarm(self):
+        # Pressing Enter while ssh is still connecting is common; it must
+        # not cost the user the auto-type when the prompt then appears.
+        def child(fd):
+            time.sleep(0.6)
+            os.write(fd, b"alice@host's password: ")
+            time.sleep(0.5)
+        s, out = self._run(child, user_input=b"\r")
+        self.assertTrue(s._password_sent)
+
+
 if __name__ == "__main__":
     unittest.main()
