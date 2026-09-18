@@ -3983,7 +3983,7 @@ function showFileBrowser(id) {
   // Open where the user is standing, not at $HOME. Three sources, best
   // first: OSC 7 told us directly; the server can ask tmux; otherwise
   // fall back to the historical ~.
-  if (p.cwd) loadFbDir(p.cwd);
+  if (p.cwd) loadFbDir(p.cwd, {fallbackHome: true});
   else loadFbDir('~', {paneCwd: true});
 }
 
@@ -4074,15 +4074,11 @@ function loadFbDir(path, o) {
     .then(r => {
       if (stale()) return;
       list.removeAttribute('aria-busy');
-      if (r.error) {
-        list.innerHTML = '<div class="fb-msg err">' + esc(r.error) + '</div>';
-        return;
-      }
       // A response with no resolved path is not a listing we can render:
       // every downstream path is built by joining onto r.path, so an
       // absent one would produce "undefined/name" download targets.
-      if (!r.path || !Array.isArray(r.entries)) {
-        list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
+      if (r.error || !r.path || !Array.isArray(r.entries)) {
+        fbLoadFailed(list, path, o, r.error || 'Failed to load');
         return;
       }
       // A fresh directory starts unfiltered — a filter left over from
@@ -4098,8 +4094,30 @@ function loadFbDir(path, o) {
     .catch(() => {
       if (stale()) return;
       list.removeAttribute('aria-busy');
-      list.innerHTML = '<div class="fb-msg err">Failed to load</div>';
+      fbLoadFailed(list, path, o, 'Failed to load');
     });
+}
+
+// A listing that could not be loaded. If a usable listing is still on
+// screen (a click into an unreadable folder, a network blip), keep it -
+// breadcrumbs, Up and every row still work - and say what failed. Only
+// with nothing to keep does the list show the error. A start directory
+// that came from the shell (OSC 7) may be stale - deleted, or on
+// another host after a nested ssh - so that one falls back to the
+// pane's own directory / $HOME instead of a dead end.
+function fbLoadFailed(list, path, o, msg) {
+  // The page (or the list) may be gone by the time a slow reply fails.
+  if (!list || !list.isConnected) return;
+  if (o && o.fallbackHome) {
+    showToast(path + ': ' + msg + ' — showing the pane directory instead', 'warn');
+    loadFbDir('~', {paneCwd: true});
+    return;
+  }
+  if (_fbListedSid && list.querySelector('.fb-row')) {
+    showToast(path + ': ' + msg, 'err');
+    return;
+  }
+  list.innerHTML = '<div class="fb-msg err">' + esc(msg) + '</div>';
 }
 
 // The pane whose listing is on screen - or null (with a reload kicked

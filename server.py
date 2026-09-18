@@ -3038,9 +3038,17 @@ class SSHSession(object):
                   '*) D="$HOME/$P";; '
                 'esac; '
             )
+        # In pane-cwd mode the start point is only a hint: tmux reports
+        # a directory that was deleted under the shell as "path
+        # (deleted)", and a chmod 000 cwd can't be entered. Both used to
+        # fail the whole listing ("directory not found", no breadcrumbs,
+        # Up disabled). Fall back to $HOME - the reply's PWD tells the
+        # client where it actually landed. An explicit path still fails.
+        enter = ('cd "$D" 2>/dev/null || cd "$HOME" 2>/dev/null || exit 1; '
+                 if pane_cwd else 'cd "$D" 2>/dev/null || exit 1; ')
         remote_cmd = (
             resolve +
-            'cd "$D" 2>/dev/null || exit 1; '
+            enter +
             'printf "PWD:%s\\0" "$PWD"; '
             'for f in * .[!.]* ..?*; do '
               '[ -e "$f" ] || [ -L "$f" ] || continue; '
