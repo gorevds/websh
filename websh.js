@@ -23,7 +23,22 @@ function api(action, opts) {
   let url = `${API}?action=${action}${opts.query || ''}`;
   let init = {};
   if (opts.body) { init.method='POST'; init.body=JSON.stringify(opts.body); init.headers={'Content-Type':'application/json'} }
-  return fetch(url, init).then(r => { return r.json() });
+  // A non-JSON reply (a reverse proxy's own HTML error page for a 5xx,
+  // a captive portal) used to surface as "Unexpected token <" in the
+  // toast. Turn it into an {error} the callers already handle.
+  return fetch(url, init).then(r => r.json().catch(() => ({
+    error: 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
+           ' (unexpected reply from the server or a proxy)'})));
+}
+
+// Capacity/rate errors are identified by a machine-readable `code`
+// (servers before it only sent prose, so the text match stays as the
+// fallback).
+const CAP_CODES = ['rate_limited', 'session_cap_per_ip',
+                   'session_cap_background', 'session_cap_global'];
+function isCapacityError(r, msg) {
+  if (r && CAP_CODES.indexOf(r.code) >= 0) return true;
+  return /too many (connection attempts|active sessions|background sessions)/i.test(msg || '');
 }
 
 // ── Pane management ─────────────────────────────────────────────────
@@ -2133,7 +2148,7 @@ function realConnect(opts, run) {
       if (/not allowed|not in the allowed list/i.test(r.error)) {
         throw { kind: 'policy_deny', msg: r.error };
       }
-      if (/too many (connection attempts|active sessions|background sessions)/i.test(r.error)) {
+      if (isCapacityError(r, r.error)) {
         throw { kind: 'rate_limited', msg: r.error };
       }
       // Saved-variant /api/connect surfaces vault-specific errors:
@@ -2256,7 +2271,7 @@ function mapConnectError(err, opts) {
   if (/timeout/i.test(msg)) {
     return {kind: 'timeout', host, user, msg};
   }
-  if (/too many (connection attempts|active sessions|background sessions)/i.test(msg)) {
+  if (isCapacityError(err, msg)) {
     return {kind: 'rate_limited', host, user, msg};
   }
   return {kind: 'error', host, user, msg};
@@ -4426,7 +4441,7 @@ function doFbDelete(row, fullPath, name, undo) {
   api('rm', {body: {session_id: p.sid, path: fullPath}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
-      showToast('Deleted ' + name, 'ok');
+      showToast((r && r.already_gone ? 'Already deleted: ' : 'Deleted ') + name, 'ok');
       // Re-list rather than dropping the row locally: the directory may
       // have changed for other reasons, and a delete already costs one
       // roundtrip.
