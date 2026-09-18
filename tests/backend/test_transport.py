@@ -2402,5 +2402,165 @@ class TestPasswordAutoTypeWindow(unittest.TestCase):
         self.assertTrue(s._password_sent)
 
 
+
+class TestOutputCursor(unittest.TestCase):
+    """read_since(): non-destructive cursor reads over a bounded replay
+    log - the basis of lossless reconnect."""
+
+    def _s(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.buf_lock = threading.Lock()
+        s.output_buf = b""
+        s._replay = b""
+        s._replay_end = 0
+        s.last_activity = 0
+        return s
+
+    def _put(self, s, data):
+        with s.buf_lock:
+            s._append_output_locked(data)
+
+    def test_reads_do_not_consume(self):
+        s = self._s()
+        self._put(s, b"hello ")
+        self._put(s, b"world")
+        self.assertEqual(s.read_since(0), (b"hello world", 11, 0, False))
+        self.assertEqual(s.read_since(0)[0], b"hello world", "still there")
+        self.assertEqual(s.read_since(6), (b"world", 11, 0, False))
+        self.assertEqual(s.read_since(11), (b"", 11, 0, False))
+
+    def test_bytes_past_the_window_are_reported_lost(self):
+        s = self._s()
+        with unittest.mock.patch.object(server, "OUTPUT_REPLAY_BYTES", 10):
+            for i in range(10):
+                self._put(s, b"%d" % i * 3)            # 30 bytes total
+            data, end, lost, reset = s.read_since(0)
+        self.assertEqual(end, 30)
+        self.assertGreater(lost, 0)
+        self.assertEqual(lost + len(data), 30, "lost + delivered = all output")
+        self.assertTrue(b"".join(b"%d" % i * 3 for i in range(10)).endswith(data))
+        self.assertFalse(reset)
+
+    def test_unknown_cursor_resets(self):
+        s = self._s()
+        self._put(s, b"abc")
+        self.assertEqual(s.read_since(999), (b"abc", 3, 0, True))
+
+    def test_cursor_reads_drain_the_legacy_buffer(self):
+        # Otherwise output_buf would sit at its 1 MB cap for the life of
+        # every session a current client is attached to.
+        s = self._s()
+        self._put(s, b"x" * 100)
+        s.read_since(0)
+        self.assertEqual(s.output_buf, b"")
+        self.assertEqual(s.read_since(0)[0], b"x" * 100, "replay unaffected")
+
+    def test_legacy_read_still_destructive(self):
+        s = self._s()
+        self._put(s, b"old")
+        self.assertEqual(s.read(), b"old")
+        self.assertEqual(s.read(), b"")
+        self.assertEqual(s.read_since(0)[0], b"old", "replay keeps it")
+
+
+class TestLosslessReconnectHTTP(LiveServerCase):
+    """End to end over /api/stream and /api/output: output that went into
+    a connection the client never read is delivered again after the
+    reconnect - exactly once - and cursor-less (older) clients keep the
+    destructive semantics."""
+
+    def _session(self):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "cur"; s.alive = True; s.auth_failed = False
+        s.buf_lock = threading.Lock(); s.output_buf = b""
+        s._replay = b""; s._replay_end = 0
+        s._data_event = threading.Event()
+        s._waiters = set(); s._waiters_lock = threading.Lock()
+        s._stream_active = False; s.owner = ""; s.client_ip = "127.0.0.1"
+        s.last_activity = time.time(); s.is_background = False
+        return s
+
+    def _put(self, s, data):
+        with s.buf_lock:
+            s._append_output_locked(data)
+        s._signal()
+
+    def _sse_events(self, sid, headers=None, query="", n_data=2, timeout=3):
+        """Read SSE events until n_data data events arrived; return
+        [(id, payload_dict)] and close the connection abruptly."""
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        c.request("GET", "/api/stream?session_id=" + sid + query,
+                  headers=headers or {})
+        r = c.getresponse()
+        events, cur = [], {}
+        deadline = time.time() + timeout
+        while len(events) < n_data and time.time() < deadline:
+            line = r.fp.readline().decode().rstrip("\n")
+            if line.startswith("id: "):
+                cur["id"] = int(line[4:])
+            elif line.startswith("data: "):
+                cur["data"] = json.loads(line[6:])
+            elif line == "" and "data" in cur:
+                events.append((cur.get("id"), cur["data"]))
+                cur = {}
+        c.close()
+        return events
+
+    @staticmethod
+    def _text(events):
+        return b"".join(base64.b64decode(e[1].get("data") or "") for e in events)
+
+    def test_reconnect_with_since_gets_exactly_the_missed_bytes(self):
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"one ")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            ev = self._sse_events(sid, query="&since=0", n_data=2)
+            self.assertEqual(self._text(ev), b"one ")
+            cursor = ev[-1][1]["cursor"]
+            self.assertEqual(ev[-1][0], cursor, "SSE id carries the cursor")
+            # The connection dropped. Meanwhile the shell printed more -
+            # and a previous stream had "sent" it into a dead socket.
+            self._put(s, b"two ")
+            s.read_since(0)                   # someone else read it: no matter
+            time.sleep(0.1)
+            s._stream_active = False
+            ev2 = self._sse_events(sid, query="&since=%d" % cursor, n_data=2)
+            self.assertEqual(self._text(ev2), b"two ", "missed bytes, exactly once")
+
+    def test_last_event_id_wins_over_the_original_url(self):
+        # EventSource's automatic reconnect re-sends its ORIGINAL URL
+        # (since=0) plus Last-Event-ID.
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"abc")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            ev = self._sse_events(sid, query="&since=0",
+                                  headers={"Last-Event-ID": "2"}, n_data=2)
+        self.assertEqual(self._text(ev), b"c")
+
+    def test_long_poll_cursor(self):
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"hello")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            body, code = self._get("/api/output?session_id=%s&since=0" % sid)
+            self.assertEqual((code, body["cursor"]), (200, 5))
+            self.assertEqual(base64.b64decode(body["data"]), b"hello")
+            body, code = self._get("/api/output?session_id=%s&since=3" % sid)
+            self.assertEqual(base64.b64decode(body["data"]), b"lo", "not consumed")
+
+    def test_cursorless_client_keeps_destructive_semantics(self):
+        sid = str(uuid.uuid4())
+        s = self._session()
+        self._put(s, b"legacy")
+        with unittest.mock.patch.dict(server.sessions, {sid: s}):
+            body, code = self._get("/api/output?session_id=%s" % sid)
+            self.assertEqual(base64.b64decode(body["data"]), b"legacy")
+            self.assertNotIn("cursor", body)
+            self.assertEqual(s.output_buf, b"", "legacy read drained")
+
+
 if __name__ == "__main__":
     unittest.main()

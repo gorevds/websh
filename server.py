@@ -337,6 +337,12 @@ PTY_DRAIN_INTERVAL = 0.01    # seconds per drain round
 PTY_READ_SIZE = 65536         # bytes per read
 OUTPUT_BUF_MAX = 1048576      # 1 MB — truncate if exceeded
 OUTPUT_BUF_KEEP = 524288      # keep last 512 KB on truncation
+# Replay window for cursor readers (lossless reconnect). Every byte the
+# PTY produced gets an absolute offset; the last OUTPUT_REPLAY_BYTES are
+# retained, so a client that reconnects with ?since=<its cursor> (or the
+# SSE Last-Event-ID) gets exactly what it missed - including bytes the
+# server had already "written" into a socket that never delivered them.
+OUTPUT_REPLAY_BYTES = max(4096, _int_env("OUTPUT_REPLAY_BYTES", str(512 * 1024)))
 
 # Terminal reset sequence: exit alt screen, show cursor, reset attrs, full reset
 TERM_RESET = b"\x1b[?1049l\x1b[?25h\x1b[0m\x1bc"
@@ -1811,6 +1817,10 @@ class SSHSession(object):
         self.master_fd = -1
         self.pid = None
         self.output_buf = b""
+        # Replay log: the retained tail of ALL output (never drained by
+        # reads) and the absolute offset one past its last byte.
+        self._replay = b""
+        self._replay_end = 0
         self.buf_lock = Lock()
         # Session recording (asciicast v2); None when disabled.
         self._rec = None
@@ -2232,10 +2242,7 @@ class SSHSession(object):
                             # *why* (the rejection message + the re-prompt)
                             # before we tear down.
                             with self.buf_lock:
-                                self.output_buf += data
-                                if len(self.output_buf) > OUTPUT_BUF_MAX:
-                                    self.output_buf = (
-                                        self.output_buf[-OUTPUT_BUF_KEEP:])
+                                self._append_output_locked(data)
                             self._signal()
                             self._auth_buf = b""
                             try:
@@ -2245,9 +2252,7 @@ class SSHSession(object):
                             break
 
                     with self.buf_lock:
-                        self.output_buf += data
-                        if len(self.output_buf) > OUTPUT_BUF_MAX:
-                            self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
+                        self._append_output_locked(data)
                     self._signal()
 
                 # Check if child exited. Done under _reap_lock (see
@@ -2270,7 +2275,7 @@ class SSHSession(object):
                         if leftover:
                             self._record("o", leftover)
                             with self.buf_lock:
-                                self.output_buf += leftover
+                                self._append_output_locked(leftover)
                             self._signal()
                         else:
                             break
@@ -2292,8 +2297,10 @@ class SSHSession(object):
                     and os.WIFEXITED(self._exit_status)
                     and os.WEXITSTATUS(self._exit_status) == 255):
                 with self.buf_lock:
-                    tail = self.output_buf[-2048:].decode(
-                        "latin-1", errors="replace").lower()
+                    # The replay log, not output_buf: a reader may already
+                    # have drained the latter, taking the tail with it.
+                    tail = (getattr(self, "_replay", b"") or self.output_buf)[
+                        -2048:].decode("latin-1", errors="replace").lower()
                 if any(p in tail for p in AUTH_FAIL_PATTERNS):
                     self.auth_failed = True
                     _log("INFO", "session {} auth failed (exit 255){}".format(
@@ -2302,7 +2309,7 @@ class SSHSession(object):
 
             # Append terminal reset so the frontend restores normal screen
             with self.buf_lock:
-                self.output_buf += TERM_RESET
+                self._append_output_locked(TERM_RESET)
 
             # Reap the child if we broke out before the inline WNOHANG reap
             # (the auth-fail branch SIGTERMs and breaks). Otherwise the ssh
@@ -2377,6 +2384,45 @@ class SSHSession(object):
                 self._exit_status = status
             except Exception:
                 pass
+
+    def _append_output_locked(self, data):
+        """Append PTY output to both the legacy drain buffer and the replay
+        log. Caller holds buf_lock. Both are bounded; the replay log trims
+        with 50% slack so it isn't re-sliced on every chunk."""
+        self.output_buf += data
+        if len(self.output_buf) > OUTPUT_BUF_MAX:
+            self.output_buf = self.output_buf[-OUTPUT_BUF_KEEP:]
+        if getattr(self, "_replay", None) is None:
+            return                         # bare test fixtures
+        self._replay += data
+        self._replay_end += len(data)
+        if len(self._replay) > OUTPUT_REPLAY_BYTES + OUTPUT_REPLAY_BYTES // 2:
+            self._replay = self._replay[-OUTPUT_REPLAY_BYTES:]
+
+    def read_since(self, cursor):
+        """Cursor read for lossless reconnect: the output from absolute
+        offset `cursor` on, WITHOUT consuming it. Returns (data, end,
+        lost, reset): `end` is the next cursor; `lost` counts bytes that
+        fell out of the replay window before this reader asked for them;
+        `reset` means the cursor was not one this session ever issued
+        (ahead of its output) and the reader must start over from the
+        retained window.
+
+        Cursor readers also clear the legacy drain buffer: it only exists
+        for readers without a cursor (older clients), and would otherwise
+        sit at its cap for the life of the session."""
+        with self.buf_lock:
+            end = self._replay_end
+            start = end - len(self._replay)
+            reset = cursor > end
+            if reset:
+                cursor = start
+            lost = max(0, start - cursor)
+            data = self._replay[max(cursor, start) - start:]
+            self.output_buf = b""
+        if data:
+            self.last_activity = time.time()
+        return data, end, lost, reset
 
     def read(self):
         """Return and clear buffered output."""
@@ -3415,6 +3461,22 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return sel
 
+    def _output_cursor(self, params):
+        """The reader's output cursor, or None for a legacy (cursor-less)
+        reader. SSE's Last-Event-ID wins over ?since: EventSource re-sends
+        its ORIGINAL URL on an automatic reconnect, but carries the id of
+        the last event it actually received in that header."""
+        raw = self.headers.get("Last-Event-ID")
+        if raw is None or not raw.strip():
+            raw = params.get("since", [None])[0]
+        if raw is None:
+            return None
+        try:
+            v = int(str(raw).strip())
+        except ValueError:
+            return None
+        return v if v >= 0 else None
+
     def _client_gone(self):
         """Return True if the peer has half-closed (sent FIN) or the
         socket has otherwise died. Non-blocking peek; if there's nothing
@@ -4380,6 +4442,7 @@ class Handler(BaseHTTPRequestHandler):
         session = self._require_session(sid)
         if session is None:
             return
+        cursor = self._output_cursor(params)
 
         # Long-poll: wait up to POLL_TIMEOUT seconds for data. Bail
         # early if the client hung up so we don't drain bytes into a
@@ -4397,24 +4460,37 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 if self._client_gone():
                     return
-                data = session.read()
-                if data:
+                extra = {}
+                if cursor is None:
+                    data = session.read()
+                else:
+                    data, nxt, lost, reset = session.read_since(cursor)
+                    extra = {"cursor": nxt}
+                    if lost or reset:
+                        extra.update({"lost": lost, "reset": reset})
+                if data or len(extra) > 1:
                     # If the client hung up between read() and write(), we
                     # would still lose these bytes — push them back on
-                    # failure so the next /api/output picks them up.
+                    # failure so the next /api/output picks them up
+                    # (legacy readers; a cursor reader asks again).
+                    body = {
+                        "data": base64.b64encode(data).decode("ascii"),
+                        "alive": session.alive,
+                        "auth_failed": session.auth_failed,
+                    }
+                    body.update(extra)
                     try:
-                        self._json({
-                            "data": base64.b64encode(data).decode("ascii"),
-                            "alive": session.alive,
-                            "auth_failed": session.auth_failed,
-                        })
+                        self._json(body)
                     except (BrokenPipeError, ConnectionResetError, OSError):
-                        session.unread(data)
+                        if cursor is None:
+                            session.unread(data)
                         raise
                     return
                 if not session.alive:
-                    self._json({"data": "", "alive": False,
-                                "auth_failed": session.auth_failed})
+                    body = {"data": "", "alive": False,
+                            "auth_failed": session.auth_failed}
+                    body.update(extra)
+                    self._json(body)
                     return
                 remaining = deadline - time.time()
                 if remaining <= 0:
@@ -4427,8 +4503,11 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        self._json({"data": "", "alive": session.alive,
-                    "auth_failed": session.auth_failed})
+        body = {"data": "", "alive": session.alive,
+                "auth_failed": session.auth_failed}
+        if cursor is not None:
+            body["cursor"] = cursor
+        self._json(body)
 
     def _stream(self):
         """SSE: stream output as 'data' events until session dies or client
@@ -4496,7 +4575,7 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            self._stream_session(session)
+            self._stream_session(session, self._output_cursor(params))
         finally:
             # Release the per-session stream slot regardless of how the
             # body exited (clean end, BrokenPipe, exception). Done under
@@ -4505,8 +4584,15 @@ class Handler(BaseHTTPRequestHandler):
             with sessions_lock:
                 session._stream_active = False
 
-    def _stream_session(self, session):
-        """Body of /api/stream once the per-session slot is held."""
+    def _stream_session(self, session, cursor=None):
+        """Body of /api/stream once the per-session slot is held.
+
+        With a cursor (current clients) output is read with read_since():
+        nothing is consumed, every data event carries `cursor` and an SSE
+        `id:` of the offset after it, and a write that silently went
+        nowhere costs nothing - the next connection asks again from the
+        client's own cursor. Without one (older cached clients) the
+        original destructive read()/unread() path is used unchanged."""
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -4533,13 +4619,16 @@ class Handler(BaseHTTPRequestHandler):
             # healthy channel delivers it instantly even on a session
             # that has nothing to print yet (idle reconnect, quiet tmux
             # pane, long-running command with no output).
-            primer = json.dumps({
+            primer = {
                 "data": "",
                 "alive": session.alive,
                 "auth_failed": session.auth_failed,
-            })
+            }
+            if cursor is not None:
+                primer["cursor"] = cursor
             self.wfile.write(
-                ("event: data\ndata: " + primer + "\n\n").encode("utf-8"))
+                ("event: data\ndata: " + json.dumps(primer) + "\n\n")
+                .encode("utf-8"))
             self.wfile.flush()
             # Connecting to /api/stream is itself proof of user interest in
             # the session. Without this bump, a quiet pane (idle vim, idle
@@ -4567,18 +4656,34 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 if self._client_gone():
-                    if data:
+                    if data and cursor is None:
                         session.unread(data)
                     return
-                data = session.read()
-                if data:
-                    payload = json.dumps({
+                extra = {}
+                if cursor is None:
+                    data = session.read()
+                else:
+                    data, nxt, lost, reset = session.read_since(cursor)
+                    if lost or reset:
+                        extra = {"lost": lost, "reset": reset}
+                    if not data and not extra:
+                        nxt = cursor
+                if data or extra:
+                    body = {
                         "data": base64.b64encode(data).decode("ascii"),
                         "alive": session.alive,
                         "auth_failed": session.auth_failed,
-                    })
+                    }
+                    head = "event: data\n"
+                    if cursor is not None:
+                        body["cursor"] = nxt
+                        body.update(extra)
+                        # EventSource sends this back as Last-Event-ID on
+                        # its automatic reconnect.
+                        head = "id: {}\n".format(nxt) + head
+                        cursor = nxt
                     self.wfile.write(
-                        ("event: data\ndata: " + payload + "\n\n")
+                        (head + "data: " + json.dumps(body) + "\n\n")
                         .encode("utf-8"))
                     self.wfile.flush()
                     last_send = time.time()
@@ -4607,16 +4712,22 @@ class Handler(BaseHTTPRequestHandler):
                                       selector=sel)
 
             # Drain any remaining buffered output before sending 'end'.
-            tail = session.read()
+            head = "event: data\n"
+            tbody = {"alive": False, "auth_failed": session.auth_failed}
+            if cursor is None:
+                tail = session.read()
+            else:
+                tail, nxt, lost, reset = session.read_since(cursor)
+                tbody["cursor"] = nxt
+                if lost or reset:
+                    tbody.update({"lost": lost, "reset": reset})
+                head = "id: {}\n".format(nxt) + head
             if tail:
-                payload = json.dumps({
-                    "data": base64.b64encode(tail).decode("ascii"),
-                    "alive": False,
-                    "auth_failed": session.auth_failed,
-                })
+                tbody["data"] = base64.b64encode(tail).decode("ascii")
+                payload = json.dumps(tbody)
                 try:
                     self.wfile.write(
-                        ("event: data\ndata: " + payload + "\n\n")
+                        (head + "data: " + payload + "\n\n")
                         .encode("utf-8"))
                     # Flush before the closing 'end' so a write failure
                     # on a buffered wfile (Python's default makefile in
@@ -4624,7 +4735,8 @@ class Handler(BaseHTTPRequestHandler):
                     # we can unread() the right bytes.
                     self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
-                    session.unread(tail)
+                    if cursor is None:
+                        session.unread(tail)
                     return
             end_payload = json.dumps({
                 "alive": False,
@@ -4636,8 +4748,9 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, OSError):
             # Client went away — give back any bytes we drained but
-            # didn't manage to deliver.
-            if data:
+            # didn't manage to deliver (legacy readers only: a cursor
+            # reader simply asks again from its own cursor).
+            if data and cursor is None:
                 session.unread(data)
             return
         finally:
