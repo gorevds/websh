@@ -3591,31 +3591,69 @@ function _dragHasFiles(ev) {
   return !!t && Array.prototype.indexOf.call(t, 'Files') >= 0;
 }
 
+// How long the highlight survives without a dragover. While a drag is
+// over an element the browser repeats dragover continuously (at least
+// every ~350 ms even when the pointer is still), so silence means the
+// drag is over - cancelled with Esc, released outside the window, or
+// ended somewhere that sent us nothing.
+const DROP_HEARTBEAT_MS = 1200;
+let _dropHighlighted = false;
+
+function showDropTarget(p) {
+  let el = p.el;
+  let why = uploadBlocker(p);
+  el.classList.add('drop-target');
+  el.classList.toggle('drop-refused', !!why);
+  el.setAttribute('data-drop-msg', why || 'Drop to upload');
+  _dropHighlighted = true;
+  clearTimeout(el._dropTimer);
+  el._dropTimer = setTimeout(() => hideDropTarget(el), DROP_HEARTBEAT_MS);
+}
+
+function hideDropTarget(el) {
+  clearTimeout(el._dropTimer);
+  el._dropTimer = null;
+  el.classList.remove('drop-target', 'drop-refused');
+}
+
+function clearAllDropTargets() {
+  if (!_dropHighlighted) return;
+  _dropHighlighted = false;
+  document.querySelectorAll('.pane.drop-target').forEach(hideDropTarget);
+}
+
 function wirePaneDrop(p) {
   let el = p.el;
-  let depth = 0;                 // dragenter/leave fire for every child
-  let clear = () => { depth = 0; el.classList.remove('drop-target'); };
+  // The highlight used to be driven by a dragenter/dragleave counter
+  // alone. A cancelled drag (Esc, or released outside the browser) gets
+  // no final dragleave in Chromium, so the counter never reached zero
+  // and "Drop to upload" + the dashed outline stayed on the pane for
+  // good. Now: dragleave checks whether the pointer really left the
+  // pane (relatedTarget), every dragover re-arms a heartbeat, and the
+  // document-level listeners below clear on any sign the drag is over.
   el.addEventListener('dragenter', ev => {
     if (!_dragHasFiles(ev)) return;
     ev.preventDefault();
-    depth++;
-    el.classList.add('drop-target');
-    el.setAttribute('data-drop-msg', uploadBlocker(p) || 'Drop to upload');
+    showDropTarget(p);
   });
   el.addEventListener('dragover', ev => {
     if (!_dragHasFiles(ev)) return;
     ev.preventDefault();
     ev.dataTransfer.dropEffect = uploadBlocker(p) ? 'none' : 'copy';
+    showDropTarget(p);
   });
   el.addEventListener('dragleave', ev => {
     if (!_dragHasFiles(ev)) return;
-    if (--depth <= 0) clear();
+    // Moving between the pane's own children fires dragleave on the old
+    // child with relatedTarget = the new one: still inside, keep it.
+    if (ev.relatedTarget && el.contains(ev.relatedTarget)) return;
+    hideDropTarget(el);
   });
   el.addEventListener('drop', ev => {
     if (!_dragHasFiles(ev)) return;
     ev.preventDefault();
     ev.stopPropagation();
-    clear();
+    clearAllDropTargets();
     let why = uploadBlocker(p);
     if (why) { showToast(why, 'warn'); return; }
     let items = ev.dataTransfer.items ? Array.from(ev.dataTransfer.items) : [];
@@ -3640,10 +3678,22 @@ function wirePaneDrop(p) {
 // replacing websh and dropping every session. Swallow stray drops.
 document.addEventListener('dragover', ev => { if (_dragHasFiles(ev)) ev.preventDefault(); });
 document.addEventListener('drop', ev => {
+  clearAllDropTargets();
   if (!_dragHasFiles(ev)) return;
   ev.preventDefault();
   showToast('Drop files onto a terminal pane to upload them.', 'warn');
 });
+// Signals that the drag is over, whatever the pane saw:
+// - the pointer left the window (dragleave with no relatedTarget);
+// - dragend (a drag that started in the page);
+// - ANY mouse/pointer movement or press: browsers suppress these for
+//   the whole duration of a drag, so seeing one means it has ended;
+// - the window lost focus (user switched away mid-drag).
+document.addEventListener('dragleave', ev => { if (!ev.relatedTarget) clearAllDropTargets(); });
+document.addEventListener('dragend', clearAllDropTargets);
+['mousemove', 'pointermove', 'pointerdown', 'keydown'].forEach(t =>
+  document.addEventListener(t, clearAllDropTargets, true));
+window.addEventListener('blur', clearAllDropTargets);
 
 // Encode filename as base64 to avoid ANY shell injection
 function safeShellName(name) { return btoa(unescape(encodeURIComponent(name))); }
