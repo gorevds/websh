@@ -6427,6 +6427,35 @@ test('file browser: a failed navigation keeps the listing; a stale OSC 7 start f
   cleanup(env);
 });
 
+test('isolate_storage: the login screen never paints another deployment\'s saved cards', async () => {
+  // renderSaved() ran at module init, before /api/config told us the
+  // storage prefix - so it read the SHARED namespace and showed another
+  // deployment's cards until config arrived.
+  const plan = [{action: 'config', delay: 150,
+                 response: {restrict_hosts: false, connections: [], isolate_storage: true}}];
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
+                               url: 'http://localhost/inst-a/'});
+  const win = dom.window;
+  makeFakes(win);
+  win.fetch = makeFetch(plan, []);
+  _injectVaultGlobals(win);
+  win.localStorage.clear();
+  win.localStorage.setItem('websh_connections',
+    JSON.stringify([{name: 'OTHER-DEPLOYMENT', host: 'secret.internal', user: 'root', port: 22}]));
+  win.localStorage.setItem('/inst-a/websh_connections',
+    JSON.stringify([{name: 'MINE', host: 'mine.example', user: 'me', port: 22}]));
+  win.eval(js + EXPOSE);
+  await sleep(40);                        // config still in flight
+  const before = win.document.getElementById('savedList').textContent;
+  ok(!/OTHER-DEPLOYMENT|secret\.internal/.test(before),
+     'nothing from the shared namespace before config; got ' + JSON.stringify(before));
+  await sleep(200);
+  const after = win.document.getElementById('savedList').textContent;
+  ok(/MINE/.test(after) && !/OTHER-DEPLOYMENT/.test(after),
+     'path-scoped cards after config; got ' + JSON.stringify(after));
+  dom.window.close();
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

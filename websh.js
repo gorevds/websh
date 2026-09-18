@@ -3393,6 +3393,10 @@ function loadServerConfig() {
   }).catch(() => {
     overlayMode = 'initial';
     showOverlay();
+    // Config unreachable: the prefix can't be known, so show what the
+    // unscoped namespace holds (the pre-isolation behaviour) rather
+    // than an empty list.
+    try { renderSaved(); } catch (e) {}
   });
 }
 
@@ -5455,5 +5459,10 @@ _initVaultBroadcast();
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
 // set to 'initial' and the user sees the login form on an empty canvas.
 loadServerConfig();
-renderSaved();
+// No renderSaved() here: under isolate_storage the storage prefix is
+// only known once /api/config answers, and a render now read the
+// SHARED namespace - the login screen showed another deployment's
+// saved cards (name, user, host) until config arrived, and a click in
+// that window connected with the wrong entry. loadServerConfig()
+// renders once the prefix is right (and its failure path renders too).
 focusFirst();
