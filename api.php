@@ -235,6 +235,7 @@ function proxy_upload($url) {
 }
 
 function proxy_download($url) {
+    ignore_user_abort(true);   // see proxy_stream
     while (ob_get_level() > 0) { ob_end_clean(); }
     @ob_implicit_flush(true);
 
@@ -316,6 +317,16 @@ function proxy_delete($url) {
 // a JSON error baked in, which EventSource sees as a healthy stream
 // with zero events.
 function proxy_stream($url) {
+    // With the default ignore_user_abort=0 PHP terminates the script the
+    // moment an echo hits a closed browser connection - INSIDE curl's
+    // write callback, before the `connection_aborted()` check below can
+    // return 0. libcurl never gets to close the backend socket, which
+    // then stays open in this worker for the rest of its life: the
+    // backend keeps the session's stream slot (409 on every reconnect),
+    // drains terminal output into the dead socket, and holds a worker
+    // thread. Keep running so the callback returns 0 and curl tears the
+    // connection down cleanly.
+    ignore_user_abort(true);
     @ini_set('zlib.output_compression', '0');
     @ini_set('output_buffering', '0');
     @ini_set('implicit_flush', '1');
