@@ -537,5 +537,36 @@ class TestAuthVaultStartupGuard(unittest.TestCase):
         self.assertIn(b"refusing to start", proc.stderr)
         self.assertIn(b"WEBSH_AUTH_HEADER", proc.stderr)
 
+
+class TestRequireVaultStartupGuard(unittest.TestCase):
+    """WEBSH_REQUIRE_VAULT=1 + plaintext credentials in websh.json must be
+    a STARTUP failure (exit 1 before binding), not a per-request one."""
+
+    def test_plaintext_config_refuses_to_start(self):
+        d = tempfile.mkdtemp()
+        try:
+            cfg = os.path.join(d, "websh.json")
+            with open(cfg, "w") as f:
+                json.dump({"connections": [
+                    {"name": "legacy", "host": "h", "username": "u",
+                     "password": "plain"}]}, f)
+            env = dict(os.environ)
+            env.pop("WEBSH_AUTH_HEADER", None)
+            env.pop("WEBSH_VAULT_ENABLE", None)
+            env["PORT"] = "0"
+            env["WEBSH_CONFIG"] = cfg
+            env["WEBSH_REQUIRE_VAULT"] = "1"
+            env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+            proc = subprocess.run(
+                [sys.executable, "-c", "import server; server.main()"],
+                env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=20)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+            self.assertIn(b"refusing to start", proc.stderr)
+            self.assertIn(b"legacy", proc.stderr)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -938,6 +938,18 @@ class _SessionPlaceholder(object):
 
 _config_cache = None
 _config_mtime = 0
+# Set by load_config() when WEBSH_REQUIRE_VAULT rejects a websh.json that
+# still carries plaintext credentials. main() turns it into a refusal to
+# start; a rejection that happens LATER (the file was edited while the
+# server runs) is logged once per file version and the config is served
+# as empty until the operator fixes it - never a dead handler thread.
+_config_rejected = None
+
+
+class _PlaintextCredsRejected(Exception):
+    pass
+
+
 _CONFIG_EMPTY = {"connections": [], "restrict_hosts": False,
                  "isolate_storage": False,
                  "denied_host_set": frozenset(),
@@ -1084,7 +1096,7 @@ def load_config():
                   denied_users lists constrain which usernames may connect,
                   but only when no fixed username is set on the entry.
     """
-    global _config_cache, _config_mtime
+    global _config_cache, _config_mtime, _config_rejected
     path = os.environ.get("WEBSH_CONFIG", "")
     if not path or not os.path.isfile(path):
         return _CONFIG_EMPTY
@@ -1117,8 +1129,7 @@ def load_config():
                        "ies" if len(flagged) > 1 else "y",
                        ", ".join(flagged))
             if WEBSH_REQUIRE_VAULT:
-                _log("ERROR", msg)
-                raise SystemExit(1)
+                raise _PlaintextCredsRejected(msg)
             _log("WARN", msg)
 
         denied_host_set, denied_net_list = _parse_denied_hosts(
@@ -1134,7 +1145,17 @@ def load_config():
         }
         _config_cache = result
         _config_mtime = mtime
+        _config_rejected = None
         return result
+    except _PlaintextCredsRejected as e:
+        # Cache the rejection under this file version so the ERROR is
+        # logged once per edit, not once per request.
+        _config_rejected = str(e)
+        _config_cache = _CONFIG_EMPTY
+        _config_mtime = mtime
+        _log("ERROR", "websh.json rejected (WEBSH_REQUIRE_VAULT=1): {}"
+             .format(e))
+        return _CONFIG_EMPTY
     except Exception as e:
         _log("WARN", "failed to load config: {}".format(e))
         return _CONFIG_EMPTY
@@ -4917,6 +4938,13 @@ def main():
              "both set, but the vault is keyed by client-supplied vault_id, "
              "not by identity — an authenticated user could reach another "
              "user's vault entries. Disable one until the vault is per-user.")
+        raise SystemExit(1)
+    # Load websh.json once BEFORE binding so a WEBSH_REQUIRE_VAULT
+    # rejection is a startup failure the operator sees in `systemctl
+    # status`, not a per-request failure behind a green /api/ping.
+    load_config()
+    if _config_rejected:
+        _log("ERROR", "refusing to start: " + _config_rejected)
         raise SystemExit(1)
     _warn_per_ip_misconfig()
     _warn_max_threads_misconfig()
