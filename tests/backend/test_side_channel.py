@@ -105,6 +105,112 @@ class TestSideChannelRateLimit(unittest.TestCase):
             server.SIDE_CHANNEL_RATE_MAX = orig
             server._side_channel_rate_limits.clear()
 
+    # Every route that spawns a side-channel ssh, with a request that
+    # passes the body/query parsing that precedes the session lookup.
+    SIDE_CHANNEL_ROUTES = [
+        ("GET",  "/api/ls?session_id={sid}&path=~", None),
+        ("GET",  "/api/download?session_id={sid}&path=/x", None),
+        ("GET",  "/api/tmux_capture?session_id={sid}", None),
+        ("POST", "/api/upload?session_id={sid}&path=x", b"data"),
+        ("POST", "/api/upload_finalize", b'{"session_id":"{sid}","tmp":"x","final":"y"}'),
+        ("POST", "/api/upload_cancel", b'{"session_id":"{sid}","tmp":"x"}'),
+        ("POST", "/api/tmux_options", b'{"session_id":"{sid}"}'),
+        ("POST", "/api/rm", b'{"session_id":"{sid}","path":"/x"}'),
+        ("POST", "/api/mkdir", b'{"session_id":"{sid}","path":"/x"}'),
+        ("POST", "/api/mv", b'{"session_id":"{sid}","path":"/x","name":"y"}'),
+    ]
+
+    def _hit(self, port, method, path, body, sid, headers=None):
+        import http.client
+        h = {"Content-Type": "application/octet-stream" if path.startswith("/api/upload?")
+             else "application/json"}
+        h.update(headers or {})
+        c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        c.request(method, path.replace("{sid}", sid),
+                  body=None if body is None else body.replace(b"{sid}", sid.encode()),
+                  headers=h)
+        r = c.getresponse(); data = r.read(); c.close()
+        return r.status, data
+
+    def test_every_side_channel_route_is_throttled(self):
+        """Mutation guard: dropping the _side_channel_throttled() call from
+        6 of the 10 routes left the suite green. MAX=0 -> the first hit
+        on EVERY route must be a 429, before any session lookup."""
+        orig = server.SIDE_CHANNEL_RATE_MAX
+        server.SIDE_CHANNEL_RATE_MAX = 0
+        server._side_channel_rate_limits.clear()
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            for method, path, body in self.SIDE_CHANNEL_ROUTES:
+                code, _ = self._hit(port, method, path, body, str(uuid.uuid4()))
+                self.assertEqual(code, 429, "%s %s not throttled (got %d)"
+                                 % (method, path, code))
+        finally:
+            httpd.shutdown(); httpd.server_close()
+            server.SIDE_CHANNEL_RATE_MAX = orig
+            server._side_channel_rate_limits.clear()
+
+    def test_every_side_channel_route_enforces_ownership(self):
+        """Mutation guard: bypassing the owner check on rm/mkdir/mv (and
+        ls/download/upload, which had no ownership test at all) left the
+        suite green. Under header-trust auth, mallory gets 403 on alice's
+        session from every route."""
+        orig_hdr = server.WEBSH_AUTH_HEADER
+        server.WEBSH_AUTH_HEADER = "Remote-User"
+        server._side_channel_rate_limits.clear()
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock(alive=True, owner="alice")
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            with unittest.mock.patch.dict(server.sessions, {sid: fake}):
+                for method, path, body in self.SIDE_CHANNEL_ROUTES:
+                    code, data = self._hit(port, method, path, body, sid,
+                                           {"Remote-User": "mallory"})
+                    self.assertEqual(code, 403, "%s %s: mallory got %d %r"
+                                     % (method, path, code, data[:80]))
+            # None of them touched the session.
+            for m in ("list_dir", "download_file", "upload_file", "remove_path",
+                      "make_dir", "rename_entry", "tmux_capture"):
+                self.assertFalse(getattr(fake, m).called, m)
+        finally:
+            httpd.shutdown(); httpd.server_close()
+            server.WEBSH_AUTH_HEADER = orig_hdr
+
+    def test_upload_size_cap_and_empty_body(self):
+        """Mutation guard: MAX_UPLOAD_SIZE appeared in no test - deleting
+        the 413 check left the suite green - and the 400 on an empty body
+        was untested."""
+        server._side_channel_rate_limits.clear()
+        sid = str(uuid.uuid4())
+        fake = unittest.mock.MagicMock(alive=True, owner="")
+        fake.upload_file.return_value = (True, "")
+        httpd = server.Server(("127.0.0.1", 0), server.Handler)
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        time.sleep(0.1)
+        try:
+            with unittest.mock.patch.dict(server.sessions, {sid: fake}), \
+                 unittest.mock.patch.object(server, "MAX_UPLOAD_SIZE", 16):
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x",
+                                       b"x" * 17, sid)
+                self.assertEqual(code, 413, data)
+                self.assertFalse(fake.upload_file.called)
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x",
+                                       b"", sid)
+                self.assertEqual(code, 400, data)
+                code, data = self._hit(port, "POST", "/api/upload?session_id={sid}&path=x",
+                                       b"x" * 16, sid)
+                self.assertEqual(code, 200, data)
+                self.assertTrue(fake.upload_file.called)
+        finally:
+            httpd.shutdown(); httpd.server_close()
+
     def test_post_side_channel_endpoints_are_throttled(self):
         # tmux_options / upload_finalize / upload_cancel each spawn an ssh
         # subprocess too, so they share the same per-IP throttle — the guard

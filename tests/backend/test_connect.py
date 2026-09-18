@@ -1581,6 +1581,45 @@ class TestHeaderTrustAuth(unittest.TestCase):
             self.assertTrue(server.sessions[sid]._stream_active,
                             "non-owner must not touch the stream slot")
 
+    def test_real_connect_stamps_the_caller_as_owner(self):
+        """Mutation guard: every other ownership test plants a MagicMock
+        with .owner preset, so `session.owner = self.headers.get("X-Owner")
+        or ...` (attacker-chosen owner) and `session.owner = ""` both
+        survived the suite. Drive a real /api/connect (SSHSession stubbed
+        so nothing forks) and check who ends up owning the session."""
+        server._rate_limits.clear()
+        with unittest.mock.patch.object(server, "SSHSession") as MockSSH:
+            inst = unittest.mock.MagicMock(alive=True, auth_failed=False,
+                                            tmux_cmd="tmux", _fake=True)
+            inst.write.return_value = True
+            MockSSH.return_value = inst
+            code, body = self._req("/api/connect", method="POST", user="alice",
+                                   body={"host": "h.example", "username": "u",
+                                         "password": "p", "cols": 80, "rows": 24})
+        self.assertEqual(code, 200, body)
+        sid = body["session_id"]
+        with server.sessions_lock:
+            self.assertEqual(server.sessions[sid].owner, "alice")
+        # alice may use it; mallory may not - and an X-Owner header from
+        # mallory must not change that.
+        code, _ = self._req("/api/input", method="POST", user="alice",
+                            body={"session_id": sid, "data": "x"})
+        self.assertEqual(code, 200)
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        c.request("POST", "/api/input", body=json.dumps({"session_id": sid, "data": "x"}),
+                  headers={"Content-Type": "application/json",
+                           "Remote-User": "mallory", "X-Owner": "alice"})
+        r = c.getresponse(); r.read(); c.close()
+        self.assertEqual(r.status, 403)
+
+    def test_delete_without_identity_is_401(self):
+        # do_DELETE's auth gate was unproven: `if False:` there left the
+        # suite green.
+        code, body = self._req("/api/save?vault_id=A&conn_id=B", method="DELETE")
+        self.assertEqual(code, 401, body)
+        self.assertEqual(body.get("error"), "unauthorized")
+
     def test_cross_user_probe_is_audit_logged(self):
         import tempfile as _tf
         d = _tf.mkdtemp()
