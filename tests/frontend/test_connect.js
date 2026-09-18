@@ -6456,6 +6456,22 @@ test('isolate_storage: the login screen never paints another deployment\'s saved
   dom.window.close();
 });
 
+test('api(): a non-JSON reply becomes a readable error, not "Unexpected token <"', async () => {
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const realFetch = win.fetch;
+  win.fetch = () => Promise.resolve({
+    status: 502, statusText: 'Bad Gateway',
+    json: () => Promise.reject(new SyntaxError("Unexpected token '<'"))});
+  const r = await win.api('rm', {body: {x: 1}});
+  ok(r && /HTTP 502 Bad Gateway/.test(r.error), 'error names the status; got ' + JSON.stringify(r));
+  ok(!/Unexpected token/.test(r.error), 'no JSON parser noise');
+  win.fetch = realFetch;
+  ok(win.isCapacityError({code: 'session_cap_global'}, 'whatever'), 'code recognised');
+  ok(win.isCapacityError({}, 'too many active sessions'), 'prose fallback kept for old servers');
+  ok(!win.isCapacityError({code: 'other'}, 'nope'), 'unrelated error is not capacity');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

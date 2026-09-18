@@ -1737,6 +1737,40 @@ sessions_lock = Lock()
 _creds_lock = RLock()
 
 
+def _remote_errno_text(stderr, fallback):
+    """The reason part of a coreutils/BusyBox error line, e.g.
+    "rm: cannot remove '/x': Device or resource busy" -> "Device or
+    resource busy". The snippets used to discard stderr and map exit
+    codes to guesses, so EBUSY/EROFS/ENOTDIR/ENAMETOOLONG all surfaced
+    as "permission denied" and a chmod-000 parent as "no such file"."""
+    lines = [l.strip() for l in (stderr or b"").decode("utf-8", "replace")
+             .splitlines() if l.strip()]
+    if not lines:
+        return fallback
+    last = lines[-1]
+    m = re.search(r"['\u2019\"]\s*:\s*([^:'\u2019\"]+)$", last)
+    reason = (m.group(1) if m else last.rsplit(": ", 1)[-1]).strip()
+    return reason[:200] or fallback
+
+
+def _side_channel_status(msg):
+    """HTTP status for a failed rm/mkdir/mv. These used to be 502 across
+    the board - wrong semantically, and an intermediary may replace a
+    5xx body with its own HTML page, which the client then failed to
+    parse ("Unexpected token <")."""
+    m = (msg or "").lower()
+    if "no such file" in m:
+        return 404
+    if "too long" in m:
+        return 400
+    if ("exists" in m or "not empty" in m or "busy" in m
+            or "not a directory" in m or "is a directory" in m):
+        return 409
+    if ("permission" in m or "not permitted" in m or "read-only" in m):
+        return 403
+    return 502
+
+
 def _sh_b64(var, b64):
     """Shell fragment assigning the base64-decoded value to $var, exactly.
     A bare `var=$(... | base64 -d)` would let command substitution strip
@@ -3125,9 +3159,9 @@ class SSHSession(object):
             _sh_b64('P', b64) + '; '
             '[ -e "$P" ] || [ -L "$P" ] || exit 3; '
             'if [ -d "$P" ] && [ ! -L "$P" ]; then '
-              'rmdir -- "$P" 2>/dev/null || exit 4; '
+              'rmdir -- "$P" || exit 5; '
             'else '
-              'rm -f -- "$P" 2>/dev/null || exit 5; '
+              'rm -f -- "$P" || exit 5; '
             'fi'
         )
         proc, err = self._mux_run(remote_cmd, 10, "rm timeout")
@@ -3135,11 +3169,13 @@ class SSHSession(object):
             return False, err
         if proc.returncode == 0:
             return True, ""
-        return False, {
-            3: "no such file or directory",
-            4: "directory not empty or not writable",
-            5: "permission denied",
-        }.get(proc.returncode, "delete failed (exit %d)" % proc.returncode)
+        if proc.returncode == 3:
+            # Already gone: the goal state holds. Reporting a failure made
+            # a retry after a lost response say "Delete failed" about a
+            # delete that had succeeded.
+            return True, "already gone"
+        return False, _remote_errno_text(
+            proc.stderr, "delete failed (exit %d)" % proc.returncode)
 
     def make_dir(self, abs_path):
         """Create one directory via the ControlMaster side-channel.
@@ -3154,17 +3190,17 @@ class SSHSession(object):
         remote_cmd = (
             _sh_b64('P', b64) + '; '
             'if [ -e "$P" ] || [ -L "$P" ]; then exit 4; fi; '
-            'mkdir -- "$P" 2>/dev/null || exit 5'
+            'mkdir -- "$P" || exit 5'
         )
         proc, err = self._mux_run(remote_cmd, 10, "mkdir timeout")
         if err:
             return False, err
         if proc.returncode == 0:
             return True, ""
-        return False, {
-            4: "name already exists",
-            5: "could not create (permission denied or missing parent)",
-        }.get(proc.returncode, "mkdir failed (exit %d)" % proc.returncode)
+        if proc.returncode == 4:
+            return False, "name already exists"
+        return False, _remote_errno_text(
+            proc.stderr, "mkdir failed (exit %d)" % proc.returncode)
 
     def rename_entry(self, abs_path, new_name):
         """Rename one entry within its own directory. new_name is a bare
@@ -3185,18 +3221,19 @@ class SSHSession(object):
             'D=${S%/*}; [ -n "$D" ] || D=/; '
             'if [ ! -e "$S" ] && [ ! -L "$S" ]; then exit 3; fi; '
             'if [ -e "$D/$N" ] || [ -L "$D/$N" ]; then exit 4; fi; '
-            'mv -- "$S" "$D/$N" 2>/dev/null || exit 5'
+            'mv -- "$S" "$D/$N" || exit 5'
         )
         proc, err = self._mux_run(remote_cmd, 10, "rename timeout")
         if err:
             return False, err
         if proc.returncode == 0:
             return True, ""
-        return False, {
-            3: "no such file or directory",
-            4: "a file with that name already exists",
-            5: "permission denied",
-        }.get(proc.returncode, "rename failed (exit %d)" % proc.returncode)
+        if proc.returncode == 3:
+            return False, "no such file or directory"
+        if proc.returncode == 4:
+            return False, "a file with that name already exists"
+        return False, _remote_errno_text(
+            proc.stderr, "rename failed (exit %d)" % proc.returncode)
 
     def download_file(self, remote_path):
         """Stream a file via ControlMaster. Returns (Popen, error).
@@ -3809,7 +3846,7 @@ class Handler(BaseHTTPRequestHandler):
         side-channel endpoint spawns an ssh subprocess and pins a worker,
         so this caps the amplification an unbounded loop could cause."""
         if not _check_side_channel_rate_limit(self._client_ip()):
-            self._json({"error": "rate_limited"}, 429)
+            self._json({"error": "rate_limited", "code": "rate_limited"}, 429)
             return True
         return False
 
@@ -3827,7 +3864,7 @@ class Handler(BaseHTTPRequestHandler):
         ip = self._client_ip()
         if not _check_rate_limit(ip):
             _access_log_emit("save", ip, result="rate_limited")
-            self._json({"error": "too many requests"}, 429)
+            self._json({"error": "too many requests", "code": "rate_limited"}, 429)
             return
         if not _vault_available():
             self._reply_vault_unavailable()
@@ -3915,7 +3952,7 @@ class Handler(BaseHTTPRequestHandler):
         ip = self._client_ip()
         if not _check_rate_limit(ip):
             _access_log_emit("save_delete", ip, result="rate_limited")
-            self._json({"error": "too many requests"}, 429)
+            self._json({"error": "too many requests", "code": "rate_limited"}, 429)
             return
         if not _vault_available():
             self._reply_vault_unavailable()
@@ -3959,7 +3996,7 @@ class Handler(BaseHTTPRequestHandler):
         if not _check_rate_limit(ip):
             _log("WARN", "rate limited: {}".format(ip))
             _access_log_emit("connect", ip, result="rate_limited")
-            self._json({"error": "too many connection attempts"}, 429)
+            self._json({"error": "too many connection attempts", "code": "rate_limited"}, 429)
             return
 
         body = self._json_body()
@@ -4203,7 +4240,8 @@ class Handler(BaseHTTPRequestHandler):
                     _access_log_emit("connect", ip,
                                      result="session_cap_per_ip",
                                      target_host=host, target_user=username)
-                    self._json({"error": "too many active sessions from your IP"},
+                    self._json({"error": "too many active sessions from your IP",
+                                "code": "session_cap_per_ip"},
                                429)
                     return
             if is_bg:
@@ -4213,7 +4251,8 @@ class Handler(BaseHTTPRequestHandler):
                                      result="session_cap_global",
                                      target_host=host, target_user=username,
                                      classification="background")
-                    self._json({"error": "too many background sessions"}, 429)
+                    self._json({"error": "too many background sessions",
+                                "code": "session_cap_background"}, 429)
                     return
             else:
                 count = sum(1 for s in sessions.values()
@@ -4223,7 +4262,8 @@ class Handler(BaseHTTPRequestHandler):
                                      result="session_cap_global",
                                      target_host=host, target_user=username,
                                      classification="foreground")
-                    self._json({"error": "too many active sessions"}, 429)
+                    self._json({"error": "too many active sessions",
+                                "code": "session_cap_global"}, 429)
                     return
             sessions[sid] = _SessionPlaceholder(client_ip=ip,
                                                 is_background=is_bg)
@@ -4861,18 +4901,21 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         ok, err = session.remove_path(path)
+        gone = ok and err == "already gone"
         # Audited like upload/download: a keystroke-free delete appears in
         # neither the session recording nor the scrollback, so the access
         # log is the only place it can ever be seen.
         _access_log_emit("rm", self._client_ip(), sid=sid,
                          target_host=getattr(session, "_host", ""),
-                         path=path, result="ok" if ok else "error",
+                         path=path,
+                         result=("already_gone" if gone else
+                                 "ok" if ok else "error"),
                          **({} if ok else {"error": err}))
         if not ok:
-            self._json({"error": err}, 502)
+            self._json({"error": err}, _side_channel_status(err))
             return
         session.last_activity = time.time()
-        self._json({"ok": True})
+        self._json({"ok": True, "already_gone": True} if gone else {"ok": True})
 
     @staticmethod
     def _bad_abs_path(path):
@@ -4915,7 +4958,7 @@ class Handler(BaseHTTPRequestHandler):
                          path=path, result="ok" if ok else "error",
                          **({} if ok else {"error": err}))
         if not ok:
-            self._json({"error": err}, 502)
+            self._json({"error": err}, _side_channel_status(err))
             return
         session.last_activity = time.time()
         self._json({"ok": True})
@@ -4948,7 +4991,7 @@ class Handler(BaseHTTPRequestHandler):
                          path=path, name=name, result="ok" if ok else "error",
                          **({} if ok else {"error": err}))
         if not ok:
-            self._json({"error": err}, 502)
+            self._json({"error": err}, _side_channel_status(err))
             return
         session.last_activity = time.time()
         self._json({"ok": True})
