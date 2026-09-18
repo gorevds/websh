@@ -94,4 +94,18 @@ code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
      -d '{}' "http://127.0.0.1:$PHP_PORT/api.php?action=input")
 [ "$code" = "403" ] || fail "Origin: null not refused" "$code"
 
+# 8. save_delete is POST-only (destructive; a GET is <img>/prefetch bait),
+#    and array-shaped query params never reach preg_match/urlencode.
+code=$(curl -s -o /dev/null -w '%{http_code}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=save_delete&vault_id=v1&conn_id=c1")
+[ "$code" = "405" ] || fail "GET save_delete not refused" "$code"
+code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action[]=ping")
+[ "$code" = "404" ] || fail "array action status" "$code $(cat "$UNKNOWN_OUT")"
+grep -q 'unknown action' "$UNKNOWN_OUT" || fail "array action body" "$(cat "$UNKNOWN_OUT")"
+code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' -X POST \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=save_delete&vault_id[]=v1&conn_id=c1")
+[ "$code" != "500" ] || fail "array vault_id fatals" "$(cat "$UNKNOWN_OUT")"
+grep -q 'Fatal' "$UNKNOWN_OUT" && fail "array vault_id leaks a fatal" "$(cat "$UNKNOWN_OUT")"
+
 echo "PHP proxy smoke: all assertions passed"
