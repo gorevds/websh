@@ -6620,6 +6620,19 @@ test('drag-and-drop: the highlight never gets stuck after a cancelled drag', asy
   cleanup(env);
 });
 
+test('drag-and-drop frame is its own layer above the terminal, not an outline', async () => {
+  // An `outline` on .pane paints UNDER xterm's positioned render layers:
+  // only the top (pane bar) and bottom strip of the frame were visible.
+  // The frame must be a pseudo-element stacked above the terminal.
+  const css = html;
+  ok(!/\.pane\.drop-target\{[^}]*outline/.test(css), 'no outline-based frame on .pane.drop-target');
+  const before = (css.match(/\.pane\.drop-target::before\{([^}]*)\}/) || [])[1] || '';
+  ok(/border:2px dashed/.test(before), 'dashed frame drawn by ::before');
+  const z = +((before.match(/z-index:(\d+)/) || [])[1] || 0);
+  ok(z > 20, 'frame stacks above the terminal layers (z-index ' + z + ' > 20)');
+  ok(/inset:\d+px/.test(before), 'frame spans the whole pane');
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
