@@ -514,6 +514,58 @@ class TestInstanceTemplateUnit(unittest.TestCase):
         self.assertEqual(d.get("StateDirectory"), ["websh"])
 
 
+class TestStartupRefusals(unittest.TestCase):
+    """main() must fail loudly, once, on a bind collision and on an
+    unwritable WEBSH_ACCESS_LOG - both used to be a raw traceback (or a
+    per-event WARN behind a reassuring startup line) under a 5 s
+    systemd restart loop."""
+
+    def _main(self, **env_extra):
+        env = dict(os.environ)
+        for k in ("WEBSH_AUTH_HEADER", "WEBSH_VAULT_ENABLE", "WEBSH_CONFIG",
+                  "WEBSH_ACCESS_LOG"):
+            env.pop(k, None)
+        env["HOST"] = "127.0.0.1"
+        env["PYTHONPATH"] = REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+        env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, "-c", "import server; server.main()"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+
+    def test_port_collision_is_a_clean_error(self):
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(1)
+        port = s.getsockname()[1]
+        try:
+            proc = self._main(PORT=str(port))
+        finally:
+            s.close()
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(b"cannot bind 127.0.0.1:%d" % port, proc.stderr)
+        self.assertNotIn(b"Traceback", proc.stderr)
+
+    def test_unwritable_access_log_refuses_to_start(self):
+        d = tempfile.mkdtemp()
+        try:
+            proc = self._main(PORT="0",
+                              WEBSH_ACCESS_LOG=os.path.join(d, "no", "such",
+                                                            "dir", "a.log"))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn(b"WEBSH_ACCESS_LOG", proc.stderr)
+        self.assertIn(b"not writable", proc.stderr)
+
+    def test_units_grant_a_writable_log_directory(self):
+        # ProtectSystem=strict + no LogsDirectory made WEBSH_ACCESS_LOG and
+        # WEBSH_RECORD_DIR silently unwritable under the bundled units.
+        for unit, name in (("websh.service", "websh"),
+                           ("websh@.service", "websh-%i")):
+            with open(os.path.join(REPO_ROOT, unit), encoding="utf-8") as f:
+                body = f.read()
+            self.assertRegex(body, r"(?m)^LogsDirectory=" + re.escape(name) + "$",
+                             unit)
+
+
 class TestAuthVaultStartupGuard(unittest.TestCase):
     """main() refuses to start when WEBSH_AUTH_HEADER and WEBSH_VAULT_ENABLE
     are both set: the vault is keyed by client-supplied vault_id, not by the
