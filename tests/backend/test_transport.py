@@ -180,6 +180,31 @@ class TestHTTPApi(LiveServerCase):
             headers={"Content-Type": "application/json; charset=utf-8"})
         self.assertNotEqual(code, 415)
 
+    def test_unhandled_handler_exception_is_a_json_500(self):
+        """Regression: an exception escaping a handler reached the worker's
+        handle_error - traceback on stderr, socket closed, no status. The
+        _dispatch backstop now answers 500 {"error":"internal error"}."""
+        def boom(self_):
+            raise RuntimeError("kaboom")
+        with unittest.mock.patch.object(server.Handler, "_boom", boom, create=True), \
+             unittest.mock.patch.dict(server.Handler._POST_ROUTES, {"boom": "_boom"}), \
+             unittest.mock.patch.object(server, "_log") as log:
+            body, code = self._post("/api/boom", {"x": 1})
+        self.assertEqual(code, 500)
+        self.assertEqual(body.get("error"), "internal error")
+        self.assertTrue(any("kaboom" in str(c) for c in log.call_args_list))
+
+    def test_infinite_numeric_field_does_not_drop_the_connection(self):
+        # JSON 1e400 -> float('inf'); int(inf) raises OverflowError, which
+        # clamp() did not catch: unhandled traceback, empty reply.
+        for path, extra in (("/api/resize", {"cols": 1e400, "rows": 24}),
+                            ("/api/connect", {"host": "h.example", "username": "u",
+                                              "password": "p", "port": 1e400,
+                                              "cols": 80, "rows": 24})):
+            body, code = self._post(path, dict(session_id="nope", **extra))
+            self.assertIn(code, (200, 400, 403, 404, 429, 500), (path, code, body))
+            self.assertIsInstance(body, dict)
+
     def test_non_dict_json_body_returns_400(self):
         """_json_body must reject valid-JSON-but-not-an-object bodies
         (bare list/string/number) with the same 400 malformed JSON gets.
