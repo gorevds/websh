@@ -6495,6 +6495,52 @@ test('file browser: header names the host; delete/rename say folder vs file', as
   cleanup(env);
 });
 
+test('drag-and-drop: files dropped on a pane upload; folders and busy panes are refused; stray drops are swallowed', async () => {
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  p.host = 'h.example';
+  const started = [];
+  const realStart = win.startUploadFiles;
+  win.startUploadFiles = (id, files) => started.push([id, files.map(f => f.name)]);
+  const fileItem = name => ({kind: 'file', getAsFile: () => ({name, size: 3}),
+                             webkitGetAsEntry: () => ({isDirectory: false})});
+  const dirItem = name => ({kind: 'file', getAsFile: () => ({name, size: 0}),
+                            webkitGetAsEntry: () => ({isDirectory: true})});
+  const drag = (target, type, items) => {
+    const ev = new win.Event(type, {bubbles: true, cancelable: true});
+    Object.defineProperty(ev, 'dataTransfer', {value: {
+      types: ['Files'], items, files: items.map(i => i.getAsFile()), dropEffect: ''}});
+    target.dispatchEvent(ev);
+    return ev;
+  };
+  drag(p.el, 'dragenter', [fileItem('a.txt')]);
+  ok(p.el.classList.contains('drop-target'), 'pane highlights as a drop target');
+  ok(p.el.getAttribute('data-drop-msg') === 'Drop to upload', 'instruction shown');
+  const ev = drag(p.el, 'drop', [fileItem('a.txt'), dirItem('src'), fileItem('b.bin')]);
+  ok(ev.defaultPrevented, 'drop handled (browser does not navigate)');
+  ok(!p.el.classList.contains('drop-target'), 'highlight cleared');
+  ok(started.length === 1 && JSON.stringify(started[0][1]) === '["a.txt","b.bin"]',
+     'files uploaded, folder skipped; got ' + JSON.stringify(started));
+  ok(/Folders can.t be uploaded/.test(win.document.body.textContent), 'folder refusal explained');
+  // Busy pane: refused with the reason.
+  p.upload = {cancelled: false};
+  drag(p.el, 'dragenter', [fileItem('c.txt')]);
+  ok(/already running/.test(p.el.getAttribute('data-drop-msg')), 'busy reason shown while dragging');
+  drag(p.el, 'drop', [fileItem('c.txt')]);
+  ok(started.length === 1, 'nothing started on a busy pane');
+  p.upload = null;
+  // A drop outside any pane must not navigate the tab away.
+  const stray = drag(win.document.body, 'drop', [fileItem('d.txt')]);
+  ok(stray.defaultPrevented, 'stray drop swallowed');
+  // The Upload button path hands its FileList to the same function.
+  const input = {files: [{name: 'e.txt', size: 1}], value: 'C:/fake/e.txt'};
+  win.handleUpload(p.id, input);
+  ok(started.length === 2 && started[1][1][0] === 'e.txt' && input.value === '',
+     'button path uses startUploadFiles and resets the input');
+  win.startUploadFiles = realStart;
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

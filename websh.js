@@ -508,6 +508,7 @@ function createPane(container) {
   // covers the cold-layout case and fitPaneWhenStable covers the
   // webfont-load case.
   new ResizeObserver(() => { fit.fit() }).observe(termEl);
+  wirePaneDrop(p);
 
   return p;
 }
@@ -3502,10 +3503,24 @@ function triggerUpload(id) {
 }
 
 function handleUpload(id, input) {
-  let p = panes[id];
-  if (!p || !p.sid || !input.files.length || (!p.host && !p.connection)) return;
-  let files = Array.prototype.slice.call(input.files);
+  let files = Array.prototype.slice.call(input.files || []);
   input.value = '';
+  startUploadFiles(id, files);
+}
+
+// Why a pane can't take an upload right now, or '' when it can. Shared
+// by the Upload button path and drag-and-drop, so both refuse for the
+// same reasons - and a drop can say which one.
+function uploadBlocker(p) {
+  if (!p || !p.sid) return 'This pane is not connected.';
+  if (!p.host && !p.connection) return 'This pane is not connected.';
+  if (p.upload || p.download) return 'A transfer is already running in this pane.';
+  return '';
+}
+
+function startUploadFiles(id, files) {
+  let p = panes[id];
+  if (!files.length || uploadBlocker(p)) return;
   let totalSize = 0;
   files.forEach(f => { totalSize += f.size });
   p.upload = {
@@ -3524,6 +3539,70 @@ function handleUpload(id, input) {
   updatePaneBadge(p);
   uploadNextFile(p);
 }
+
+// ── Drag-and-drop upload ────────────────────────────────────────────
+// Dropping files on a pane uploads them exactly like the Upload button
+// (same destination: the pane's working directory on persistent panes,
+// $HOME + mv otherwise). Folders are refused - the upload pipeline
+// streams single files.
+function _dragHasFiles(ev) {
+  let t = ev.dataTransfer && ev.dataTransfer.types;
+  return !!t && Array.prototype.indexOf.call(t, 'Files') >= 0;
+}
+
+function wirePaneDrop(p) {
+  let el = p.el;
+  let depth = 0;                 // dragenter/leave fire for every child
+  let clear = () => { depth = 0; el.classList.remove('drop-target'); };
+  el.addEventListener('dragenter', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    depth++;
+    el.classList.add('drop-target');
+    el.setAttribute('data-drop-msg', uploadBlocker(p) || 'Drop to upload');
+  });
+  el.addEventListener('dragover', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = uploadBlocker(p) ? 'none' : 'copy';
+  });
+  el.addEventListener('dragleave', ev => {
+    if (!_dragHasFiles(ev)) return;
+    if (--depth <= 0) clear();
+  });
+  el.addEventListener('drop', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    clear();
+    let why = uploadBlocker(p);
+    if (why) { showToast(why, 'warn'); return; }
+    let items = ev.dataTransfer.items ? Array.from(ev.dataTransfer.items) : [];
+    let files = [], folders = 0;
+    if (items.length) {
+      for (let it of items) {
+        if (it.kind !== 'file') continue;
+        let entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
+        if (entry && entry.isDirectory) { folders++; continue; }
+        let f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    } else {
+      files = Array.from(ev.dataTransfer.files || []);
+    }
+    if (folders) showToast('Folders can’t be uploaded — drop the files inside instead.', 'warn');
+    if (files.length) { activatePane(p.id); startUploadFiles(p.id, files); }
+  });
+}
+
+// A file dropped anywhere else would make the browser navigate to it -
+// replacing websh and dropping every session. Swallow stray drops.
+document.addEventListener('dragover', ev => { if (_dragHasFiles(ev)) ev.preventDefault(); });
+document.addEventListener('drop', ev => {
+  if (!_dragHasFiles(ev)) return;
+  ev.preventDefault();
+  showToast('Drop files onto a terminal pane to upload them.', 'warn');
+});
 
 // Encode filename as base64 to avoid ANY shell injection
 function safeShellName(name) { return btoa(unescape(encodeURIComponent(name))); }
