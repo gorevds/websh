@@ -6573,6 +6573,53 @@ test('reconnecting is shown on the pane while the transport retries, and cleared
   cleanup(env);
 });
 
+test('drag-and-drop: the highlight never gets stuck after a cancelled drag', async () => {
+  // Regression: the highlight was driven by a dragenter/dragleave counter
+  // only. A cancelled drag (Esc, or released outside the browser) gets no
+  // final dragleave in Chromium, so "Drop to upload" and the dashed
+  // outline stayed on the pane for good (reproduced in real Chromium).
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  p.host = 'h.example';
+  const lit = () => p.el.classList.contains('drop-target');
+  const fire = (target, type, extra) => {
+    const ev = new win.Event(type, {bubbles: true, cancelable: true});
+    Object.defineProperty(ev, 'dataTransfer', {value: {types: ['Files'], items: [], files: [], dropEffect: ''}});
+    if (extra && 'relatedTarget' in extra) Object.defineProperty(ev, 'relatedTarget', {value: extra.relatedTarget});
+    target.dispatchEvent(ev);
+  };
+  const child = p.el.querySelector('.pane-term');
+  // Moving between the pane's own children keeps the highlight.
+  fire(p.el, 'dragenter'); fire(child, 'dragenter');
+  fire(p.el, 'dragleave', {relatedTarget: child});
+  ok(lit(), 'moving onto a child keeps the highlight');
+  // Leaving the window (no relatedTarget) clears it at once.
+  fire(child, 'dragleave', {relatedTarget: null});
+  ok(!lit(), 'leaving the pane/window clears it');
+  // Any mouse movement means the drag is over (browsers suppress mouse
+  // events during a drag) - the cancel-then-move case.
+  fire(p.el, 'dragenter'); ok(lit(), 're-highlighted');
+  win.document.dispatchEvent(new win.MouseEvent('mousemove', {bubbles: true}));
+  ok(!lit(), 'mousemove after a cancel clears it');
+  // No events at all (cancel with the mouse still): heartbeat clears it.
+  fire(p.el, 'dragenter'); fire(p.el, 'dragover');
+  await sleep(600);
+  ok(lit(), 'still shown while within the heartbeat');
+  fire(p.el, 'dragover');                          // UA keeps sending these while held
+  await sleep(900);
+  ok(lit(), 'a held drag stays highlighted (heartbeat re-armed)');
+  await sleep(500);
+  ok(!lit(), 'silence past the heartbeat clears it');
+  // Refusal looks different from an invitation.
+  p.upload = {cancelled: false};
+  fire(p.el, 'dragenter');
+  ok(p.el.classList.contains('drop-refused'), 'busy pane is styled as refused');
+  win.document.dispatchEvent(new win.MouseEvent('mousemove', {bubbles: true}));
+  ok(!p.el.classList.contains('drop-refused') && !lit(), 'refused style cleared too');
+  p.upload = null;
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

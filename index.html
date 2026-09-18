@@ -131,7 +131,13 @@
     /* Drag-and-drop upload target: an outline + the reason/instruction. */
     .pane-reconnect{position:absolute;top:40px;left:50%;transform:translateX(-50%);z-index:15;background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-left:3px solid #e5a50a;border-radius:6px;padding:6px 12px;font-size:12px;white-space:nowrap;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.35)}
     .pane.drop-target{outline:2px dashed var(--ac);outline-offset:-4px}
-    .pane.drop-target::after{content:attr(data-drop-msg);position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:var(--sf);color:var(--tx);border:1px solid var(--ac);border-radius:8px;padding:10px 16px;font-size:13px;pointer-events:none;z-index:20}
+    /* Centered with inset:0 + margin:auto rather than left:50% +
+       translate: an absolute box at left:50% shrink-wraps to HALF the
+       pane, so in a narrow split the message broke into three lines. */
+    .pane.drop-target::after{content:attr(data-drop-msg);box-sizing:border-box;position:absolute;inset:0;margin:auto;width:max-content;max-width:calc(100% - 32px);height:max-content;text-align:center;background:var(--sf);color:var(--tx);border:1px solid var(--ac);border-radius:8px;padding:10px 16px;font-size:13px;pointer-events:none;z-index:20}
+    /* A pane that can't take the drop must not look like one that can. */
+    .pane.drop-target.drop-refused{outline-color:#e5a50a}
+    .pane.drop-target.drop-refused::after{border-color:#e5a50a;color:var(--dim)}
     .pane.active>.pane-bar{background:var(--sf)}
     .pane-bar{display:flex;align-items:center;gap:6px;padding:2px 8px;background:var(--bg);border-bottom:1px solid var(--bd);flex-shrink:0}
     .pane-badge{font-size:10px;padding:1px 6px;border-radius:10px;font-weight:500}
