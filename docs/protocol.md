@@ -81,6 +81,32 @@ as `output`, `: keepalive` comment heartbeats, and a final
 `event: end` + `data: {"alive": false, ...}`. Note the events are
 named — a bare `EventSource.onmessage` consumer sees nothing.
 
+#### Output cursor (lossless reconnect)
+Both endpoints accept `&since=<n>`: the absolute byte offset of the
+output this client has already rendered (0 for a new session). With
+it, output is read **without being consumed**, from a replay window of
+the session's last `OUTPUT_REPLAY_BYTES` (default 512 KiB), and every
+reply / `data` event carries:
+
+- `cursor` — the offset after this chunk (the client's next `since`);
+- `lost` (only when non-zero) — bytes that were produced but fell out
+  of the replay window before this reader asked; the client should say
+  so rather than silently skip;
+- `reset: true` (only when set) — the `since` was ahead of anything
+  this session produced (a cursor from another session); the reply
+  starts over from the retained window.
+
+On SSE each `data` event also has `id: <cursor>`, so a browser's
+automatic EventSource reconnect resends it as `Last-Event-ID`, which
+takes precedence over the `since` in the (unchanged) reconnect URL. A
+chunk may overlap what the client already has - it covers
+`[cursor - len(data), cursor)` - and the client trims bytes below its
+own cursor. The PHP shim forwards `Last-Event-ID`.
+
+Without `since` (and without `Last-Event-ID`) the original semantics
+apply: reads drain the buffer, no `cursor` field. Older cached clients
+keep working.
+
 ### POST /api/resize
 Body: `session_id`, `cols`, `rows`. Reply `{"ok": true}`.
 

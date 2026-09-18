@@ -1410,6 +1410,7 @@ function endSession(p, o) {
   // reconnect starts somewhere else and must re-learn it.
   p.cwd = '';
   p.osc7Host = null;     // a new session pins its own OSC 7 host
+  p.outCursor = 0;       // cursors are per session
   clearTimeout(p.saveCommitTimer);
   p.saveCommitTimer = null;
   if (o.disconnect && sid) {
@@ -1531,7 +1532,24 @@ function handleOutputPayload(p, r, sid) {
     return true;
   }
   p.connecting=false;
-  if(r.data){
+  // Output cursor (servers with lossless reconnect). A frame covers the
+  // bytes [cursor - len, cursor). Anything below our own cursor was
+  // already written to this terminal - a replay after a reconnect, or
+  // EventSource re-sending its original URL - so it is trimmed rather
+  // than printed twice. `reset`: the server did not know our cursor and
+  // started over from what it still has.
+  let chunk = r.data ? atob(r.data) : '';
+  if (typeof r.cursor === 'number') {
+    let start = r.cursor - chunk.length;
+    let have = p.outCursor || 0;
+    if (!r.reset && start < have) chunk = chunk.slice(Math.min(chunk.length, have - start));
+    if (r.lost) {
+      p.term.write('\r\n\x1b[2m[websh: ' + r.lost + ' bytes of output were produced while ' +
+                   'disconnected and no longer available]\x1b[0m\r\n');
+    }
+    p.outCursor = r.reset ? r.cursor : Math.max(have, r.cursor);
+  }
+  if(chunk.length){
     // Always render incoming bytes — even on a tail-drain frame that
     // arrives after the disconnect banner, the bytes may be the last
     // thing the shell wrote (final command output, exit message). We
@@ -1539,7 +1557,7 @@ function handleOutputPayload(p, r, sid) {
     // them where the cursor is. Skipping them on p.sid=null would
     // silently drop end-of-session output.
     updatePaneBadge(p);
-    let chunk = atob(r.data);
+
     // Tight loop instead of Uint8Array.from(chunk, c => c.charCodeAt(0)):
     // this runs per output chunk on the hottest path (noisy output like
     // `cat`/build logs), and the per-element callback in .from() is a
@@ -1695,7 +1713,12 @@ function streamOutput(p) {
   if (!p.sid || !p.polling) return;
   closeStream(p);
   let mySid = p.sid;
-  let url = `${API}?action=stream&session_id=${encodeURIComponent(mySid)}`;
+  // since= our output cursor: a reconnect resumes exactly where this
+  // pane's terminal stopped, instead of losing whatever the server had
+  // already sent into the dead connection. EventSource's own automatic
+  // reconnects send Last-Event-ID (the id: of the last event it got).
+  let url = `${API}?action=stream&session_id=${encodeURIComponent(mySid)}` +
+            `&since=${p.outCursor || 0}`;
   let es;
   try { es = new EventSource(url); }
   catch (e) {
@@ -1777,7 +1800,7 @@ function streamOutput(p) {
 function pollOutput(p) {
   if(!p.sid || !p.polling) return;
   let mySid = p.sid;
-  api('output',{query:'&session_id='+mySid}).then(r => {
+  api('output',{query:'&session_id='+mySid+'&since='+(p.outCursor || 0)}).then(r => {
     clearRetryClock(p);
     if (handleOutputPayload(p, r, mySid)) return;
     if(p.polling) pollOutput(p);
@@ -1982,6 +2005,7 @@ async function connectPane(p, opts) {
         return;
       }
       p.sid = r.session_id;
+      p.outCursor = 0;          // a new session's output starts at offset 0
       if (r.slot_id) p.slotId = r.slot_id;
       if (r.tmux_cmd) p.tmuxCmd = r.tmux_cmd;
       p.connectedAt = Date.now();
@@ -2274,6 +2298,7 @@ function finalizeSuccess(opts, result, run) {
   p.slotId = result.slot_id || opts.slotId || null;
   p.tmuxCmd = result.tmux_cmd || opts.tmuxCmd || 'tmux';
   p.sid = result.session_id;
+  p.outCursor = 0;              // a new session's output starts at offset 0
   p.connectedAt = Date.now();
   p.recentOutput = '';
   p.connecting = false;

@@ -6656,6 +6656,46 @@ test('drag-and-drop frame is its own layer above the terminal, not an outline', 
   ok(/inset:\d+px/.test(before), 'frame spans the whole pane');
 });
 
+test('lossless reconnect: replayed output is trimmed by cursor, gaps are announced', async () => {
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  ok(p.outCursor === 0, 'a new session starts at cursor 0');
+  const out = [];
+  p.term.write = (b) => { out.push(typeof b === 'string' ? b : Buffer.from(b).toString('latin1')); };
+  const b64 = t => Buffer.from(t, 'latin1').toString('base64');
+  const frame = (text, cursor, extra) =>
+    win.handleOutputPayload(p, Object.assign({data: b64(text), alive: true, cursor}, extra || {}), p.sid);
+  frame('hello ', 6);
+  frame('world', 11);
+  ok(out.join('') === 'hello world' && p.outCursor === 11, 'in-order frames written; cursor 11');
+  // After a reconnect the server replays from an older cursor (e.g.
+  // EventSource re-sent its original URL): only the new tail is printed.
+  frame('world!!', 13);
+  ok(out.join('') === 'hello world!!', 'overlap trimmed; got ' + JSON.stringify(out.join('')));
+  frame('world!!', 13);
+  ok(out.join('') === 'hello world!!', 'a full duplicate prints nothing');
+  // Bytes that fell out of the server's window are announced, not faked.
+  frame('tail', 5017, {lost: 5000});
+  ok(/5000 bytes of output were produced while disconnected/.test(out.join('')), 'gap announced');
+  ok(out.join('').endsWith('tail') && p.outCursor === 5017, 'then the retained bytes');
+  // reset: the server didn't know our cursor - take its data as-is.
+  frame('fresh', 5, {reset: true});
+  ok(out.join('').endsWith('fresh') && p.outCursor === 5, 'reset adopts the server cursor');
+  // Frames without a cursor (older server) are written as before.
+  win.handleOutputPayload(p, {data: b64('legacy'), alive: true}, p.sid);
+  ok(out.join('').endsWith('legacy'), 'cursor-less frames still render');
+  // The stream URL carries the cursor.
+  let seen = null;
+  const RealES = win.EventSource;
+  win.EventSource = function (url) { seen = url; this.addEventListener = () => {}; this.close = () => {}; };
+  win.closeStream(p); win.streamOutput(p);
+  ok(seen && /[?&]since=5\b/.test(seen), 'stream URL resumes from the cursor; got ' + seen);
+  win.EventSource = RealES;
+  win.endSession(p, {});
+  ok(p.outCursor === 0, 'endSession resets the cursor');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
