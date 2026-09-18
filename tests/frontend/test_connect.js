@@ -6299,6 +6299,65 @@ test('returning to a tab while a fit is in flight still reopens the stream', asy
   cleanup(env);
 });
 
+test('file browser: sorting reorders in place, no refetch, open editor survives', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const lsBefore = env.log.filter(e => e.action === 'ls').length;
+  const row = rowFor(win, 'mid.txt');
+  row.querySelector('[data-fb-ren]').click();
+  const inp = row.querySelector('.fb-ed-inp');
+  inp.value = 'typed-but-not-saved.txt';
+  win.setFbSort('size');
+  await sleep(20);
+  ok(env.log.filter(e => e.action === 'ls').length === lsBefore, 'no /api/ls for a sort');
+  ok(row.isConnected && row.classList.contains('fb-edit'), 'rename editor survived the reorder');
+  ok(row.querySelector('.fb-ed-inp').value === 'typed-but-not-saved.txt', 'typed text kept');
+  // By row node (data-name): the row in edit mode has no .fb-nm span.
+  const order = Array.from($(win, 'fbList').querySelectorAll('.fb-row'))
+    .map(r => r.dataset.name).filter(n => n && n !== '..');
+  // dirs first, then files by size desc: alpha(5000) mid(700) zeta(10)
+  ok(JSON.stringify(order.slice(2)) === JSON.stringify(['alpha.txt', 'mid.txt', 'zeta.txt']),
+     'files reordered by size; got ' + JSON.stringify(order));
+  cleanup(env);
+});
+
+test('file browser: clicking a file during a running transfer keeps the browser open and says why', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  p.upload = {cancelled: false};
+  rowFor(win, 'zeta.txt').click();
+  await sleep(10);
+  ok(!$(win, 'fbOv').hidden, 'browser stayed open');
+  ok(/already running/.test(win.document.body.textContent), 'toast explains the refusal');
+  p.upload = null;
+  cleanup(env);
+});
+
+test('file browser: a filter with no matches says so; an armed delete stays visible', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const f = $(win, 'fbFilter');
+  f.value = 'zzzz'; win.applyFbFilter();
+  ok(/No matches/.test($(win, 'fbList').textContent), '"No matches" shown for an empty filter result');
+  f.value = ''; win.applyFbFilter();
+  ok(!/No matches/.test($(win, 'fbList').textContent), 'note removed when rows are visible again');
+  // Arm a delete, then filter it out: the confirmation must stay on screen.
+  const row = rowFor(win, 'mid.txt');
+  row.querySelector('[data-fb-del]').click();
+  f.value = 'zeta'; win.applyFbFilter();
+  ok(!row.classList.contains('fb-hide'), 'armed delete confirmation is never hidden');
+  // Cancelling re-applies the filter to the restored row.
+  row.querySelector('.fb-cf-no').click();
+  ok(row.classList.contains('fb-hide'), 'after cancel the row obeys the filter again');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
