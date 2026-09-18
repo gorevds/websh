@@ -52,6 +52,7 @@ and logged as a `WARN` at startup (as is any name no knob reads):
 | `MAX_UPLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/upload` (bytes) |
 | `MAX_DOWNLOAD_SIZE` | `2147483648` (2 GiB) | Hard cap on a single `/api/download` (bytes); the browser accumulates the stream into a Blob, so this also protects the tab |
 | `UPLOAD_TIMEOUT` | `1800` | Seconds before the side-channel ssh for an in-flight upload is killed |
+| `TRANSFER_IDLE_TIMEOUT` | `60` | Seconds to wait for the side-channel ssh to produce the download header / next chunk, or to accept the next upload chunk, before the helper is killed (download → `504`, upload → error). Bounds a wedged ControlMaster, which otherwise pinned a worker thread for the life of the session. |
 | `MAX_BODY_SIZE` | `8388608` (8 MiB) | Cap on the in-memory request body for control/JSON endpoints (connect, input, resize, save, …); stops a bogus Content-Length from buffering gigabytes into RAM |
 | `WEBSH_MAX_THREADS` | `4 × (MAX_SESSIONS + MAX_BG_SESSIONS) + 64` (`464` at defaults) | Hard cap on concurrent HTTP worker threads. New requests past the cap get an immediate `503 {"error":"busy"}`. Values below `1` are clamped to `1` with a startup WARN; there is no "unlimited" mode by design. |
 | `RATE_LIMIT_MAX` | `50` | Max `/api/connect` attempts per IP per window |

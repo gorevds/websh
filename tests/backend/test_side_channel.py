@@ -27,6 +27,22 @@ from tests.backend._base import (  # noqa: F401
 import server
 
 
+def _pipe_stdout(*chunks):
+    """A real pipe pre-filled with `chunks` (writer closed after), wrapped
+    like Popen.stdout. _download reads the raw fd under select(), so a
+    MagicMock with read.side_effect no longer models it."""
+    r, w = os.pipe()
+    data = b"".join(chunks)
+
+    def feed():
+        try:
+            os.write(w, data)
+        finally:
+            os.close(w)
+    threading.Thread(target=feed, daemon=True).start()
+    return os.fdopen(r, "rb", buffering=0)
+
+
 class TestSideChannelRateLimit(unittest.TestCase):
     """The side-channel endpoints (ls/download/upload/tmux_capture) each
     spawn an ssh subprocess; they get their own, higher per-IP limit so an
@@ -1761,11 +1777,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
     def test_file_not_found_returns_error(self):
         sid = str(uuid.uuid4())
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = [b"E", b"R", b"R", b"\t",
-                                              b"F", b"i", b"l", b"e",
-                                              b" ", b"n", b"o", b"t",
-                                              b" ", b"f", b"o", b"u",
-                                              b"n", b"d", b"\n"]
+        fake_proc.stdout = _pipe_stdout(b"ERR\tFile not found\n")
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
@@ -1786,7 +1798,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         oversize = server.MAX_DOWNLOAD_SIZE + 1
         header = "OK\t{}\n".format(oversize).encode()
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = [bytes([b]) for b in header]
+        fake_proc.stdout = _pipe_stdout(header)
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
@@ -1802,12 +1814,39 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         side-channel ssh child is reaped, not leaked as a zombie."""
         sid = str(uuid.uuid4())
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = OSError("pipe broken")
+        fake_proc.stdout.fileno.side_effect = OSError("pipe broken")
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
             r = self._get_json("session_id={}&path=/tmp/x".format(sid))
         self.assertIn("error", r)
+        self.assertTrue(fake_proc.kill.called)
+        self.assertTrue(fake_proc.wait.called)
+
+    def test_silent_side_channel_times_out_with_504(self):
+        """Regression: a side-channel ssh that connects but never writes
+        the protocol header pinned the worker thread (and a MAX_THREADS
+        permit) until the master session died - there was no bound on
+        the pipe read at all. Now the header read is gated by
+        TRANSFER_IDLE_TIMEOUT and answers 504."""
+        sid = str(uuid.uuid4())
+        r, w = os.pipe()                 # writer never writes
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout = os.fdopen(r, "rb", buffering=0)
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        t0 = time.time()
+        try:
+            with unittest.mock.patch.object(server, "TRANSFER_IDLE_TIMEOUT", 1), \
+                 unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+                code, body = self._request_raw(
+                    "/api/download?session_id={}&path=/tmp/stall".format(sid),
+                    timeout=10)
+        finally:
+            os.close(w)
+        self.assertEqual(code, 504, body)
+        self.assertIn(b"timeout", body)
+        self.assertLess(time.time() - t0, 8)
         self.assertTrue(fake_proc.kill.called)
         self.assertTrue(fake_proc.wait.called)
 
@@ -1831,12 +1870,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
             pos[0] += len(chunk)
             return chunk
         fake_proc = unittest.mock.MagicMock()
-        # read(1) calls consume header byte by byte; read(BUF) reads body
-        fake_proc.stdout.read.side_effect = (
-            [bytes([b]) for b in header[:-1]] +  # all header bytes except \n
-            [b"\n"] +                              # \n terminates header
-            [payload, b""]                         # body then EOF
-        )
+        fake_proc.stdout = _pipe_stdout(header, payload)
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
@@ -1870,10 +1904,7 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         header = b"OK\t-1\n"          # stat failed -> unknown size
         big_chunk = b"Z" * 4096
         fake_proc = unittest.mock.MagicMock()
-        fake_proc.stdout.read.side_effect = (
-            [bytes([b]) for b in header[:-1]] + [b"\n"] +
-            [big_chunk, big_chunk, b""]
-        )
+        fake_proc.stdout = _pipe_stdout(header, big_chunk, big_chunk)
         fake_session = unittest.mock.MagicMock()
         fake_session.download_file.return_value = (fake_proc, None)
         with unittest.mock.patch.object(server, "MAX_DOWNLOAD_SIZE", 1000), \
@@ -1947,6 +1978,40 @@ class TestUploadFileNoDeadlock(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("ssh exit 7", err)
         self.assertIn("E", err)  # stderr text preserved for the user
+
+    def test_remote_that_stops_reading_is_bounded_by_idle_timeout(self):
+        """Regression: the deadline was checked only at the top of the
+        loop, and the buffered proc.stdin.write() blocked without bound
+        once the remote stopped reading - a stalled `cat >` pinned the
+        worker for the life of the master session. The raw write is now
+        gated by select() with TRANSFER_IDLE_TIMEOUT."""
+        s = self._fake_session("/tmp/fake.sock")
+        # A child that never reads stdin: the pipe fills (64 KB) and every
+        # further write would block forever.
+        child = [sys.executable, "-c", "import time; time.sleep(30)"]
+        real_popen = subprocess.Popen
+
+        def fake_popen(cmd, **kw):
+            return real_popen(child, **kw)
+
+        body = io.BytesIO(b"D" * (1024 * 1024))
+        result = {}
+
+        def run():
+            with unittest.mock.patch("os.path.exists", return_value=True), \
+                 unittest.mock.patch("subprocess.Popen", side_effect=fake_popen), \
+                 unittest.mock.patch.object(server, "TRANSFER_IDLE_TIMEOUT", 1):
+                result["v"] = s.upload_file("dest", body, 1024 * 1024, timeout=1)
+
+        t0 = time.time()
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(12)
+        self.assertFalse(t.is_alive(), "upload_file still blocked after 12s")
+        ok, err = result["v"]
+        self.assertFalse(ok)
+        self.assertIn("stalled", err)
+        self.assertLess(time.time() - t0, 10)
 
     def test_broken_pipe_surfaces_remote_stderr(self):
         # Remote `cat >` dies mid-upload (disk full): ssh exits and tears down

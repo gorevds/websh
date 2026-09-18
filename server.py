@@ -270,6 +270,21 @@ MAX_UPLOAD_SIZE = _int_env("MAX_UPLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 MAX_DOWNLOAD_SIZE = _int_env("MAX_DOWNLOAD_SIZE", str(2 * 1024 * 1024 * 1024))
 # How long a single upload may take before we kill the side-channel ssh.
 UPLOAD_TIMEOUT = _int_env("UPLOAD_TIMEOUT", "1800")
+# Idle bound on the side-channel pipe during a transfer: how long we
+# wait for the remote to produce the download header / the next chunk,
+# or to accept the next upload chunk, before killing the helper ssh.
+# The side channel returns a raw Popen, so nothing else bounds these
+# reads - a wedged ControlMaster pinned a worker thread (and a
+# MAX_THREADS permit) until the master session itself died.
+TRANSFER_IDLE_TIMEOUT = _int_env("TRANSFER_IDLE_TIMEOUT", "60")
+
+
+def _wait_fd(fd, timeout, write=False):
+    """Block until `fd` is readable (or writable), at most `timeout`
+    seconds. Returns False on timeout."""
+    r, w, _ = select.select([] if write else [fd], [fd] if write else [],
+                            [], max(0.0, timeout))
+    return bool(r or w)
 # Cap on the in-memory request body for control/JSON endpoints (connect,
 # input, resize, save, tmux_options, upload_finalize/cancel, ...). Stops a
 # bogus/huge Content-Length from making the single-process server buffer
@@ -2748,6 +2763,11 @@ class SSHSession(object):
         BUF = 256 * 1024
         remaining = length
         deadline = time.time() + max(60, timeout)
+        in_fd = proc.stdin.fileno()
+        # Non-blocking so a write never sleeps past the select() below:
+        # a blocking pipe write of a 256 KB chunk only returns once ALL
+        # of it fits, whatever select() said about the first 4 KB.
+        os.set_blocking(in_fd, False)
         try:
             while remaining > 0:
                 if time.time() > deadline:
@@ -2755,7 +2775,21 @@ class SSHSession(object):
                 chunk = body_stream.read(min(BUF, remaining))
                 if not chunk:
                     break
-                proc.stdin.write(chunk)
+                # Raw writes gated by select(): the buffered
+                # proc.stdin.write() blocked without bound once the remote
+                # stopped reading, so the deadline above (checked only at
+                # the top of the loop) never fired.
+                view = memoryview(chunk)
+                while view:
+                    if not _wait_fd(in_fd, min(TRANSFER_IDLE_TIMEOUT,
+                                               max(0.0, deadline - time.time())),
+                                    write=True):
+                        raise IOError("upload stalled: remote stopped reading")
+                    try:
+                        n = os.write(in_fd, view)
+                    except BlockingIOError:
+                        continue
+                    view = view[n:]
                 remaining -= len(chunk)
                 # Multi-GB uploads can outlast SESSION_TIMEOUT; without
                 # this stamp the cleanup loop would close the master
@@ -4809,14 +4843,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": err}, 502)
             return
 
-        # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n")
+        # Read the protocol header ("OK\t<size>\n" or "ERR\t<msg>\n").
+        # Byte-at-a-time on the raw fd, each byte gated by select():
+        # Popen's file object would block without bound on a remote
+        # that connected but never answers.
         header_line = b""
         try:
+            out_fd = proc.stdout.fileno()
             while True:
-                c = proc.stdout.read(1)
+                if not _wait_fd(out_fd, TRANSFER_IDLE_TIMEOUT):
+                    raise TimeoutError("download header timeout")
+                c = os.read(out_fd, 1)
                 if not c or c == b"\n":
                     break
                 header_line += c
+                if len(header_line) > 4096:
+                    raise ValueError("download header too long")
+        except TimeoutError:
+            _kill_reap(proc)
+            _log("WARN", "download header timeout sid={} path={}".format(
+                sid, path))
+            self._json({"error": "download timeout"}, 504)
+            return
         except Exception:
             _kill_reap(proc)
             self._json({"error": "download failed"}, 502)
@@ -4858,11 +4906,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")
         self.end_headers()
 
+        result = "ok"
         try:
             BUF = 256 * 1024
             sent = 0
             while True:
-                chunk = proc.stdout.read(BUF)
+                if not _wait_fd(out_fd, TRANSFER_IDLE_TIMEOUT):
+                    _log("WARN", "download stalled {}s, aborting sid={} "
+                         "path={}".format(TRANSFER_IDLE_TIMEOUT, sid, path))
+                    result = "timeout"
+                    proc.kill()
+                    break
+                chunk = os.read(out_fd, BUF)
                 if not chunk:
                     break
                 sent += len(chunk)
@@ -4877,6 +4932,7 @@ class Handler(BaseHTTPRequestHandler):
                 if sent > MAX_DOWNLOAD_SIZE:
                     _log("WARN", "download exceeded MAX_DOWNLOAD_SIZE, "
                          "aborting sid={} path={}".format(sid, path))
+                    result = "over_cap"
                     proc.kill()
                     break
                 self.wfile.write(chunk)
@@ -4885,8 +4941,14 @@ class Handler(BaseHTTPRequestHandler):
                 # this stamp the cleanup loop would close the master
                 # mid-stream and the side-channel ssh would die with it.
                 session.last_activity = time.time()
+            # A known size that we did not reach means the remote cut the
+            # stream short (or the client left mid-way): not an "ok".
+            if result == "ok" and content_length is not None \
+                    and sent < content_length:
+                result = "partial"
         except Exception:
-            pass
+            # Client went away mid-stream (BrokenPipe) or the pipe died.
+            result = "client_gone" if result == "ok" else result
         finally:
             proc.stdout.close()
             try:
@@ -4900,7 +4962,7 @@ class Handler(BaseHTTPRequestHandler):
         # partial). The path is sanitized + capped by the access-log layer.
         _access_log_emit("download", self._client_ip(), sid=sid,
                          target_host=getattr(session, "_host", ""),
-                         path=path, bytes=sent, result="ok")
+                         path=path, bytes=sent, result=result)
 
     # ── Disconnect ──────────────────────────────────────────────────
 
