@@ -6272,6 +6272,33 @@ test('file browser: a mutating action is refused when the listed session changed
   cleanup(env);
 });
 
+test('returning to a tab while a fit is in flight still reopens the stream', async () => {
+  // kickPanesAfterAbsence reopens SSE only from fitPaneWhenStable's
+  // onSettled. A fit already in flight (the 1 s drift watchdog, or a
+  // font load still pending) used to make the second call return early
+  // and DROP that callback: the tab came back frozen.
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  // A font load that stays pending until we release it.
+  let releaseFont;
+  const pending = new Promise(r => { releaseFont = r; });
+  win.document.fonts = {load: () => pending, ready: Promise.resolve()};
+  let restarts = 0;
+  const realStart = win.startOutput;
+  win.startOutput = (q) => { restarts++; };
+  win.fitPaneWhenStable(p);                 // watchdog-style fit, in flight
+  ok(p._fitInFlight === true, 'a fit is in flight');
+  win.kickPanesAfterAbsence();              // tab comes back now
+  await sleep(30);
+  ok(restarts === 0, 'stream restart waits for the running fit');
+  releaseFont();
+  await sleep(200);
+  ok(restarts === 1, 'queued restart ran once the fit finished; got ' + restarts);
+  ok(!p._fitInFlight, 'fit released');
+  win.startOutput = realStart;
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

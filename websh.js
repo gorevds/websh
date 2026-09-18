@@ -705,6 +705,7 @@ function _destroyPane(id, terminate) {
   // still POST and add a card. Clearing it also drops the closure's `p` ref.
   clearTimeout(p.saveCommitTimer);
   p._fitInFlight = false;
+  p._pendingSettled = [];     // nothing to resume on a destroyed pane
   // Disconnect main session
   if (p.sid) {
     p.polling = false;
@@ -4661,8 +4662,25 @@ function applySettings(opts){
 // will use to render" is: two consecutive fits return the same cols.
 // So we iterate fit-once-per-RAF until cols stabilises (or hit a
 // safety cap of 8 attempts — at most ~130 ms total, imperceptible).
+// Callbacks waiting for the pane's in-flight fit to finish. Every exit
+// of a fit - settled, aborted, font load failed, or the 10 s stuck
+// timer - drains this, so a caller's onSettled is never lost. It used
+// to be: a second call while a fit was running returned early and
+// dropped its onSettled, and kickPanesAfterAbsence only reopens the SSE
+// stream from that callback - so a tab brought back while the 1 s drift
+// watchdog (or a hung font load) held the flag stayed frozen.
+function _drainPendingSettled(p) {
+  let q = p._pendingSettled;
+  if (!q || !q.length) return;
+  p._pendingSettled = [];
+  if (panes[p.id] !== p) return;          // pane gone: nothing to resume
+  q.forEach(cb => { try { cb(p); } catch (e) { console.error(e); } });
+}
+
 function fitPaneWhenStable(p, opts){
   if (!p || !panes[p.id] || !p.fitAddon) return;
+  let onSettled = (opts && opts.onSettled) || null;
+  if (onSettled) (p._pendingSettled = p._pendingSettled || []).push(onSettled);
   // Re-entry guard: settle-loop forceMeasure() and the fontFamily
   // round-trip both cause xterm to fire its own change events. If a
   // second fitPaneWhenStable call races in before the first finishes
@@ -4670,8 +4688,13 @@ function fitPaneWhenStable(p, opts){
   // they pile up async Promises that each trigger the same xterm
   // chain, exponentially saturating the event loop. Skip cleanly —
   // the in-flight call will land on the latest values anyway.
-  if (p._fitInFlight) return;
+  if (p._fitInFlight) return;             // queued above; drained on its exit
   p._fitInFlight = true;
+  // Identity of THIS fit. The stuck timer can clear the flag and a new
+  // fit can set it again while this one's promise chain is still
+  // pending; the token keeps the old chain from acting as the owner.
+  let token = {};
+  p._fitToken = token;
   // Stuck-timer safety. If the font load hangs (CDN unreachable,
   // captive portal, document.fonts.ready waiting on an unrelated
   // never-completing face) the flag would stay true forever and every
@@ -4683,17 +4706,21 @@ function fitPaneWhenStable(p, opts){
   // a pane closed mid-settle keeps the timer's closure-captured `p`
   // alive for up to 10 s.
   let stuckTimer = setTimeout(() => {
-    p._fitInFlight = false;
+    if (p._fitToken === token) { p._fitInFlight = false; p._fitToken = null; }
     p._stuckTimer = null;
+    _drainPendingSettled(p);
   }, 10000);
   p._stuckTimer = stuckTimer;
   let shouldFlush = !opts || opts.flush !== false;
-  let onSettled = (opts && opts.onSettled) || null;
+  let owns = () => p._fitInFlight && p._fitToken === token && panes[p.id] === p;
   let release = () => {
     clearTimeout(stuckTimer);
     if (p._stuckTimer === stuckTimer) p._stuckTimer = null;
-    p._fitInFlight = false;
+    if (p._fitToken === token) { p._fitInFlight = false; p._fitToken = null; }
   };
+  // Aborted exits still resume whoever was waiting (the stream restart
+  // matters more than a perfect fit).
+  let abort = () => { release(); _drainPendingSettled(p); };
   let f = FONTS[settings.font];
   let webfont = f && f[1];
   // `document.fonts.load(spec)` actively triggers the load AND resolves
@@ -4707,7 +4734,7 @@ function fitPaneWhenStable(p, opts){
         .then(() => document.fonts.ready)
     : Promise.resolve();
   waitFont.then(() => {
-    if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
+    if (!owns()) { abort(); return; }
     // Invalidate xterm's CharSizeService cache via a no-op fontFamily
     // round-trip. xterm v5's options setter has a value-equality
     // short-circuit (`rawOptions[k] !== v && fire(k)`), so the
@@ -4734,14 +4761,14 @@ function fitPaneWhenStable(p, opts){
     // (~130 ms total, imperceptible).
     let attempts = 0, lastCols = -1;
     let step = () => {
-      if (!p._fitInFlight || panes[p.id] !== p) { release(); return; }
+      if (!owns()) { abort(); return; }
       forceMeasure();
       try { p.fitAddon.fit(); } catch(e){}
       let cols = p.term.cols;
       if (cols === lastCols || attempts >= 8) {
         release();
         if (shouldFlush) flushPaneResize(p);
-        if (onSettled) onSettled(p);
+        _drainPendingSettled(p);
         return;
       }
       lastCols = cols;
@@ -4749,7 +4776,7 @@ function fitPaneWhenStable(p, opts){
       requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-  }).catch(() => { release(); });
+  }).catch(() => { abort(); });
 }
 
 // Periodic drift watchdog. Even with the settle loop, edge cases can
