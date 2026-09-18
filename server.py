@@ -558,7 +558,7 @@ def _validate_tmux_options(body):
             continue
         try:
             iv = int(body.get(key))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if lo <= iv <= hi:
             out.append((opt, str(iv)))
@@ -1646,11 +1646,14 @@ def authorize_target(host, port, username, is_saved, conn_hint=None):
 # ─── Validation ──────────────────────────────────────────────────────
 
 def clamp(value, lo, hi, default):
-    """Parse int and clamp to range. Returns default on failure."""
+    """Parse int and clamp to range. Returns default on failure.
+    OverflowError: JSON `1e400` parses to float('inf'), and int(inf)
+    raises that rather than ValueError - it was an unhandled traceback
+    (dropped connection) on /api/connect and /api/save."""
     try:
         v = int(value)
         return max(lo, min(hi, v))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return default
 
 
@@ -3388,6 +3391,14 @@ class Handler(BaseHTTPRequestHandler):
         self._unsolicited_seen = total
         return False
 
+    # Set once the status line is on the wire, so the _dispatch backstop
+    # knows whether a 500 can still be sent.
+    _headers_sent = False
+
+    def send_response(self, code, message=None):
+        self._headers_sent = True
+        BaseHTTPRequestHandler.send_response(self, code, message)
+
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
         self.send_response(status)
@@ -3579,7 +3590,22 @@ class Handler(BaseHTTPRequestHandler):
         if name is None:
             self._json({"error": "not found"}, 404)
             return
-        getattr(self, name)()
+        try:
+            getattr(self, name)()
+        except Exception as e:
+            # Last line of defence. An exception escaping a handler used
+            # to reach the worker's handle_error: traceback on stderr,
+            # socket closed, and the client saw an aborted connection
+            # with no status at all (e.g. PermissionError from
+            # _save_creds_atomic when the creds dir is unwritable). Reply
+            # 500 if the headers have not gone out yet; either way, log.
+            _log("ERROR", "unhandled error in {} for {}: {}: {}".format(
+                name, self._client_ip(), type(e).__name__, e))
+            if not getattr(self, "_headers_sent", False):
+                try:
+                    self._json({"error": "internal error"}, 500)
+                except Exception:
+                    pass
 
     def do_POST(self):
         if self._csrf_gate() or self._auth_gate():
