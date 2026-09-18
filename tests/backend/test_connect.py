@@ -942,6 +942,33 @@ class TestConnectValidation(LiveServerCase):
         # fail validation.
         self.assertNotEqual(code, 400)
 
+    def test_destination_syntax_in_host_rejected(self):
+        """`user@host` / `ssh://...` are what ssh parses as a destination
+        but getaddrinfo() cannot resolve - the deny-list used to fall
+        open on exactly these. They must be a 400 before any policy."""
+        for host in ("bob@127.0.0.1", "ssh://bob@127.0.0.1",
+                     "host:22", "a b", "x$(id)y", "h/path", "-oFoo=bar"):
+            body, code = self._post("/api/connect", {
+                "host": host, "username": "u", "password": "p",
+                "cols": 80, "rows": 24})
+            self.assertEqual(code, 400, host)
+            self.assertIn("invalid host", body["error"])
+
+    def test_username_with_shell_or_space_rejected(self):
+        for user in ("a b", "a$(id)", "-l", "a\\b", "u\nx"):
+            body, code = self._post("/api/connect", {
+                "host": "example.com", "username": user, "password": "p",
+                "cols": 80, "rows": 24})
+            self.assertEqual(code, 400, repr(user))
+
+    def test_plain_hosts_and_ip_literals_pass_validation(self):
+        for host in ("example.com", "my_alias", "10.0.0.1", "[::1]", "::1",
+                     "fe80::1%eth0"):
+            body, code = self._post("/api/connect", {
+                "host": host, "username": "alice@corp", "password": "p",
+                "cols": 80, "rows": 24})
+            self.assertNotEqual(code, 400, (host, body))
+
     def test_non_persistent_ignores_slot_id(self):
         """Without persistent flag, any slot_id value is ignored."""
         body, code = self._post("/api/connect", {

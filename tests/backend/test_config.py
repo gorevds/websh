@@ -714,6 +714,19 @@ class TestDeniedHosts(unittest.TestCase):
         with self._patched_resolve("127.5.5.5"):
             self.assertFalse(server.is_host_allowed("loopback.example", 22, "u"))
 
+    def test_userinfo_prefix_cannot_bypass_deny_list(self):
+        """Regression: `bob@127.0.0.1` made getaddrinfo() fail, the
+        resolver returned [] and _is_denied_host fell open while ssh
+        happily parsed the user@ form. The HTTP layer now rejects such
+        syntax outright; this pins that the validator itself is what
+        stands in the way (the deny-list alone still falls open)."""
+        self.assertFalse(server._valid_host("bob@127.0.0.1"))
+        self.assertFalse(server._valid_host("ssh://bob@127.0.0.1"))
+        self.assertTrue(server._valid_host("127.0.0.1"))
+        self.assertTrue(server._valid_host("[::1]"))
+        self.assertFalse(server._valid_host("[]"))
+        self.assertFalse(server._valid_host(""))
+
     def test_dns_resolves_to_denied_range_blocked(self):
         """The whole point: hostname looks innocent, but A record points
         into a denied range → blocked."""
