@@ -4122,11 +4122,12 @@ class Handler(BaseHTTPRequestHandler):
     # ── I/O endpoints (input / output / stream / resize) ────────────
 
     def _input(self):
-        try:
-            raw = self._body()
-            body = json.loads(raw.decode("utf-8"))
-        except Exception as e:
-            self._json({"error": "invalid json: " + str(e)}, 400)
+        # The one JSON handler that used to parse its own body: a valid-
+        # JSON non-object ([1,2], "str") reached body.get() outside the
+        # try and the AttributeError dropped the connection with no
+        # response. _json_body() covers that and the media-type gate.
+        body = self._json_body()
+        if body is None:
             return
 
         sid = body.get("session_id", "")
@@ -4135,8 +4136,11 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            data = body.get("data", "").encode("utf-8")
-            ok = session.write(data)
+            data = body.get("data", "")
+            if not isinstance(data, str):
+                self._json({"error": "data must be a string"}, 400)
+                return
+            ok = session.write(data.encode("utf-8"))
             self._json({"ok": ok, "alive": session.alive})
         except Exception as e:
             self._json({"error": "input error: " + str(e)}, 500)

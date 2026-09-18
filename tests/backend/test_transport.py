@@ -186,9 +186,14 @@ class TestHTTPApi(LiveServerCase):
         Previously body.get() raised AttributeError and the client saw a
         dropped connection with no response at all."""
         for payload in ([1, 2, 3], "just a string", 42, None, True):
-            body, code = self._post("/api/resize", payload)
-            self.assertEqual(code, 400, "payload %r" % (payload,))
-            self.assertEqual(body.get("error"), "invalid json")
+            for path in ("/api/resize", "/api/input"):
+                body, code = self._post(path, payload)
+                self.assertEqual(code, 400, "%s payload %r" % (path, payload))
+                self.assertEqual(body.get("error"), "invalid json")
+        # And a non-string `data` is a 400, not a 500 from .encode().
+        body, code = self._post("/api/input",
+                                {"session_id": "x", "data": [1]})
+        self.assertIn(code, (400, 404))
 
 
     def test_stream_on_placeholder_session_404s_not_500(self):
