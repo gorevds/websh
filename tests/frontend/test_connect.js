@@ -6162,6 +6162,31 @@ test('file browser: a hostile filename cannot inject attributes or markup (esc +
   cleanup(env);
 });
 
+test('file browser: cancelling a delete keeps the Rename button working', async () => {
+  // askFbDelete's done() restored the row's innerHTML but re-wired only
+  // the delete button. The next click on the orphaned pencil bubbled to
+  // the row itself, which closed the browser and started a download.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  let row = rowFor(win, 'mid.txt');
+  row.querySelector('[data-fb-del]').click();
+  ok(row.classList.contains('fb-confirm'), 'delete confirm armed');
+  row.querySelector('.fb-cf-no').click();
+  ok(!row.classList.contains('fb-confirm'), 'delete confirm cancelled');
+  row.querySelector('[data-fb-ren]').click();
+  await sleep(10);
+  ok(row.classList.contains('fb-edit'), 'pencil still opens the rename editor');
+  ok(!$(win, 'fbOv').hidden, 'browser stayed open (no download was started)');
+  ok(env.log.filter(e => e.action === 'ls').length === 1, 'no navigation happened');
+  // Symmetric: cancel rename, then delete still works.
+  row.querySelector('.fb-ed-no').click();
+  row.querySelector('[data-fb-del]').click();
+  ok(row.classList.contains('fb-confirm'), 'delete still arms after a rename cancel');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

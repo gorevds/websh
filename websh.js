@@ -4099,8 +4099,7 @@ function renderFbEntries(entries, absPath) {
         if (id) startFastDownload(id, fullPath);
       });
     }
-    wireFbDelete(row, fullPath, e.name);
-    wireFbRename(row, fullPath, e.name, e.type);
+    wireFbRow(row, fullPath, e.name, e.type);
     list.appendChild(row);
   }
   if (!entries.length) {
@@ -4228,18 +4227,28 @@ function syncFbSortUi() {
 // fight the file browser's own focus trap for Escape and Tab, and a
 // window.confirm() blocks the SSE pump; swapping the row's contents
 // costs neither and keeps the target filename in front of the user.
-function wireFbDelete(row, fullPath, name) {
+// Both inline editors (delete confirm, rename) swap the row's innerHTML
+// out and back, which drops every listener on the buttons - so every
+// restore must re-wire BOTH. One helper, so neither `done()` can forget
+// one: the delete editor used to re-wire only its own button, and the
+// orphaned Rename click then bubbled to the row and downloaded the file.
+function wireFbRow(row, fullPath, name, type) {
+  wireFbDelete(row, fullPath, name, type);
+  wireFbRename(row, fullPath, name, type);
+}
+
+function wireFbDelete(row, fullPath, name, type) {
   let btn = row.querySelector('[data-fb-del]');
   if (!btn) return;
   btn.addEventListener('click', ev => {
     // Without this the row's own handler would start a download of the
     // very file we are asking about.
     ev.stopPropagation();
-    askFbDelete(row, fullPath, name);
+    askFbDelete(row, fullPath, name, type);
   });
 }
 
-function askFbDelete(row, fullPath, name) {
+function askFbDelete(row, fullPath, name, type) {
   if (row.classList.contains('fb-confirm')) return;
   cancelFbConfirm();
   let restore = row.innerHTML;
@@ -4252,7 +4261,7 @@ function askFbDelete(row, fullPath, name) {
     _fbConfirm = null;
     row.classList.remove('fb-confirm');
     row.innerHTML = restore;
-    wireFbDelete(row, fullPath, name);
+    wireFbRow(row, fullPath, name, type);
   };
   _fbConfirm = done;
   row.querySelector('.fb-cf-no').addEventListener('click', ev => {
@@ -4351,8 +4360,7 @@ function askFbRename(row, fullPath, name, type) {
     _fbConfirm = null;
     row.classList.remove('fb-edit');
     row.innerHTML = restore;
-    wireFbDelete(row, fullPath, name);
-    wireFbRename(row, fullPath, name, type);
+    wireFbRow(row, fullPath, name, type);
   };
   _fbConfirm = done;
   let commit = () => {
