@@ -3215,16 +3215,47 @@ class Handler(BaseHTTPRequestHandler):
             sock.settimeout(0.0)
             try:
                 peek = sock.recv(1, socket.MSG_PEEK)
+                if peek == b"":
+                    return True
+                return self._consume_unsolicited(sock)
             finally:
                 try:
                     sock.settimeout(prev)
                 except OSError:
                     pass
-            return peek == b""
         except (BlockingIOError, InterruptedError):
             return False
         except OSError:
             return True
+
+    # Unsolicited bytes tolerated per request before the peer is treated
+    # as broken. Nothing legitimate sends anything after the request on
+    # this HTTP/1.0 close-after-response server.
+    _UNSOLICITED_MAX = 1024 * 1024
+
+    def _consume_unsolicited(self, sock):
+        """Called when the peer sent bytes we will never read. The socket
+        must not stay readable: both wake paths in wait_for_data treat a
+        readable client socket as a wake reason, and _client_gone() only
+        reports EOF, so one stray byte turned /api/stream into a 100%-CPU
+        loop for the life of the session. Read the bytes away (socket is
+        already non-blocking here); past a generous total budget, report
+        the peer as gone. Returns True when the request should end."""
+        total = getattr(self, "_unsolicited_seen", 0)
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            if not chunk:
+                return True
+            total += len(chunk)
+            if total > self._UNSOLICITED_MAX:
+                _log("WARN", "closing {}: {} unsolicited bytes on the "
+                     "request socket".format(self._client_ip(), total))
+                return True
+        self._unsolicited_seen = total
+        return False
 
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")

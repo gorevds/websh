@@ -554,6 +554,55 @@ class TestHTTPApi(LiveServerCase):
         finally:
             a.close(); b.close()
 
+    def test_unsolicited_bytes_do_not_spin_the_wait_loop(self):
+        """Regression: one stray byte from the peer made the client socket
+        permanently readable. Both wait_for_data() wake paths treat that
+        as a wake reason and _client_gone() only reported EOF, so
+        /api/stream returned instantly from every wait - 97% of a core
+        per connection for the life of the session. _client_gone() now
+        consumes the bytes; the next wait must block for its full
+        timeout again."""
+        import socket as _socket
+        import selectors as _sel
+        a, b = _socket.socketpair()
+        sel = _sel.DefaultSelector()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            s = server.SSHSession.__new__(server.SSHSession)
+            s._data_event = threading.Event()
+            s._waiters = set()
+            s._waiters_lock = threading.Lock()
+            sel.register(a, _sel.EVENT_READ)
+            b.send(b"X")
+            time.sleep(0.02)
+            self.assertFalse(h._client_gone(), "a stray byte is not a FIN")
+            t0 = time.time(); n = 0
+            while time.time() - t0 < 0.3:
+                s.wait_for_data(a, 0.3, selector=sel)
+                n += 1
+            self.assertLessEqual(
+                n, 3, "wait_for_data returned %d times in 0.3s: spinning" % n)
+        finally:
+            sel.close(); a.close(); b.close()
+
+    def test_unsolicited_bytes_over_budget_end_the_request(self):
+        import socket as _socket
+        a, b = _socket.socketpair()
+        try:
+            h = server.Handler.__new__(server.Handler)
+            h.connection = a
+            h.client_address = ("127.0.0.1", 1)
+            h.headers = {}
+            h._client_ip = lambda: "127.0.0.1"
+            h._unsolicited_seen = server.Handler._UNSOLICITED_MAX
+            b.send(b"Y")
+            time.sleep(0.02)
+            self.assertTrue(h._client_gone(),
+                            "peer past the unsolicited-byte budget must be gone")
+        finally:
+            a.close(); b.close()
+
     def test_session_unread_prepends(self):
         """Session.unread() must push bytes back to the FRONT of the
         buffer so they're delivered in original order on the next read."""
