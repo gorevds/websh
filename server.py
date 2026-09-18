@@ -50,6 +50,8 @@ import base64
 import binascii
 import datetime
 import fcntl
+import gzip
+import hashlib
 import ipaddress
 import json
 import os
@@ -663,6 +665,46 @@ _STATIC_FILES = {
     "/websh.js": ("websh.js", "application/javascript; charset=utf-8"),
     "/assets/websh-logo.svg": ("assets/websh-logo.svg", "image/svg+xml"),
 }
+
+
+# Static bytes, their gzip and a content ETag, recomputed only when the
+# file's (mtime, size) changes - so a deploy that replaces websh.js is
+# served (and re-tagged) on the next request without a restart.
+_static_cache = {}
+_static_cache_lock = Lock()
+
+
+def _static_blob(filepath):
+    st = os.stat(filepath)
+    key = (st.st_mtime_ns, st.st_size)
+    with _static_cache_lock:
+        hit = _static_cache.get(filepath)
+        if hit and hit[0] == key:
+            return hit[1]
+    with open(filepath, "rb") as f:
+        data = f.read()
+    gz = gzip.compress(data, 6) if len(data) > 1024 else None
+    etag = '"' + hashlib.sha256(data).hexdigest()[:20] + '"'
+    blob = (data, gz, etag)
+    with _static_cache_lock:
+        _static_cache[filepath] = (key, blob)
+    return blob
+
+
+def _accepts_gzip(header):
+    """True when Accept-Encoding lists gzip (or *) without q=0."""
+    for part in header.lower().split(","):
+        bits = [b.strip() for b in part.split(";")]
+        if bits[0] not in ("gzip", "*"):
+            continue
+        q = [b for b in bits[1:] if b.startswith("q=")]
+        try:
+            if q and float(q[0][2:]) == 0:
+                continue
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 def _log(level, msg):
@@ -3508,15 +3550,36 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        with open(filepath, "rb") as f:
-            data = f.read()
+        data, gz, etag = _static_blob(filepath)
+        # Negotiate gzip. websh.js is ~230 KB raw / ~75 KB gzipped and was
+        # re-sent in full on every page load: no compression, no
+        # validator, Cache-Control: no-cache. no-cache stays (a deploy
+        # must be picked up immediately) but now revalidates cheaply:
+        # a matching If-None-Match gets a body-less 304.
+        use_gz = gz is not None and _accepts_gzip(
+            self.headers.get("Accept-Encoding", ""))
+        tag = etag[:-1] + '-gz"' if use_gz else etag
+        inm = self.headers.get("If-None-Match", "")
+        if inm and (inm.strip() == "*" or tag in
+                    [t.strip().replace("W/", "", 1) for t in inm.split(",")]):
+            self.send_response(304)
+            self.send_header("ETag", tag)
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Vary", "Accept-Encoding")
+            self.end_headers()
+            return
+        body = gz if use_gz else data
         self.send_response(200)
         self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Length", str(len(body)))
+        if use_gz:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("ETag", tag)
         self.send_header("Cache-Control", "no-cache")
         self._send_security_headers()
         self.end_headers()
-        self.wfile.write(data)
+        self.wfile.write(body)
 
     # Content-Security-Policy + companions for the credential-handling page.
     # The policy permits exactly what the app already loads (self, the
