@@ -6472,6 +6472,29 @@ test('api(): a non-JSON reply becomes a readable error, not "Unexpected token <"
   cleanup(env);
 });
 
+test('file browser: header names the host; delete/rename say folder vs file', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  p.user = 'alice'; p.host = 'prod.example';
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok($(win, 'fbHost').textContent === 'alice@prod.example' && !$(win, 'fbHost').hidden,
+     'user@host shown; got ' + $(win, 'fbHost').textContent);
+  const d = rowFor(win, 'adir');
+  d.querySelector('[data-fb-del]').click();
+  ok(/Delete folder/.test(d.textContent) && /only if empty/.test(d.textContent),
+     'folder confirm says folder + non-recursive; got ' + d.textContent);
+  d.querySelector('.fb-cf-no').click();
+  const f = rowFor(win, 'zeta.txt');
+  f.querySelector('[data-fb-del]').click();
+  ok(/Delete zeta\.txt\?/.test(f.textContent) && !/only if empty/.test(f.textContent),
+     'file confirm stays plain');
+  f.querySelector('.fb-cf-yes').click();
+  await sleep(40);
+  ok(/Deleted zeta\.txt/.test(win.document.body.textContent), 'file toast');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {

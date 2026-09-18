@@ -3985,6 +3985,16 @@ function showFileBrowser(id) {
   let p = panes[id];
   if (!p || !p.sid) return;
   _fbId = id;
+  // Which machine this is. The browser can delete and rename, and with
+  // several panes open (or after a nested ssh changed OSC 7) the rows
+  // alone don't say which host they live on.
+  let hostEl = $('fbHost');
+  if (hostEl) {
+    let who = (p.user ? p.user + '@' : '') + (p.host || '');
+    hostEl.textContent = who;
+    hostEl.title = who ? 'Files on ' + who : '';
+    hostEl.hidden = !who;
+  }
   // A fresh open never shows another pane's rows: clear the previous
   // listing (and invalidate its in-flight request) before the first
   // load, so the keep-while-loading logic has nothing stale to keep.
@@ -4400,8 +4410,13 @@ function askFbDelete(row, fullPath, name, type) {
   cancelFbConfirm();
   let restore = row.innerHTML;
   row.classList.add('fb-confirm');
+  // Say what kind of thing is about to go. A folder is removed only
+  // when empty (rmdir, never recursive) - say that up front instead of
+  // letting the user find out from an error.
+  let what = type === 'd' ? 'folder ' : type === 'l' ? 'link ' : '';
+  let note = type === 'd' ? ' <span class="fb-cf-note">(only if empty)</span>' : '';
   row.innerHTML =
-    '<span class="fb-cf-q">Delete <b>' + esc(name) + '</b>?</span>' +
+    '<span class="fb-cf-q">Delete ' + what + '<b>' + esc(name) + '</b>?' + note + '</span>' +
     '<button type="button" class="fb-cf-no">Cancel</button>' +
     '<button type="button" class="fb-cf-yes">Delete</button>';
   let done = () => {
@@ -4425,7 +4440,7 @@ function askFbDelete(row, fullPath, name, type) {
   row.querySelector('.fb-cf-yes').addEventListener('click', ev => {
     ev.stopPropagation();
     _fbConfirm = null;
-    doFbDelete(row, fullPath, name, done);
+    doFbDelete(row, fullPath, name, done, type);
   });
   // The button that opened this strip was just destroyed by the
   // innerHTML swap, so a keyboard user's focus would fall to <body> and
@@ -4434,14 +4449,19 @@ function askFbDelete(row, fullPath, name, type) {
   try { row.querySelector('.fb-cf-no').focus(); } catch (e) {}
 }
 
-function doFbDelete(row, fullPath, name, undo) {
+function fbKindLabel(type) {
+  return type === 'd' ? 'folder ' : type === 'l' ? 'link ' : '';
+}
+
+function doFbDelete(row, fullPath, name, undo, type) {
   let p = fbSessionForAction();
   if (!p) return;
   row.innerHTML = '<span class="fb-cf-q">Deleting ' + esc(name) + '…</span>';
   api('rm', {body: {session_id: p.sid, path: fullPath}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
-      showToast((r && r.already_gone ? 'Already deleted: ' : 'Deleted ') + name, 'ok');
+      showToast((r && r.already_gone ? 'Already deleted: ' : 'Deleted ') +
+                fbKindLabel(type) + name, 'ok');
       // Re-list rather than dropping the row locally: the directory may
       // have changed for other reasons, and a delete already costs one
       // roundtrip.
@@ -4549,7 +4569,7 @@ function askFbRename(row, fullPath, name, type) {
     if (next.indexOf('/') >= 0) {
       showToast('Name cannot contain "/"', 'err'); return;
     }
-    doFbRename(row, fullPath, next, done);
+    doFbRename(row, fullPath, next, done, type);
   };
   row.querySelector('.fb-ed-no').addEventListener('click', ev => {
     ev.stopPropagation(); done();
@@ -4571,14 +4591,14 @@ function askFbRename(row, fullPath, name, type) {
   } catch (e) {}
 }
 
-function doFbRename(row, fullPath, newName, undo) {
+function doFbRename(row, fullPath, newName, undo, type) {
   let p = fbSessionForAction();
   if (!p) return;
   row.innerHTML = '<span class="fb-cf-q">Renaming…</span>';
   api('mv', {body: {session_id: p.sid, path: fullPath, name: newName}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
-      showToast('Renamed to ' + newName, 'ok');
+      showToast('Renamed ' + fbKindLabel(type) + 'to ' + newName, 'ok');
       reloadFbDir();
     })
     .catch(e => {
@@ -4645,7 +4665,7 @@ function doFbMkdir(row, name, undo) {
   api('mkdir', {body: {session_id: p.sid, path: full}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);
-      showToast('Created ' + name, 'ok');
+      showToast('Created folder ' + name, 'ok');
       reloadFbDir();
     })
     .catch(e => {

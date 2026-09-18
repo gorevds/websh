@@ -242,6 +242,8 @@
     /* .panel-close is absolutely positioned for the other panels; here it
        belongs in the header row, not in the page's top-right corner. */
     .fb-hd .panel-close{position:static;flex-shrink:0;margin-left:auto}
+    .fb-host{flex-shrink:1;min-width:0;max-width:40%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:11px;color:var(--ac);border:1px solid var(--bd);border-radius:4px;padding:2px 7px}
+    .fb-cf-note{color:var(--dim);font-size:11px}
     /* Breadcrumb path. Scrolls horizontally on a deep path rather than
        ellipsising, so every segment stays clickable; min-width:0 keeps
        it from shoving the close button off the row. */
@@ -575,6 +577,7 @@
       <button class="fb-up" onclick="fbUp()" title="Parent directory" aria-label="Parent directory">&#x2191;</button>
       <!-- Clickable path segments (breadcrumbs), rendered by setFbPath.
            data-path carries the full resolved path for scripts/tests. -->
+      <span class="fb-host" id="fbHost" hidden></span>
       <nav class="fb-path" id="fbPath" aria-label="Current path"></nav>
       <button class="panel-close" onclick="closeFb()" title="Close" aria-label="Close file browser">&#x00D7;</button>
     </div>
