@@ -86,7 +86,12 @@ abuse-relevant event. Records are stable single-line JSON suitable for
 `fail2ban` filters and ad-hoc `jq` pipelines. The value is normalised
 at startup: `~` expands and a relative path resolves against the
 server's cwd. The resolved path is logged once at startup
-(`access log: <abs-path>`).
+(`access log: <abs-path>`), and the server **refuses to start** if
+the file cannot be opened for append — a security log that silently
+is not written is worse than a server that does not come up. Under
+the bundled systemd units (`ProtectSystem=strict`) the writable homes
+are `/var/log/websh*` (`LogsDirectory=`) and `/var/lib/websh*`
+(`StateDirectory=`); the same applies to `WEBSH_RECORD_DIR`.
 
 ```json
 {"ts":"2026-05-07T12:34:56.789012Z","event":"connect","ip":"203.0.113.7","result":"deny_blocked","target_host":"10.5.6.7","target_user":"root"}

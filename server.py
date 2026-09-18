@@ -5311,7 +5311,27 @@ def main():
     t = Thread(target=_cleanup_loop, daemon=True)
     t.start()
 
-    server = Server((HOST, PORT), Handler)
+    try:
+        server = Server((HOST, PORT), Handler)
+    except OSError as e:
+        # A port collision (two template instances sharing one PORT, or
+        # the single-instance unit's 8765) used to be a raw traceback
+        # that systemd restarted every 5 s forever. Say what happened.
+        _log("ERROR", "cannot bind {}:{}: {}".format(HOST, PORT, e))
+        raise SystemExit(1)
+    # WEBSH_ACCESS_LOG is a security control: a log that silently is not
+    # written is worse than a server that refuses to start. Prove the
+    # path is writable now rather than WARN on every event later.
+    if ACCESS_LOG_PATH:
+        try:
+            fd = os.open(ACCESS_LOG_PATH,
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+            os.close(fd)
+        except OSError as e:
+            _log("ERROR", "refusing to start: WEBSH_ACCESS_LOG={} is not "
+                 "writable: {} (under the bundled systemd unit, put it "
+                 "under /var/log/websh*)".format(ACCESS_LOG_PATH, e))
+            raise SystemExit(1)
 
     stop_event = Event()
 
