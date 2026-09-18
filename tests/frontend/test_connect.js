@@ -6104,6 +6104,39 @@ test('transportFatal no-ops on a torn-down transport (stale reconnect guard, #13
   cleanup(env);
 });
 
+test('file browser: a hostile filename cannot inject attributes or markup (esc + DOM API)', async () => {
+  // esc() used to be textContent->innerHTML, which escapes & < > but not
+  // quotes, and the row's Rename/Delete buttons interpolated esc(name)
+  // INSIDE an aria-label="..." attribute. A remote file named
+  //   pwn" onmouseover="..." data-x="
+  // therefore rendered a live event handler in the websh origin.
+  const evil = 'pwn" onmouseover="window.__PWNED=1" data-x="';
+  const evil2 = "<img src=x onerror=\"window.__PWNED=2\">'.txt";
+  const entries = [
+    {name: evil,  type: 'f', size: 1, mtime: 1000},
+    {name: evil2, type: 'f', size: 1, mtime: 2000},
+  ];
+  const env = await mkEnv(FB_PLAN(entries, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  ok(win.__PWNED === undefined, 'no injected handler ran at render');
+  ok($(win, 'fbList').querySelector('[onmouseover],[onerror],img') === null,
+     'no injected attribute/element anywhere in the list');
+  for (const n of [evil, evil2]) {
+    const row = rowFor(win, n);
+    ok(!!row, 'row rendered for ' + JSON.stringify(n));
+    const ren = row.querySelector('[data-fb-ren]');
+    ok(ren.getAttribute('aria-label') === 'Rename ' + n,
+       'aria-label carries the full verbatim name; got ' + ren.getAttribute('aria-label'));
+    ok(!ren.hasAttribute('onmouseover') && !ren.hasAttribute('data-x'),
+       'no attribute smuggled onto the button');
+    ok(row.querySelector('.fb-nm').textContent === n, 'name shown verbatim as text');
+  }
+  ok(win.esc('a"b\'c<d>&') === 'a&quot;b&#39;c&lt;d&gt;&amp;', 'esc() escapes quotes too');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
