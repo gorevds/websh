@@ -6541,6 +6541,38 @@ test('drag-and-drop: files dropped on a pane upload; folders and busy panes are 
   cleanup(env);
 });
 
+test('reconnecting is shown on the pane while the transport retries, and cleared on recovery', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 's-rc', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  ok(!p.el.querySelector('.pane-reconnect'), 'no banner while healthy');
+  // A transient transport failure inside the budget.
+  p.firstFailureAt = Date.now();
+  win.setReconnecting(p, true);
+  const b = p.el.querySelector('.pane-reconnect');
+  ok(b && /reconnecting/.test(b.textContent) && /\(\d+ s\)/.test(b.textContent),
+     'banner with time left; got ' + (b && b.textContent));
+  const badge = p.el.querySelector('[data-pane-badge]');
+  ok(/Reconnecting/.test(badge.textContent) && /s-wait/.test(badge.className),
+     'badge says Reconnecting; got ' + badge.textContent);
+  // A real frame arrives -> retry clock cleared -> banner gone.
+  win.clearRetryClock(p);
+  ok(!p.el.querySelector('.pane-reconnect'), 'banner removed on recovery');
+  ok(/Connected/.test(badge.textContent), 'badge back to Connected');
+  ok(!p._reconnTimer, 'countdown timer stopped');
+  // Budget exhausted -> transportFatal takes over and removes the banner.
+  win.setReconnecting(p, true);
+  p.term.write = () => {};
+  win.transportFatal(p, new Error('x'));
+  ok(!p.el.querySelector('.pane-reconnect'), 'banner removed when giving up');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
