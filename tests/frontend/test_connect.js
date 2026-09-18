@@ -5669,6 +5669,29 @@ test('OSC 7 tracks the remote working directory', async () => {
   cleanup(env);
 });
 
+test('OSC 7 from another host (nested ssh, cat of a file) does not move the cwd', async () => {
+  const env = await mkEnv(FB_PLAN()); const win = env.win;
+  const p = await _onePane(win);
+  p.term.parser._fireOsc(7, 'file://prod/home/alice/app');
+  ok(p.cwd === '/home/alice/app' && p.osc7Host === 'prod', 'first report pins the host');
+  // `ssh db` inside the pane: the nested shell reports ITS directory.
+  ok(p.term.parser._fireOsc(7, 'file://db/var/lib/postgresql') === true, 'consumed (not echoed)');
+  ok(p.cwd === '/home/alice/app', 'foreign host ignored; got ' + p.cwd);
+  // Back in the outer shell: its own reports apply again (host match is case-insensitive).
+  p.term.parser._fireOsc(7, 'file://PROD/srv');
+  ok(p.cwd === '/srv', 'own host applies again; got ' + p.cwd);
+  // Query/fragment are not part of the path; control characters are refused.
+  p.term.parser._fireOsc(7, 'file://prod/srv/www?x=1#frag');
+  ok(p.cwd === '/srv/www', 'query/fragment stripped; got ' + p.cwd);
+  ok(p.term.parser._fireOsc(7, 'file://prod/tmp/a%0Ab') === false, 'newline in path refused');
+  ok(p.term.parser._fireOsc(7, 'file://prod/tmp/a%1Bb') === false, 'ESC in path refused');
+  ok(p.cwd === '/srv/www', 'refused payloads left cwd untouched');
+  // A new session re-learns its host.
+  win.endSession(p, {});
+  ok(p.osc7Host === null && p.cwd === '', 'endSession resets cwd and the pinned host');
+  cleanup(env);
+});
+
 test('file browser opens at the OSC 7 cwd, without asking the server', async () => {
   const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/srv/app')); const win = env.win;
   const p = await _onePane(win);

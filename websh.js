@@ -458,10 +458,26 @@ function createPane(container) {
       if (!data || data.length > 4096 || data.slice(0, 7) !== 'file://') return false;
       let slash = data.indexOf('/', 7);
       if (slash < 0) return false;
+      let host = data.slice(7, slash).toLowerCase();
+      // Query/fragment are not part of a path: `file://h/srv?x#y` used
+      // to become the directory "/srv?x#y".
+      let raw = data.slice(slash).split(/[?#]/)[0];
       let path;
-      try { path = decodeURIComponent(data.slice(slash)); }
+      try { path = decodeURIComponent(raw); }
       catch (e) { return false; }
-      if (path.charAt(0) !== '/' || path.indexOf('\x00') >= 0) return false;
+      // No control characters at all (NUL, newline, ESC...): a path the
+      // file browser then lists and offers delete buttons in must be a
+      // plain one.
+      if (path.charAt(0) !== '/' || /[\x00-\x1f\x7f]/.test(path)) return false;
+      // The host part used to be discarded, so a nested `ssh other-box`,
+      // a `docker exec`, or merely `cat`-ing a file containing an OSC 7
+      // sequence moved the file browser's start directory - which then
+      // opened that path on THIS pane's host, with delete buttons. Pin
+      // the host of the first OSC 7 this session sees (the shell ssh
+      // landed in) and ignore reports from any other host; when the
+      // nested session exits, the outer shell's own reports apply again.
+      if (p.osc7Host === undefined || p.osc7Host === null) p.osc7Host = host;
+      else if (host !== p.osc7Host) return true;     // consumed, not applied
       p.cwd = path;
       return true;
     });
@@ -1393,6 +1409,7 @@ function endSession(p, o) {
   // The tracked cwd belongs to the shell that just went away; a
   // reconnect starts somewhere else and must re-learn it.
   p.cwd = '';
+  p.osc7Host = null;     // a new session pins its own OSC 7 host
   clearTimeout(p.saveCommitTimer);
   p.saveCommitTimer = null;
   if (o.disconnect && sid) {
