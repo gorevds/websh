@@ -3338,6 +3338,16 @@ class Handler(BaseHTTPRequestHandler):
         body.get(), which previously blew up with AttributeError — a
         dropped connection — instead of the 400 the malformed-JSON case
         gets."""
+        # CSRF layer 2: a cross-site <form> can only send text/plain,
+        # urlencoded or multipart. Requiring the JSON media type means a
+        # forged form post never reaches a handler even if the Origin
+        # check in _csrf_gate() is somehow bypassed. The bundled client
+        # and the PHP shim both send application/json.
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0]
+        if ctype.strip().lower() != "application/json":
+            self._json({"error": "content-type must be application/json"},
+                       415)
+            return None
         try:
             body = json.loads(self._body().decode("utf-8"))
         except Exception:
@@ -3347,6 +3357,43 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "invalid json"}, 400)
             return None
         return body
+
+    def _csrf_gate(self):
+        """CSRF layer 1 for every state-changing method. A browser sends
+        `Origin` on every cross-site POST/DELETE (and on same-origin ones
+        too, in current engines), so an Origin whose host is not the
+        host this request was addressed to is a forged request: 403.
+        `Sec-Fetch-Site: cross-site` is the same signal from a browser
+        that omitted Origin. No Origin and no Sec-Fetch-Site means a
+        non-browser client (curl, the PHP shim, monitoring) - those are
+        not CSRF victims and pass. `Origin: null` (sandboxed iframe,
+        data: URL, some redirects) is rejected: nothing legitimate posts
+        to websh from there. Returns True when the reply was sent."""
+        origin = self.headers.get("Origin")
+        site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+        if origin is None:
+            if site in ("cross-site", "same-site"):
+                self._json({"error": "cross-site request refused"}, 403)
+                return True
+            return False
+        origin = origin.strip()
+        o_host = urllib.parse.urlsplit(origin).netloc.lower() \
+            if "://" in origin else ""
+        if not o_host:
+            self._json({"error": "cross-site request refused"}, 403)
+            return True
+        allowed = {(self.headers.get("Host") or "").strip().lower()}
+        # Behind a trusted reverse proxy the browser-facing host may only
+        # be visible in X-Forwarded-Host.
+        if self.client_address[0] in _TRUSTED_PROXIES:
+            fwd = (self.headers.get("X-Forwarded-Host") or "").split(",")[0]
+            if fwd.strip():
+                allowed.add(fwd.strip().lower())
+        allowed.discard("")
+        if o_host in allowed:
+            return False
+        self._json({"error": "cross-site request refused"}, 403)
+        return True
 
     def _path(self):
         p = self.path.split("?")[0].rstrip("/")
@@ -3455,7 +3502,7 @@ class Handler(BaseHTTPRequestHandler):
         getattr(self, name)()
 
     def do_POST(self):
-        if self._auth_gate():
+        if self._csrf_gate() or self._auth_gate():
             return
         self._dispatch(self._POST_ROUTES)
 
@@ -3473,7 +3520,7 @@ class Handler(BaseHTTPRequestHandler):
         self._dispatch(self._GET_ROUTES)
 
     def do_DELETE(self):
-        if self._auth_gate():
+        if self._csrf_gate() or self._auth_gate():
             return
         self._dispatch(self._DELETE_ROUTES)
 

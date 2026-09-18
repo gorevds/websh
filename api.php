@@ -55,6 +55,30 @@ if (!preg_match('/^[a-z_]{1,32}$/D', $action)) {
     exit;
 }
 
+// CSRF gate for state-changing methods. The shim forwards no browser
+// headers to the backend, so the backend's own Origin check never sees
+// a cross-site request that came through here - it must be enforced at
+// this hop. A browser sends Origin on every cross-site POST/DELETE; an
+// Origin whose host is not the host this request was addressed to is a
+// forged request. No Origin at all means a non-browser client (not a
+// CSRF victim) and passes; `Origin: null` never legitimately posts here.
+$method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
+if (($method === 'POST' || $method === 'DELETE') && isset($_SERVER['HTTP_ORIGIN'])) {
+    $o_host = strtolower((string) parse_url(trim($_SERVER['HTTP_ORIGIN']), PHP_URL_HOST));
+    $o_port = parse_url(trim($_SERVER['HTTP_ORIGIN']), PHP_URL_PORT);
+    if ($o_port) { $o_host .= ':' . $o_port; }
+    $allowed = array(strtolower(isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : ''));
+    if (!empty($_SERVER['HTTP_X_FORWARDED_HOST'])) {
+        $fwd = explode(',', $_SERVER['HTTP_X_FORWARDED_HOST']);
+        $allowed[] = strtolower(trim($fwd[0]));
+    }
+    if ($o_host === '' || !in_array($o_host, $allowed, true)) {
+        header('HTTP/1.1 403 Forbidden');
+        echo '{"error":"cross-site request refused"}';
+        exit;
+    }
+}
+
 // Auto-start: launch server.py if it's not running.
 ensure_backend($BACKEND, $WEBSH_CONFIG);
 

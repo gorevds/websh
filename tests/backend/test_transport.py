@@ -125,6 +125,61 @@ class TestHTTPApi(LiveServerCase):
         self.assertEqual(code, 404)
         self.assertIn("error", body)
 
+    def _post_hdr(self, path, body, headers):
+        h = {"Content-Type": "application/json"}
+        h.update(headers)
+        return self._request_json(path, data=json.dumps(body).encode(),
+                                  headers=h)
+
+    def test_cross_site_origin_is_refused(self):
+        """CSRF layer 1: a browser sends Origin on every cross-site POST.
+        An Origin host that is not the Host this request was addressed
+        to is a forged request - 403 before any handler runs."""
+        body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                    {"Origin": "https://evil.example"})
+        self.assertEqual(code, 403)
+        self.assertIn("cross-site", body["error"])
+        body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                    {"Origin": "null"})
+        self.assertEqual(code, 403)
+        body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                    {"Sec-Fetch-Site": "cross-site"})
+        self.assertEqual(code, 403)
+        code, _ = self._request_raw("/api/save?vault_id=A&conn_id=B",
+                                    method="DELETE",
+                                    headers={"Origin": "https://evil.example"})
+        self.assertEqual(code, 403)
+
+    def test_same_origin_and_non_browser_posts_pass_the_csrf_gate(self):
+        host = "127.0.0.1:%d" % self.port
+        for hdrs in ({"Origin": "http://" + host},
+                     {"Origin": "HTTP://" + host.upper()},
+                     {"Sec-Fetch-Site": "same-origin"},
+                     {}):
+            body, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                        hdrs)
+            self.assertNotEqual(code, 403, hdrs)
+
+    def test_forwarded_host_from_trusted_proxy_counts_as_origin(self):
+        body, code = self._post_hdr(
+            "/api/resize", {"session_id": "x"},
+            {"Origin": "https://websh.example",
+             "X-Forwarded-Host": "websh.example"})
+        # 127.0.0.1 is a trusted proxy by default.
+        self.assertNotEqual(code, 403, body)
+
+    def test_json_endpoints_require_json_content_type(self):
+        """CSRF layer 2: a cross-site <form enctype=text/plain> can carry
+        a JSON-looking body but never the application/json media type."""
+        body, code = self._request_json(
+            "/api/resize", data=b'{"session_id":"x"}',
+            headers={"Content-Type": "text/plain"})
+        self.assertEqual(code, 415)
+        body, code = self._request_json(
+            "/api/resize", data=b'{"session_id":"x"}',
+            headers={"Content-Type": "application/json; charset=utf-8"})
+        self.assertNotEqual(code, 415)
+
     def test_non_dict_json_body_returns_400(self):
         """_json_body must reject valid-JSON-but-not-an-object bodies
         (bare list/string/number) with the same 400 malformed JSON gets.
