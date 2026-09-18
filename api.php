@@ -16,7 +16,11 @@ if ($proto === 'http') {
     exit;
 }
 
-$action  = isset($_GET['action']) ? $_GET['action'] : '';
+// `?action[]=x` arrives as an array; PHP 8's preg_match() then throws
+// a TypeError - an uncaught fatal that, with display_errors on, prints
+// this file's absolute path to the client. Non-strings are simply "no
+// such action" (the regex gate below turns '' into a 404).
+$action  = (isset($_GET['action']) && is_string($_GET['action'])) ? $_GET['action'] : '';
 
 // SSE stream needs a longer execution window than the JSON endpoints.
 // Some shared hosts cap this hard, in which case the stream is killed
@@ -97,8 +101,16 @@ switch ($action) {
     case 'save_delete':
         // Browsers can't issue DELETE through form posts, so the
         // client POSTs here and we translate to a real backend DELETE.
-        $vault = isset($_GET['vault_id']) ? $_GET['vault_id'] : '';
-        $conn  = isset($_GET['conn_id'])  ? $_GET['conn_id']  : '';
+        // POST only: this is destructive, and a GET would make it
+        // reachable from an <img src>, a link prefetch or a scanner.
+        if ($method !== 'POST') {
+            header('HTTP/1.1 405 Method Not Allowed');
+            header('Allow: POST');
+            echo '{"error":"method not allowed"}';
+            break;
+        }
+        $vault = (isset($_GET['vault_id']) && is_string($_GET['vault_id'])) ? $_GET['vault_id'] : '';
+        $conn  = (isset($_GET['conn_id'])  && is_string($_GET['conn_id']))  ? $_GET['conn_id']  : '';
         proxy_delete($BACKEND . '/api/save'
             . '?vault_id=' . urlencode($vault)
             . '&conn_id='  . urlencode($conn));
