@@ -538,7 +538,8 @@ function activatePane(id) {
 function updatePaneBadge(p) {
   let badge = p.el.querySelector('[data-pane-badge]');
   if (!badge) return;
-  let s = p.sid ? 'connected' : (p.connecting ? 'connecting' : 'disconnected');
+  let s = p.sid ? (p.reconnecting ? 'reconnecting' : 'connected')
+                : (p.connecting ? 'connecting' : 'disconnected');
   let busy = !!p.upload || !!p.download;
   // Title upkeep stays OUTSIDE the memo below: it depends on activeId,
   // which changes without this pane's own state changing (pane switch),
@@ -556,7 +557,8 @@ function updatePaneBadge(p) {
                p.persistent ? 1 : 0].join('');
   if (p._badgeState === state) return;
   p._badgeState = state;
-  badge.className = 'pane-badge ' + (s==='connected'?'s-on':s==='connecting'?'s-wait':'s-off');
+  badge.className = 'pane-badge ' + (s==='connected'?'s-on':
+                                     (s==='connecting'||s==='reconnecting')?'s-wait':'s-off');
   badge.textContent = s.charAt(0).toUpperCase() + s.slice(1);
   let ub = p.el.querySelector('[data-upload-btn]');
   if (ub) ub.disabled = !p.sid || busy;
@@ -722,6 +724,7 @@ function _destroyPane(id, terminate) {
   clearTimeout(p.saveCommitTimer);
   p._fitInFlight = false;
   p._pendingSettled = [];     // nothing to resume on a destroyed pane
+  clearInterval(p._reconnTimer); p._reconnTimer = null;
   // Disconnect main session
   if (p.sid) {
     p.polling = false;
@@ -1605,6 +1608,41 @@ function clearRetryClock(p) {
   p.firstFailureAt = 0;
   p.retryCount = 0;
   p.pollRetries = 0;
+  setReconnecting(p, false);
+}
+
+// While the transport retries inside RECONNECT_BUDGET_MS the terminal
+// just stopped updating - nothing said the connection was being
+// re-established or how long websh would keep trying; the user only
+// learned at the end, from a red line. Show it on the pane itself: a
+// small banner with the time left, and a "Reconnecting" badge.
+function setReconnecting(p, on) {
+  if (!p || !p.el) return;
+  if (!!p.reconnecting === !!on && (!on || p._reconnTimer)) return;
+  p.reconnecting = !!on;
+  let el = p.el.querySelector('.pane-reconnect');
+  if (!on) {
+    clearInterval(p._reconnTimer); p._reconnTimer = null;
+    if (el) el.remove();
+    updatePaneBadge(p);
+    return;
+  }
+  if (!el) {
+    el = document.createElement('div');
+    el.className = 'pane-reconnect';
+    el.setAttribute('role', 'status');
+    let body = p.el;                      // .pane is position:relative
+    body.appendChild(el);
+  }
+  let paint = () => {
+    let left = Math.max(0, Math.ceil(
+      (RECONNECT_BUDGET_MS - (Date.now() - (p.firstFailureAt || Date.now()))) / 1000));
+    el.textContent = 'Connection lost — reconnecting… (' + left + ' s)';
+  };
+  paint();
+  clearInterval(p._reconnTimer);
+  p._reconnTimer = setInterval(paint, 1000);
+  updatePaneBadge(p);
 }
 
 function transportFatal(p, e) {
@@ -1613,6 +1651,7 @@ function transportFatal(p, e) {
   // the pane again — and must not reset p.connecting, which would defuse
   // connectPane's in-flight duplicate guard during an auto-reconnect.
   if (!p.polling) return;
+  setReconnecting(p, false);
   // Final fallback: budget exhausted, give up and surface banner.
   console.error('transport gave up:', p.id, e);
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
@@ -1712,6 +1751,7 @@ function streamOutput(p) {
     }
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, new Error('SSE reconnect budget exhausted')); return; }
+    setReconnecting(p, true);
     // EventSource will retry on its own ~3s; we just enforce the
     // total-elapsed budget. No need to schedule an explicit retry.
   };
@@ -1727,6 +1767,7 @@ function pollOutput(p) {
   }).catch(e => {
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
+    setReconnecting(p, true);
     setTimeout(() => { if(p.polling) pollOutput(p) }, d);
   });
 }

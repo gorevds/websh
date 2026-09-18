@@ -129,6 +129,7 @@
     #panes{flex:1;display:flex;overflow:hidden}
     .pane{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;position:relative}
     /* Drag-and-drop upload target: an outline + the reason/instruction. */
+    .pane-reconnect{position:absolute;top:40px;left:50%;transform:translateX(-50%);z-index:15;background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-left:3px solid #e5a50a;border-radius:6px;padding:6px 12px;font-size:12px;white-space:nowrap;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.35)}
     .pane.drop-target{outline:2px dashed var(--ac);outline-offset:-4px}
     .pane.drop-target::after{content:attr(data-drop-msg);position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:var(--sf);color:var(--tx);border:1px solid var(--ac);border-radius:8px;padding:10px 16px;font-size:13px;pointer-events:none;z-index:20}
     .pane.active>.pane-bar{background:var(--sf)}
