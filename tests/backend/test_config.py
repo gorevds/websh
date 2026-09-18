@@ -1086,6 +1086,26 @@ class TestKnobResolution(unittest.TestCase):
         server._SERVER_KNOBS["WEBSH_CREDS_PATH"] = "/tmp/evil.creds.json"
         self.assertIsNone(server._knob("WEBSH_ACCESS_LOG", None))
         self.assertIsNone(server._knob("WEBSH_CREDS_PATH", None))
+        # ...and the auth header / recording dir, which used to bypass
+        # _knob() entirely (bare os.environ.get) while the docs listed
+        # them as JSON-settable: an operator got a silent no-auth server.
+        server._SERVER_KNOBS["WEBSH_AUTH_HEADER"] = "Remote-User"
+        server._SERVER_KNOBS["WEBSH_RECORD_DIR"] = "/tmp/rec"
+        self.assertEqual(server._knob("WEBSH_AUTH_HEADER", ""), "")
+        self.assertEqual(server._knob("WEBSH_RECORD_DIR", ""), "")
+
+    def test_ignored_server_keys_are_warned_at_startup(self):
+        server._SERVER_KNOBS["WEBSH_AUTH_HEADER"] = "Remote-User"
+        server._SERVER_KNOBS["SESION_TIMEOUT"] = 5       # typo
+        server._SERVER_KNOBS["SESSION_TIMEOUT"] = 5      # legit: no warn
+        with unittest.mock.patch.object(server, "_log") as log:
+            server._warn_ignored_server_knobs()
+        msgs = [c.args[1] for c in log.call_args_list if c.args[0] == "WARN"]
+        self.assertTrue(any("WEBSH_AUTH_HEADER" in m and "env-only" in m
+                            for m in msgs), msgs)
+        self.assertTrue(any("SESION_TIMEOUT" in m and "no such knob" in m
+                            for m in msgs), msgs)
+        self.assertFalse(any("\"server\".SESSION_TIMEOUT" in m for m in msgs), msgs)
 
     def test_server_knobs_reader(self):
         d = tempfile.mkdtemp()

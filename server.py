@@ -124,13 +124,23 @@ _SERVER_KNOBS = _server_knobs()
 # writes to — WEBSH_ACCESS_LOG (arbitrary-path O_APPEND|O_CREAT) and
 # WEBSH_CREDS_PATH (where the vault's _save_creds_atomic os.replace()
 # lands, i.e. arbitrary-path file overwrite). All env only.
+# WEBSH_AUTH_HEADER flips authentication semantics and WEBSH_RECORD_DIR
+# is another filesystem write path, so both are env-only as well.
 _ENV_ONLY_KNOBS = frozenset({
-    "HOST", "TRUSTED_PROXIES", "WEBSH_ACCESS_LOG", "WEBSH_CREDS_PATH"})
+    "HOST", "TRUSTED_PROXIES", "WEBSH_ACCESS_LOG", "WEBSH_CREDS_PATH",
+    "WEBSH_AUTH_HEADER", "WEBSH_RECORD_DIR", "WEBSH_RECORD_INPUT"})
+
+# Every name that went through _knob() at import: lets main() warn about
+# "server" keys that can never take effect (env-only, or a typo) instead
+# of ignoring them silently - an operator who put WEBSH_AUTH_HEADER in
+# websh.json would otherwise run unauthenticated without a hint.
+_KNOWN_KNOBS = set()
 
 
 def _knob(name, default):
     """Resolve one tunable (raw value; callers cast). See the
     precedence comment above."""
+    _KNOWN_KNOBS.add(name)
     if not name.startswith("WEBSH_"):
         v = os.environ.get("WEBSH_" + name)
         if v is not None:
@@ -191,13 +201,13 @@ HOST = str(_knob("HOST", "127.0.0.1"))
 # TRUSTED_PROXIES — exactly the X-Forwarded-For trust rule — so a
 # client talking to the backend directly cannot mint identities; with
 # the feature on, an untrusted peer is simply unauthenticated (401).
-WEBSH_AUTH_HEADER = os.environ.get("WEBSH_AUTH_HEADER", "").strip()
+WEBSH_AUTH_HEADER = str(_knob("WEBSH_AUTH_HEADER", "")).strip()
 # Opt-in session recording (asciicast v2, one .cast file per session,
 # created 0600). OFF unless WEBSH_RECORD_DIR names a directory the
 # server user can write. Recording is OUTPUT-ONLY; keystroke/input
 # recording is hard-disabled (see WEBSH_RECORD_INPUT below). Recording is
 # best-effort: a write failure disables it for that session, never the PTY.
-WEBSH_RECORD_DIR = os.environ.get("WEBSH_RECORD_DIR", "").strip()
+WEBSH_RECORD_DIR = str(_knob("WEBSH_RECORD_DIR", "")).strip()
 # Input recording (keystrokes — which include any password typed at a
 # sudo/login prompt INSIDE the session) is HARD-DISABLED. Capturing
 # keystrokes to disk on a public-facing deployment is a liability we do
@@ -205,7 +215,7 @@ WEBSH_RECORD_DIR = os.environ.get("WEBSH_RECORD_DIR", "").strip()
 # environment. The env var is read ONLY to warn an operator who sets it
 # (see main()). The browser-form ssh password was never recorded either
 # way (it is auto-typed below the input tee).
-_WEBSH_RECORD_INPUT_REQUESTED = os.environ.get("WEBSH_RECORD_INPUT") == "1"
+_WEBSH_RECORD_INPUT_REQUESTED = _bool_knob("WEBSH_RECORD_INPUT")
 WEBSH_RECORD_INPUT = False
 # Per-file ceiling. A `cat /dev/urandom` session would otherwise write
 # unbounded (and invalid UTF-8 inflates ~3-5x through replacement +
@@ -4934,6 +4944,20 @@ class Server(HTTPServer):
             self._req_sem.release()
 
 
+def _warn_ignored_server_knobs():
+    """One WARN per websh.json "server" key that cannot take effect:
+    env-only knobs (security: the JSON plane must not flip them) and
+    names no knob reads (typos). Silence here cost an operator their
+    authentication once."""
+    for key in sorted(_SERVER_KNOBS):
+        if key in _ENV_ONLY_KNOBS:
+            _log("WARN", "websh.json \"server\".{} is IGNORED: this knob is "
+                 "env-only (see docs/configuration.md)".format(key))
+        elif key not in _KNOWN_KNOBS:
+            _log("WARN", "websh.json \"server\".{} is IGNORED: no such "
+                 "knob".format(key))
+
+
 def _warn_per_ip_misconfig():
     """Emit a WARN when MAX_SESSIONS_PER_IP cannot ever trip.
 
@@ -5030,6 +5054,7 @@ def main():
     if _config_rejected:
         _log("ERROR", "refusing to start: " + _config_rejected)
         raise SystemExit(1)
+    _warn_ignored_server_knobs()
     _warn_per_ip_misconfig()
     _warn_max_threads_misconfig()
     # Start background cleanup thread
