@@ -6187,6 +6187,91 @@ test('file browser: cancelling a delete keeps the Rename button working', async 
   cleanup(env);
 });
 
+test('file browser: a slow earlier /api/ls reply cannot overwrite a newer directory', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sa', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'ls', once: true, response: {path: '/home/alice', entries: FB_ENTRIES}},
+    {action: 'ls', once: true, delay: 200,
+     response: {path: '/slow', entries: [{name: 'slow.txt', type: 'f', size: 1, mtime: 1}]}},
+    {action: 'ls', once: true, delay: 5,
+     response: {path: '/fast', entries: [{name: 'fast.txt', type: 'f', size: 1, mtime: 1}]}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  win.loadFbDir('/slow');
+  win.loadFbDir('/fast');
+  await sleep(320);
+  ok($(win, 'fbPath').getAttribute('data-path') === '/fast',
+     'breadcrumb shows the newest directory; got ' + $(win, 'fbPath').getAttribute('data-path'));
+  ok(names(win).includes('fast.txt') && !names(win).includes('slow.txt'),
+     'rows are from the newest reply; got ' + JSON.stringify(names(win)));
+  cleanup(env);
+});
+
+test('file browser: a listing keeps its rows while the next one loads (no Loading… collapse)', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sa', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'ls', once: true, response: {path: '/home/alice', entries: FB_ENTRIES}},
+    {action: 'rm', response: {ok: true}},
+    {action: 'ls', delay: 150,
+     response: {path: '/home/alice', entries: FB_ENTRIES.slice(1)}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const real = () => names(win).filter(n => n !== '..');
+  const before = real().length;
+  ok(before === FB_ENTRIES.length, 'initial listing rendered');
+  // Delete -> confirm -> rm ok -> re-list (slow). Meanwhile the rows stay.
+  const row = rowFor(win, 'zeta.txt');
+  row.querySelector('[data-fb-del]').click();
+  row.querySelector('.fb-cf-yes').click();
+  await sleep(40);
+  const list = $(win, 'fbList');
+  ok(list.querySelectorAll('.fb-row').length >= before - 1,
+     'rows kept during the re-list; got ' + list.querySelectorAll('.fb-row').length);
+  ok(!/Loading/.test(list.textContent), 'no Loading… placeholder while rows exist');
+  ok(list.getAttribute('aria-busy') === 'true', 'list marked busy meanwhile');
+  await sleep(200);
+  ok(!real().includes('zeta.txt') && real().length === FB_ENTRIES.length - 1,
+     'final listing swapped in; got ' + JSON.stringify(real()));
+  ok(list.getAttribute('aria-busy') === null, 'busy flag cleared');
+  // Navigation keeps rows too.
+  win.loadFbDir('/elsewhere');
+  await sleep(20);
+  ok(list.querySelectorAll('.fb-row').length > 0 && !/Loading/.test(list.textContent),
+     'navigation does not collapse the list either');
+  cleanup(env);
+});
+
+test('file browser: a mutating action is refused when the listed session changed', async () => {
+  // The rows on screen were listed through session `sa`. If the pane
+  // has since reconnected (or the browser was reopened on another pane)
+  // a delete must not run through the new session: that would remove
+  // a same-named path on a DIFFERENT host.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  p.sid = 'sb';                         // reconnect happened underneath
+  const row = rowFor(win, 'mid.txt');
+  row.querySelector('[data-fb-del]').click();
+  row.querySelector('.fb-cf-yes').click();
+  await sleep(40);
+  ok(env.log.filter(e => e.action === 'rm').length === 0, 'no rm was sent through the new session');
+  ok(env.log.filter(e => e.action === 'ls').length >= 2, 'a reload was kicked off instead');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
