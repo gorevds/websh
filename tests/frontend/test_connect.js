@@ -1529,7 +1529,7 @@ test('vault primitives: AES-GCM round-trip preserves payload', async () => {
   const conn_id = 'C'.repeat(26);
   const payload = {password: 'hunter2', key: null, key_pass: null};
   const blob = await win.eval(
-    `encryptCredentials(${JSON.stringify(payload)}, ${JSON.stringify(conn_id)})`);
+    `encryptCredentials(${JSON.stringify(payload)}, ${JSON.stringify(conn_id)}, {host:'h.example', port:22, username:'alice'})`);
   ok(typeof blob.iv === 'string' && blob.iv.length > 0, 'iv is base64 string');
   ok(typeof blob.ct === 'string' && blob.ct.length > 0, 'ct is base64 string');
   ok(/^[A-Z2-7]{26}$/.test(blob.vault_id), 'vault_id surfaced from encryptCredentials');
@@ -1538,7 +1538,7 @@ test('vault primitives: AES-GCM round-trip preserves payload', async () => {
   ok(ivBytes.length === 12, 'iv is 12 bytes; got ' + ivBytes.length);
   const recovered = await win.eval(
     `decryptCredentials(${JSON.stringify(blob.iv)}, ` +
-    `${JSON.stringify(blob.ct)}, ${JSON.stringify(conn_id)})`);
+    `${JSON.stringify(blob.ct)}, ${JSON.stringify(conn_id)}, {host:'h.example', port:22, username:'alice'})`);
   ok(recovered.password === 'hunter2', 'round-trip preserves password');
   ok(recovered.key === null, 'round-trip preserves null key');
   cleanup(env);
@@ -1550,14 +1550,39 @@ test('vault primitives: AAD binding — wrong conn_id fails decrypt', async () =
   const env = await mkEnv(plan); const win = env.win;
   const conn_id = 'D'.repeat(26);
   const blob = await win.eval(
-    `encryptCredentials({password:'x'}, ${JSON.stringify(conn_id)})`);
+    `encryptCredentials({password:'x'}, ${JSON.stringify(conn_id)}, {host:'h.example', port:22, username:'alice'})`);
   let threw = false;
   try {
     await win.eval(
       `decryptCredentials(${JSON.stringify(blob.iv)}, ` +
-      `${JSON.stringify(blob.ct)}, ${JSON.stringify('E'.repeat(26))})`);
+      `${JSON.stringify(blob.ct)}, ${JSON.stringify('E'.repeat(26))}, {host:'h.example', port:22, username:'alice'})`);
   } catch (e) { threw = true; }
   ok(threw, 'wrong conn_id rejects (AAD binding holds)');
+  cleanup(env);
+});
+
+test('vault primitives: AAD v2 binds the destination - a rebound host fails decrypt', async () => {
+  // Server-side the record's host/port/username are plaintext next to
+  // the blob and /api/save needs no key. Binding them into the AAD is
+  // what stops a creds.json reader from re-posting the victim's blob
+  // under host=attacker.example and having the victim's key decrypt it.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [],
+                                                vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const conn_id = 'F'.repeat(26);
+  const blob = await win.eval(
+    `encryptCredentials({password:'x'}, ${JSON.stringify(conn_id)}, {host:'good.example', port:22, username:'alice'})`);
+  let threw = false;
+  try {
+    await win.eval(
+      `decryptCredentials(${JSON.stringify(blob.iv)}, ${JSON.stringify(blob.ct)}, ` +
+      `${JSON.stringify(conn_id)}, {host:'evil.example', port:22, username:'alice'})`);
+  } catch (e) { threw = true; }
+  ok(threw, 'blob bound to good.example must not decrypt under evil.example');
+  // Canonical form: trimmed host/user, integer port, out-of-range -> 22.
+  const d = win.vaultDestination(' H.example ', '70000', ' bob ');
+  ok(d.host === 'H.example' && d.port === 22 && d.username === 'bob',
+     'vaultDestination canonicalises like the server; got ' + JSON.stringify(d));
   cleanup(env);
 });
 
@@ -1567,8 +1592,8 @@ test('vault primitives: each save uses a fresh IV', async () => {
   const env = await mkEnv(plan); const win = env.win;
   const conn_id = 'F'.repeat(26);
   // GCM IV reuse under the same key is catastrophic — must regenerate.
-  const blob1 = await win.eval(`encryptCredentials({p:'a'}, ${JSON.stringify(conn_id)})`);
-  const blob2 = await win.eval(`encryptCredentials({p:'a'}, ${JSON.stringify(conn_id)})`);
+  const blob1 = await win.eval(`encryptCredentials({p:'a'}, ${JSON.stringify(conn_id)}, {host:'h.example', port:22, username:'alice'})`);
+  const blob2 = await win.eval(`encryptCredentials({p:'a'}, ${JSON.stringify(conn_id)}, {host:'h.example', port:22, username:'alice'})`);
   ok(blob1.iv !== blob2.iv, 'IVs differ across saves');
   ok(blob1.ct !== blob2.ct, 'ciphertexts differ (same plaintext, fresh IV)');
   cleanup(env);
