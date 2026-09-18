@@ -1240,7 +1240,8 @@ async function commitVaultSave(entry) {
   // key clears it. Plain `delete` is also fine, used here for symmetry
   // with the previous shape.
   try { delete entry.__ephemeralSecrets; } catch (e) {}
-  let {iv, ct, vault_id} = await encryptCredentials(secrets, conn_id);
+  let dest = vaultDestination(entry.host, entry.port, entry.user);
+  let {iv, ct, vault_id} = await encryptCredentials(secrets, conn_id, dest);
   // Post-encrypt re-check: subtle.encrypt yielded the event loop, and a
   // sibling tab's BroadcastChannel signed_out handler may have wiped
   // IDB + invalidateVaultCache() during that gap. Bypass the in-memory
@@ -1266,8 +1267,10 @@ async function commitVaultSave(entry) {
   }
   let body = {
     vault_id, conn_id,
-    host: entry.host, port: entry.port, username: entry.user,
-    iv, ct,
+    // Exactly the values bound into the AAD, so the server derives the
+    // same bytes from the stored record at connect time.
+    host: dest.host, port: dest.port, username: dest.username,
+    iv, ct, aad_v: VAULT_AAD_VERSION,
     // ssh_options is part of the /api/save wire contract (server filters
     // through _filter_ssh_options and persists what survives). The
     // browser has no UI for arbitrary SSH options yet, so we send an
@@ -2653,20 +2656,41 @@ function _b64ToBytes(b64) {
   return bytes;
 }
 
-async function encryptCredentials(plaintext, conn_id) {
+// AAD version 2: the blob is bound to its slot AND its destination.
+// Server-side the record's host/port/username are plaintext metadata,
+// and /api/save needs no proof of key possession - so with the old
+// slot-only AAD, anyone who could read websh.creds.json could re-POST a
+// blob under the same ids with a different host and have the server
+// decrypt it (with the victim's key) into the attacker's machine.
+// The canonical form must match server.py's _credential_aad() byte for
+// byte: trimmed host, integer port (1-65535, else 22), trimmed user.
+const VAULT_AAD_VERSION = 2;
+function vaultDestination(host, port, username) {
+  let p = parseInt(port, 10);
+  if (!(p >= 1 && p <= 65535)) p = 22;
+  return {host: String(host || '').trim(), port: p,
+          username: String(username || '').trim()};
+}
+function vaultAad(vault_id, conn_id, dest) {
+  return new TextEncoder().encode(
+    vault_id + ':' + conn_id + ':' + dest.host + ':' + dest.port + ':' +
+    dest.username);
+}
+
+async function encryptCredentials(plaintext, conn_id, dest) {
   let vault_id = await ensureVaultId();
   let key = await ensureVaultKey();
   // GCM IV reuse under the same key is catastrophic; draw a fresh
   // 12-byte IV on every encrypt. See docs/encryption.md.
   let iv = crypto.getRandomValues(new Uint8Array(12));
-  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  let aad = vaultAad(vault_id, conn_id, dest);
   let pt = new TextEncoder().encode(JSON.stringify(plaintext));
   let ct = await crypto.subtle.encrypt(
     {name: 'AES-GCM', iv, additionalData: aad}, key, pt);
   return {iv: _bufToB64(iv), ct: _bufToB64(ct), vault_id};
 }
 
-async function decryptCredentials(iv_b64, ct_b64, conn_id) {
+async function decryptCredentials(iv_b64, ct_b64, conn_id, dest) {
   // Non-minting: silently minting a fresh vault_id / K here would just
   // guarantee a decrypt failure with extra garbage left in IDB. Raise
   // a clear error so the caller can surface a useful diagnostic
@@ -2674,7 +2698,10 @@ async function decryptCredentials(iv_b64, ct_b64, conn_id) {
   let vault_id = await ensureVaultIdIfPresent();
   let key = await ensureVaultKeyIfPresent();
   if (!vault_id || !key) throw new Error('no_vault_key');
-  let aad = new TextEncoder().encode(vault_id + ':' + conn_id);
+  // `dest` selects the v2 (destination-bound) AAD; without it the v1
+  // slot-only binding is used, for blobs saved before aad_v existed.
+  let aad = dest ? vaultAad(vault_id, conn_id, dest)
+                 : new TextEncoder().encode(vault_id + ':' + conn_id);
   let pt = await crypto.subtle.decrypt(
     {name: 'AES-GCM', iv: _b64ToBytes(iv_b64), additionalData: aad},
     key, _b64ToBytes(ct_b64));

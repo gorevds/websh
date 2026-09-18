@@ -1367,8 +1367,32 @@ def _save_creds_atomic(data):
             _creds_cache_key = (0, 0)
 
 
-def _decrypt_credential(key_bytes, iv_b64, ct_b64, vault_id, conn_id):
-    """Decrypt one stored blob.
+# Vault record AAD versions. v1 bound a blob to its slot only
+# (vault_id:conn_id). A record's host/port/username are plaintext
+# metadata next to the blob and /api/save needs no proof of key
+# possession, so anyone who could READ websh.creds.json could re-POST a
+# victim's iv/ct under the same ids with host=attacker.example - and on
+# the victim's next click the server decrypted with the victim's key and
+# auto-typed the password into the attacker's host. v2 binds the
+# destination into the AAD, so a rebound record fails its GCM tag.
+# Records without aad_v are v1: still readable (nothing to migrate them
+# with server-side), but /api/save refuses to WRITE anything but v2, so
+# a v1 record cannot be modified or re-created in a rebound form.
+_AAD_VERSION = 2
+
+
+def _credential_aad(vault_id, conn_id, aad_v, host=None, port=None,
+                    username=None):
+    if aad_v == 2:
+        return "{}:{}:{}:{}:{}".format(
+            vault_id, conn_id, host, int(port), username).encode("utf-8")
+    return "{}:{}".format(vault_id, conn_id).encode("utf-8")
+
+
+def _decrypt_credential(key_bytes, iv_b64, ct_b64, vault_id, conn_id,
+                        aad=None):
+    """Decrypt one stored blob. `aad` is the exact bytes from
+    _credential_aad(); None means the v1 slot-only binding.
 
     Raises ValueError on malformed inputs (wrong key length, bad
     base64, wrong IV length, ct too short, non-string iv/ct). Raises
@@ -1393,7 +1417,8 @@ def _decrypt_credential(key_bytes, iv_b64, ct_b64, vault_id, conn_id):
         raise ValueError("iv must be 12 bytes")
     if len(ct) < 17:
         raise ValueError("ct too short for GCM tag")
-    aad = ("{}:{}".format(vault_id, conn_id)).encode("utf-8")
+    if aad is None:
+        aad = _credential_aad(vault_id, conn_id, 1)
     return AESGCM(bytes(key_bytes)).decrypt(iv, ct, aad)
 
 
@@ -3636,8 +3661,11 @@ class Handler(BaseHTTPRequestHandler):
         if dropped:
             _log("WARN", "save dropped ssh_options keys: {}".format(dropped))
 
+        if body.get("aad_v") != _AAD_VERSION:
+            return _bad("aad_v {} required: the blob must bind its "
+                        "destination".format(_AAD_VERSION))
         rec = {"host": host, "port": port, "username": username,
-               "iv": iv_b64, "ct": ct_b64}
+               "iv": iv_b64, "ct": ct_b64, "aad_v": _AAD_VERSION}
         if ssh_options:
             rec["ssh_options"] = ssh_options
 
@@ -3771,9 +3799,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "saved entry not found"}, 404)
                 return
             try:
+                rec_aad_v = 2 if rec.get("aad_v") == 2 else 1
                 plaintext = _decrypt_credential(
                     vault_key_bytes, rec.get("iv", ""), rec.get("ct", ""),
-                    sv_vault, sv_conn)
+                    sv_vault, sv_conn,
+                    aad=_credential_aad(
+                        sv_vault, sv_conn, rec_aad_v,
+                        rec.get("host"), rec.get("port", 22),
+                        rec.get("username")))
             except InvalidTag:
                 _access_log_emit("connect", ip,
                                  result="cred_decrypt_failed",
