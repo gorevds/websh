@@ -130,14 +130,31 @@
     .pane{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0;position:relative}
     /* Drag-and-drop upload target: an outline + the reason/instruction. */
     .pane-reconnect{position:absolute;top:40px;left:50%;transform:translateX(-50%);z-index:15;background:var(--sf);color:var(--tx);border:1px solid var(--bd);border-left:3px solid #e5a50a;border-radius:6px;padding:6px 12px;font-size:12px;white-space:nowrap;pointer-events:none;box-shadow:0 4px 14px rgba(0,0,0,.35)}
-    .pane.drop-target{outline:2px dashed var(--ac);outline-offset:-4px}
-    /* Centered with inset:0 + margin:auto rather than left:50% +
-       translate: an absolute box at left:50% shrink-wraps to HALF the
-       pane, so in a narrow split the message broke into three lines. */
-    .pane.drop-target::after{content:attr(data-drop-msg);box-sizing:border-box;position:absolute;inset:0;margin:auto;width:max-content;max-width:calc(100% - 32px);height:max-content;text-align:center;background:var(--sf);color:var(--tx);border:1px solid var(--ac);border-radius:8px;padding:10px 16px;font-size:13px;pointer-events:none;z-index:20}
-    /* A pane that can't take the drop must not look like one that can. */
-    .pane.drop-target.drop-refused{outline-color:#e5a50a}
-    .pane.drop-target.drop-refused::after{border-color:#e5a50a;color:var(--dim)}
+    /* Drag-and-drop target. Drawn as its own layer ABOVE the terminal:
+       an `outline` on .pane paints under xterm's positioned render
+       layers, so only the top (pane bar) and bottom strip of the frame
+       were ever visible. ::before = full rounded dashed frame + dimmed,
+       slightly blurred backdrop so the card stays legible over busy
+       output; ::after = the card. --dz is the accent (amber = refused). */
+    .pane.drop-target{--dz:var(--ac);--dz-rgb:88,166,255}
+    .pane.drop-target.drop-refused{--dz:var(--wn);--dz-rgb:210,153,34}
+    .pane.drop-target::before{content:'';position:absolute;inset:6px;z-index:30;pointer-events:none;
+      border:2px dashed var(--dz);border-radius:10px;
+      background:rgba(13,17,23,.72);
+      background-image:radial-gradient(ellipse at center,rgba(var(--dz-rgb),.16),rgba(var(--dz-rgb),.04) 70%);
+      -webkit-backdrop-filter:blur(2px);backdrop-filter:blur(2px);
+      animation:dz-in .12s ease-out}
+    /* Centered with inset:0 + margin:auto (a left:50% box shrink-wraps to
+       half the pane and wrapped the text in narrow splits). */
+    .pane.drop-target::after{content:'\2B06\FE0E  ' attr(data-drop-msg);box-sizing:border-box;position:absolute;inset:0;margin:auto;z-index:31;pointer-events:none;
+      width:max-content;max-width:calc(100% - 48px);height:max-content;text-align:center;
+      background:var(--sf);color:var(--tx);border:1px solid var(--dz);border-radius:10px;
+      padding:12px 20px;font-size:14px;font-weight:600;letter-spacing:.2px;
+      box-shadow:0 8px 28px rgba(0,0,0,.45),0 0 0 4px rgba(var(--dz-rgb),.14);
+      animation:dz-in .12s ease-out}
+    .pane.drop-target.drop-refused::after{content:'\26A0\FE0E  ' attr(data-drop-msg);color:var(--dz);font-weight:500}
+    @keyframes dz-in{from{opacity:0}to{opacity:1}}
+    @media (prefers-reduced-motion:reduce){.pane.drop-target::before,.pane.drop-target::after{animation:none}}
     .pane.active>.pane-bar{background:var(--sf)}
     .pane-bar{display:flex;align-items:center;gap:6px;padding:2px 8px;background:var(--bg);border-bottom:1px solid var(--bd);flex-shrink:0}
     .pane-badge{font-size:10px;padding:1px 6px;border-radius:10px;font-weight:500}
