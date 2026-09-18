@@ -8,7 +8,14 @@ function storageKey(name) { return storagePrefix + name; }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 function $(id){ return document.getElementById(id) }
-function esc(s){ let d=document.createElement('div'); d.textContent=s; return d.innerHTML }
+// HTML-escape for BOTH text and attribute context. The old
+// textContent->innerHTML trick only covered & < > - a remote filename
+// containing a double quote could then close an attribute and add its
+// own (onmouseover=...) when esc() output was interpolated into one.
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'}[c]));
+}
 
 const API = location.pathname.replace(/\/[^/]*$/, '') + '/api.php';
 function api(action, opts) {
@@ -4092,17 +4099,29 @@ function makeFbRow(type, name, size, mtime, o) {
   // Rename + delete live in a fixed-width group at the far right, after
   // the metadata columns. The ".." row gets no buttons, but the empty
   // group keeps its width so the size/date columns stay aligned.
-  let acts = (o && o.noActions) ? '' :
-    '<button type="button" class="fb-ren" data-fb-ren ' +
-      'title="Rename" aria-label="Rename ' + esc(name) + '">&#x270E;</button>' +
-    '<button type="button" class="fb-del" data-fb-del ' +
-      'title="Delete" aria-label="Delete ' + esc(name) + '">&#x00D7;</button>';
   row.innerHTML =
     '<span class="fb-ic">' + icon + '</span>' +
     '<span class="fb-nm">' + esc(name) + '</span>' +
     '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
     '<span class="fb-dt">' + esc(fbDate(mtime)) + '</span>' +
-    '<span class="fb-act">' + acts + '</span>';
+    '<span class="fb-act"></span>';
+  // The action buttons carry the (remote-controlled) filename in an
+  // attribute, so they are built with the DOM API: setAttribute never
+  // parses markup, whatever the name contains.
+  if (!(o && o.noActions)) {
+    let acts = row.querySelector('.fb-act');
+    for (let [cls, attr, title, glyph] of [
+        ['fb-ren', 'data-fb-ren', 'Rename', '\u270E'],
+        ['fb-del', 'data-fb-del', 'Delete', '\u00D7']]) {
+      let b = document.createElement('button');
+      b.type = 'button'; b.className = cls;
+      b.setAttribute(attr, '');
+      b.title = title;
+      b.setAttribute('aria-label', title + ' ' + name);
+      b.textContent = glyph;
+      acts.appendChild(b);
+    }
+  }
   // The visibility pass (dotfile toggle + name filter) reads the name here.
   row.dataset.name = name;
   return row;
