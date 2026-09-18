@@ -1100,7 +1100,7 @@ class TestListDir(unittest.TestCase):
         # PWD line is \n-terminated; entry rows are \0-terminated so a
         # filename containing \n can't split a row in half.
         stdout = (
-            b"PWD:/home/alice\n"
+            b"PWD:/home/alice\0"
             b"d\t4096\t1700000000\tdocs\0"
             b"f\t12345\t1700000001\tfile.txt\0"
             b"l\t0\t1700000002\tlink\0"
@@ -1147,7 +1147,7 @@ class TestListDir(unittest.TestCase):
         s = self._fake_session(control_path="/tmp/fake.sock")
         weird = "weird\nname.txt"
         stdout = (
-            b"PWD:/home/alice\n"
+            b"PWD:/home/alice\0"
             b"f\t10\t1700000000\t" + weird.encode() + b"\0"
             b"f\t20\t1700000001\tnext.txt\0"
         )
@@ -1173,7 +1173,7 @@ class TestListDir(unittest.TestCase):
             captured["remote"] = cmd[-1]
             r = unittest.mock.MagicMock()
             r.returncode = 0
-            r.stdout = b"PWD:/home/alice\n"
+            r.stdout = b"PWD:/home/alice\0"
             return r
         with unittest.mock.patch("os.path.exists", return_value=True), \
              unittest.mock.patch("subprocess.run", side_effect=fake_run):
@@ -1189,7 +1189,7 @@ class TestListDir(unittest.TestCase):
     def test_dirs_sorted_before_files(self):
         s = self._fake_session(control_path="/tmp/fake.sock")
         stdout = (
-            b"PWD:/home/alice\n"
+            b"PWD:/home/alice\0"
             b"f\t100\t1700000000\taardvark.txt\0"
             b"d\t4096\t1700000000\tzebra_dir\0"
             b"f\t200\t1700000000\tbeta.py\0"
@@ -1326,7 +1326,7 @@ class TestListDirPaneCwd(unittest.TestCase):
         seen = {}
         result = unittest.mock.MagicMock()
         result.returncode = 0
-        result.stdout = b"PWD:/srv/app\n"
+        result.stdout = b"PWD:/srv/app\0"
 
         def fake_run(argv, **_):
             seen["argv"] = argv
@@ -1645,7 +1645,7 @@ class TestRenameEntry(unittest.TestCase):
         cap = {}
         self._run(0, capture=cap)
         cmd = cap["argv"][-1]
-        self.assertIn('D=$(dirname -- "$S")', cmd)
+        self.assertIn('D=${S%/*}; [ -n "$D" ] || D=/', cmd)
         self.assertIn('mv -- "$S" "$D/$N"', cmd)
         # Refuses to clobber an existing target.
         self.assertIn('[ -e "$D/$N" ]', cmd)
@@ -2191,6 +2191,92 @@ class TestTmuxCapture(unittest.TestCase):
         data, err = s.tmux_capture()
         self.assertIsNone(data)
         self.assertIn("not a persistent", err)
+
+
+
+class TestSideChannelSnippetsExecuted(unittest.TestCase):
+    """Run the real remote_cmd strings through a local POSIX shell against
+    a temp directory. Every other test in this file only substring-matches
+    the command text; these pin what the shell actually does with hostile
+    names — in particular that a trailing newline survives the base64
+    decode (command substitution used to strip it, so `rm foo\n` deleted
+    `foo` and reported success)."""
+
+    SHELLS = [sh for sh in ("dash", "bash", "busybox") if shutil.which(sh)]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        if not self.SHELLS:
+            self.skipTest("no POSIX shell available")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _session(self, shell):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.id = "exec"; s.persistent = False; s.slot_id = None
+        s.alive = True; s._control_path = "/tmp/fake.sock"
+        s._host = "h"; s._port = 22; s._username = "u"
+        s._mux_ready = lambda: True
+        argv = ["busybox", "sh", "-c"] if shell == "busybox" else [shell, "-c"]
+
+        def run(remote_cmd, timeout, msg, err_prefix=None):
+            return subprocess.run(argv + [remote_cmd], capture_output=True,
+                                  timeout=timeout), None
+        s._mux_run = run
+        return s
+
+    def _touch(self, *names):
+        for n in names:
+            with open(os.path.join(self.tmp, n), "w") as f:
+                f.write("data")
+
+    def test_trailing_newline_name_targets_the_right_entry(self):
+        for sh in self.SHELLS:
+            self._touch("foo", "foo\n")
+            s = self._session(sh)
+            ok, err = s.remove_path(os.path.join(self.tmp, "foo\n"))
+            self.assertEqual((ok, err), (True, ""), sh)
+            self.assertEqual(sorted(os.listdir(self.tmp)), ["foo"], sh)
+            os.remove(os.path.join(self.tmp, "foo"))
+
+    def test_rename_and_mkdir_keep_trailing_newline(self):
+        for sh in self.SHELLS:
+            self._touch("src")
+            s = self._session(sh)
+            ok, err = s.rename_entry(os.path.join(self.tmp, "src"), "dst\n")
+            self.assertEqual((ok, err), (True, ""), sh)
+            self.assertIn("dst\n", os.listdir(self.tmp), sh)
+            ok, err = s.make_dir(os.path.join(self.tmp, "d\n"))
+            self.assertEqual((ok, err), (True, ""), sh)
+            self.assertTrue(os.path.isdir(os.path.join(self.tmp, "d\n")), sh)
+            shutil.rmtree(self.tmp); os.makedirs(self.tmp)
+
+    def test_list_dir_reports_exact_path_and_hostile_names(self):
+        weird = ["a b", "-rf", "*", "tab\there", "nl\nname", "trail ", "ünï"]
+        for sh in self.SHELLS:
+            d = os.path.join(self.tmp, "proj ")           # trailing space
+            os.makedirs(d, exist_ok=True)
+            for n in weird:
+                with open(os.path.join(d, n), "w") as f:
+                    f.write("x")
+            s = self._session(sh)
+            entries, path, err = s.list_dir(d)
+            self.assertIsNone(err, sh)
+            self.assertEqual(path, d, sh)              # no .strip()
+            self.assertEqual(sorted(e["name"] for e in entries),
+                             sorted(weird), sh)
+            shutil.rmtree(d)
+
+    def test_rename_refuses_to_clobber_and_stays_in_dir(self):
+        for sh in self.SHELLS:
+            self._touch("a", "b")
+            s = self._session(sh)
+            ok, err = s.rename_entry(os.path.join(self.tmp, "a"), "b")
+            self.assertFalse(ok, sh)
+            self.assertIn("already exists", err, sh)
+            for n in ("a", "b"):
+                os.remove(os.path.join(self.tmp, n))
 
 
 if __name__ == "__main__":

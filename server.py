@@ -1630,6 +1630,18 @@ sessions_lock = Lock()
 _creds_lock = RLock()
 
 
+def _sh_b64(var, b64):
+    """Shell fragment assigning the base64-decoded value to $var, exactly.
+    A bare `var=$(... | base64 -d)` would let command substitution strip
+    every trailing newline, so a remote entry named "foo\n" resolved to
+    "foo" - and rm/mv/mkdir then acted on the wrong file while reporting
+    success. Appending a sentinel byte inside the substitution and
+    stripping it afterwards preserves the decoded bytes verbatim; the
+    `&&` between the two keeps base64's exit status meaningful."""
+    return ('{v}=$(printf %s {b} | base64 -d && printf x) && '
+            '{v}=${{{v}%x}}'.format(v=var, b=b64))
+
+
 class SSHSession(object):
     """Manages a single SSH connection via PTY subprocess."""
 
@@ -2619,7 +2631,7 @@ class SSHSession(object):
         b64name = base64.b64encode(
             rel_path.encode("utf-8")).decode("ascii")
         remote_cmd = (
-            'n="$(printf %s ' + b64name + ' | base64 -d)" && '
+            _sh_b64('n', b64name) + ' && '
             'cat > "$HOME/$n"'
         )
 
@@ -2756,8 +2768,8 @@ class SSHSession(object):
         #   6. echo the resolved absolute path so the API caller can
         #      surface it to the user
         remote_cmd = (
-            't=$(printf %s ' + b_tmp + ' | base64 -d); '
-            'f=$(printf %s ' + b_final + ' | base64 -d); '
+            _sh_b64('t', b_tmp) + '; ' +
+            _sh_b64('f', b_final) + '; '
             'cwd=$(' + self.tmux_cmd + ' display -p -t ' + target +
                 ' "#{pane_current_path}" 2>/dev/null); '
             '[ -n "$cwd" ] || cwd="$HOME"; '
@@ -2797,7 +2809,7 @@ class SSHSession(object):
         # that starts with `-` even though the upstream validator
         # already rejected absolute paths and `..`.
         remote_cmd = (
-            'n=$(printf %s ' + b + ' | base64 -d) && '
+            _sh_b64('n', b) + ' && '
             'rm -f -- "$HOME/$n"'
         )
         proc, err = self._mux_run(remote_cmd, 10, "rm timeout")
@@ -2840,7 +2852,9 @@ class SSHSession(object):
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
         # Entry rows are NUL-terminated (not \n) so filenames containing
         # an embedded newline don't split a row in half. The PWD: line
-        # before the entries still uses \n — easy to peel off first.
+        # before the entries is NUL-terminated too: a directory whose
+        # own name ends in a newline or a space must round-trip exactly,
+        # because every rm/mv/mkdir the browser issues is based on it.
         # Pure POSIX shell loop (no GNU `find -printf`) so this works on
         # BusyBox / Alpine / dash targets in addition to glibc Linux.
         # `stat -c` covers GNU + BusyBox; `stat -f` is the BSD/macOS
@@ -2856,7 +2870,7 @@ class SSHSession(object):
             resolve = 'D=; ' + self.pane_cwd_expr() + '[ -n "$D" ] || D="$HOME"; '
         else:
             resolve = (
-                'P=$(printf %s ' + b64 + ' | base64 -d); '
+                _sh_b64('P', b64) + '; '
                 'case "$P" in '
                   '/*) D="$P";; '
                   '"~") D="$HOME";; '
@@ -2867,7 +2881,7 @@ class SSHSession(object):
         remote_cmd = (
             resolve +
             'cd "$D" 2>/dev/null || exit 1; '
-            'printf "PWD:%s\\n" "$(pwd)"; '
+            'printf "PWD:%s\\0" "$PWD"; '
             'for f in * .[!.]* ..?*; do '
               '[ -e "$f" ] || [ -L "$f" ] || continue; '
               'if [ -L "$f" ]; then t=l; '
@@ -2888,15 +2902,16 @@ class SSHSession(object):
         if result.returncode != 0:
             return None, None, "directory not found"
 
-        # Peel the PWD:<path>\n preamble off the front, then split the
+        # Peel the PWD:<path>\0 preamble off the front, then split the
         # rest on NUL — each `printf ... \0` row from the loop ends
-        # with \0 so embedded newlines in filenames stay intact.
+        # with \0 so embedded newlines in filenames stay intact. The
+        # path is taken verbatim (no strip): see the comment above.
         raw = result.stdout
         abs_path = remote_path
-        nl = raw.find(b"\n")
-        if nl >= 0 and raw[:4] == b"PWD:":
-            abs_path = raw[4:nl].decode("utf-8", "replace").strip()
-            raw = raw[nl + 1:]
+        nul = raw.find(b"\0")
+        if nul >= 0 and raw[:4] == b"PWD:":
+            abs_path = raw[4:nul].decode("utf-8", "replace")
+            raw = raw[nul + 1:]
 
         entries = []
         for row in raw.split(b"\0"):
@@ -2939,7 +2954,7 @@ class SSHSession(object):
         # instead of surfacing a bare "exit 1". Every `--` guards a
         # filename that begins with a dash.
         remote_cmd = (
-            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            _sh_b64('P', b64) + '; '
             '[ -e "$P" ] || [ -L "$P" ] || exit 3; '
             'if [ -d "$P" ] && [ ! -L "$P" ]; then '
               'rmdir -- "$P" 2>/dev/null || exit 4; '
@@ -2969,7 +2984,7 @@ class SSHSession(object):
 
         b64 = base64.b64encode(abs_path.encode("utf-8")).decode("ascii")
         remote_cmd = (
-            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            _sh_b64('P', b64) + '; '
             'if [ -e "$P" ] || [ -L "$P" ]; then exit 4; fi; '
             'mkdir -- "$P" 2>/dev/null || exit 5'
         )
@@ -2996,9 +3011,10 @@ class SSHSession(object):
         b_src = base64.b64encode(abs_path.encode("utf-8")).decode("ascii")
         b_name = base64.b64encode(new_name.encode("utf-8")).decode("ascii")
         remote_cmd = (
-            'S=$(printf %s ' + b_src + ' | base64 -d); '
-            'N=$(printf %s ' + b_name + ' | base64 -d); '
-            'D=$(dirname -- "$S"); '
+            _sh_b64('S', b_src) + '; ' +
+            _sh_b64('N', b_name) + '; '
+            # ${S%/*} instead of $(dirname): same trailing-newline hazard.
+            'D=${S%/*}; [ -n "$D" ] || D=/; '
             'if [ ! -e "$S" ] && [ ! -L "$S" ]; then exit 3; fi; '
             'if [ -e "$D/$N" ] || [ -L "$D/$N" ]; then exit 4; fi; '
             'mv -- "$S" "$D/$N" 2>/dev/null || exit 5'
@@ -3024,7 +3040,7 @@ class SSHSession(object):
 
         b64 = base64.b64encode(remote_path.encode("utf-8")).decode("ascii")
         remote_cmd = (
-            'P=$(printf %s ' + b64 + ' | base64 -d); '
+            _sh_b64('P', b64) + '; '
             'case "$P" in '
               '/*) F="$P";; '
               '"~") F="$HOME";; '
