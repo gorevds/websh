@@ -4958,6 +4958,13 @@ class Server(HTTPServer):
     """
 
     allow_reuse_address = True
+    # listen(2) backlog. socketserver's default is 5, and this server
+    # speaks HTTP/1.0 with Connection: close, so every keystroke POST is
+    # a fresh TCP connection: with a handful of typists the accept queue
+    # overflowed and clients ate 1-3 s SYN-retransmit stalls (measured
+    # p99 1.0 s at 32 concurrent connections). The kernel caps this at
+    # net.core.somaxconn (4096 on modern Linux, 128 on older ones).
+    request_queue_size = 128
 
     def __init__(self, *args, **kwargs):
         HTTPServer.__init__(self, *args, **kwargs)
