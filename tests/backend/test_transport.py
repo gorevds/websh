@@ -1727,13 +1727,22 @@ class TestReapChild(unittest.TestCase):
         s._reap_lock = threading.Lock()
         s._child_reaped = False
         s._signal = lambda: None  # isolate: we assert on reaping, not signaling
+        s.client_ip = "203.0.113.9"
+        s._host = "target.example"; s._username = "alice"
         try:
-            t = threading.Thread(target=s._read_loop, daemon=True)
-            t.start()
-            t.join(15)
+            with unittest.mock.patch.object(server, "_access_log_emit") as emit:
+                t = threading.Thread(target=s._read_loop, daemon=True)
+                t.start()
+                t.join(15)
             self.assertFalse(t.is_alive(),
                              "_read_loop did not exit on auth fail")
             self.assertTrue(s.auth_failed, "auth failure was not detected")
+            # The auth failure is an access-log event of its own (the
+            # connect record already said result=ok when ssh spawned).
+            calls = [c for c in emit.call_args_list if c.args[0] == "auth_failed"]
+            self.assertEqual(len(calls), 1, emit.call_args_list)
+            self.assertEqual(calls[0].args[1], "203.0.113.9")
+            self.assertEqual(calls[0].kwargs.get("target_host"), "target.example")
             self.assertIsNotNone(s._exit_status,
                                  "child was not reaped (zombie leak)")
             with self.assertRaises(ChildProcessError):

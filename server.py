@@ -901,11 +901,12 @@ def _record_deny_for_scan(ip, target_host):
 
 
 def _forgive_scan_for_ip(ip):
-    """Successful connect from `ip` clears its scan-pattern state.
-
-    Called from the success path. The asymmetry — only deny_blocked
-    accumulates, only ok forgives — is what makes the heuristic safe:
-    real users always have ok events; pure scanners never do.
+    """A session from `ip` that is being USED clears its scan-pattern
+    state. Called from /api/input on the first keystroke into a session
+    whose auth did not fail. The asymmetry — only deny_blocked
+    accumulates, only real use forgives — is what makes the heuristic
+    safe: real users always type; pure scanners never get a shell.
+    (It used to fire on spawn, before auth even ran.)
     """
     if not ip:
         return
@@ -2139,6 +2140,15 @@ class SSHSession(object):
                             _log("INFO", "session {} auth failed{}".format(
                                 self.id,
                                 " [bg]" if self.is_background else ""))
+                            # The connect record said result=ok (ssh
+                            # spawned); this is the event fail2ban and an
+                            # auditor actually need to see brute force
+                            # relayed through websh.
+                            _access_log_emit(
+                                "auth_failed", getattr(self, "client_ip", ""),
+                                sid=self.id,
+                                target_host=getattr(self, "_host", ""),
+                                target_user=getattr(self, "_username", ""))
                             # Append this final chunk so the client sees
                             # *why* (the rejection message + the re-prompt)
                             # before we tear down.
@@ -3800,7 +3810,8 @@ class Handler(BaseHTTPRequestHandler):
 
         _access_log_emit("save", self._client_ip(),
                          result="ok", vault_id=vault_id, conn_id=conn_id,
-                         iv_len=len(iv), ct_len=len(ct))
+                         target_host=host, target_user=username,
+                         target_port=port, iv_len=len(iv), ct_len=len(ct))
         self._json({})
 
     def _delete_credential(self):
@@ -4153,8 +4164,11 @@ class Handler(BaseHTTPRequestHandler):
             _log("INFO", "new session {} for {}@{}:{}{}".format(
                 sid, username, host, port,
                 " [persistent slot=" + slot_id + "]" if persistent else ""))
-            # Successful connect forgives the IP — see _forgive_scan_for_ip.
-            _forgive_scan_for_ip(ip)
+            # NOT forgiven here: "ssh spawned" is not "authenticated". A
+            # scanner interleaving one connect to any non-denied host
+            # (auth failing is fine) used to reset its own counter. The
+            # forgiveness happens in _input, on the first real keystroke
+            # of a session that did not fail auth - see _forgive_scan_for_ip.
             _access_log_emit("connect", ip, result="ok", sid=sid,
                              auth_user=self._client_identity(),
                              target_host=host, target_user=username,
@@ -4211,6 +4225,12 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "data must be a string"}, 400)
                 return
             ok = session.write(data.encode("utf-8"))
+            if ok and session.alive and not session.auth_failed \
+                    and data.strip():
+                # A real keystroke into a session that did not fail auth
+                # is the "this IP is a person" signal the scan-pattern
+                # detector forgives on (see _forgive_scan_for_ip).
+                _forgive_scan_for_ip(self._client_ip())
             self._json({"ok": ok, "alive": session.alive})
         except Exception as e:
             self._json({"error": "input error: " + str(e)}, 500)
@@ -4744,6 +4764,13 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         ok, err = session.remove_path(path)
+        # Audited like upload/download: a keystroke-free delete appears in
+        # neither the session recording nor the scrollback, so the access
+        # log is the only place it can ever be seen.
+        _access_log_emit("rm", self._client_ip(), sid=sid,
+                         target_host=getattr(session, "_host", ""),
+                         path=path, result="ok" if ok else "error",
+                         **({} if ok else {"error": err}))
         if not ok:
             self._json({"error": err}, 502)
             return
@@ -4786,6 +4813,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         ok, err = session.make_dir(path)
+        _access_log_emit("mkdir", self._client_ip(), sid=sid,
+                         target_host=getattr(session, "_host", ""),
+                         path=path, result="ok" if ok else "error",
+                         **({} if ok else {"error": err}))
         if not ok:
             self._json({"error": err}, 502)
             return
@@ -4815,6 +4846,10 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         ok, err = session.rename_entry(path, name)
+        _access_log_emit("mv", self._client_ip(), sid=sid,
+                         target_host=getattr(session, "_host", ""),
+                         path=path, name=name, result="ok" if ok else "error",
+                         **({} if ok else {"error": err}))
         if not ok:
             self._json({"error": err}, 502)
             return
