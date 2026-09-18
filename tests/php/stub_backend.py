@@ -8,12 +8,35 @@ shape ensure_backend() expects so api.php never tries to auto-start a
 real server.py.
 """
 import json
+import os
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class Echo(BaseHTTPRequestHandler):
+    def _stream(self):
+        """Endless SSE. When the proxy closes its side we get EPIPE on
+        the next write; record that in $STUB_MARK so the smoke can prove
+        the proxy really tore the backend connection down after the
+        browser went away (it used to leave it open forever)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        try:
+            while True:
+                self.wfile.write(b": tick\n\n")
+                self.wfile.flush()
+                time.sleep(0.1)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            mark = os.environ.get("STUB_MARK")
+            if mark:
+                with open(mark, "w") as f:
+                    f.write("closed\n")
+
     def _reply(self):
+        if self.path.split("?")[0] == "/api/stream":
+            return self._stream()
         if self.path.split("?")[0] == "/api/ping":
             body = json.dumps({"ok": True, "version": "stub"}).encode()
         else:
@@ -40,6 +63,6 @@ class Echo(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     # Port 0 = kernel-assigned; print the real port for the caller.
-    srv = HTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 0), Echo)
+    srv = ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 0), Echo)
     print(srv.server_address[1], flush=True)
     srv.serve_forever()

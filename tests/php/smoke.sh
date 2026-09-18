@@ -9,10 +9,12 @@ cd "$(dirname "$0")/../.."
 # Kernel-assigned ports: parallel CI jobs / dev boxes can't collide.
 STUB_OUT=$(mktemp)
 UNKNOWN_OUT=$(mktemp)
+STUB_MARK=$(mktemp -u)
+export STUB_MARK
 python3 tests/php/stub_backend.py > "$STUB_OUT" &
 STUB_PID=$!
 PHP_PID=
-trap 'kill $STUB_PID $PHP_PID 2>/dev/null || true; rm -f "$STUB_OUT" "$UNKNOWN_OUT"' EXIT
+trap 'kill $STUB_PID $PHP_PID 2>/dev/null || true; rm -f "$STUB_OUT" "$UNKNOWN_OUT" "$STUB_MARK"' EXIT
 for i in $(seq 1 50); do [ -s "$STUB_OUT" ] && break; sleep 0.1; done
 STUB_PORT=$(head -1 "$STUB_OUT")
 [ -n "$STUB_PORT" ] || { echo "stub backend never reported its port"; exit 1; }
@@ -107,5 +109,15 @@ code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' -X POST \
      "http://127.0.0.1:$PHP_PORT/api.php?action=save_delete&vault_id[]=v1&conn_id=c1")
 [ "$code" != "500" ] || fail "array vault_id fatals" "$(cat "$UNKNOWN_OUT")"
 grep -q 'Fatal' "$UNKNOWN_OUT" && fail "array vault_id leaks a fatal" "$(cat "$UNKNOWN_OUT")"
+
+# 9. A browser that drops an SSE stream must make the proxy close its
+#    backend connection (it used to stay open in the worker forever:
+#    409 on every reconnect, terminal output lost into a dead socket).
+#    The stub records EPIPE on its side in $STUB_MARK.
+rm -f "$STUB_MARK"
+curl -s --max-time 1 -o /dev/null "http://127.0.0.1:$PHP_PORT/api.php?action=stream&session_id=s1" || true
+closed=
+for i in $(seq 1 40); do [ -f "$STUB_MARK" ] && { closed=1; break; }; sleep 0.1; done
+[ -n "$closed" ] || fail "backend stream connection not closed after client abort" "no EPIPE seen by the stub within 4s"
 
 echo "PHP proxy smoke: all assertions passed"
