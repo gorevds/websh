@@ -326,6 +326,17 @@ TERM_RESET = b"\x1b[?1049l\x1b[?25h\x1b[0m\x1bc"
 
 # Password prompt patterns (lowercase, checked against lowered PTY output)
 PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
+# The auto-typer stays armed only while ssh can plausibly still be
+# authenticating: this much PTY output or this many seconds without a
+# prompt, or ANY real keystroke from the user, disarms it and drops the
+# password. Without a bound the password stayed armed for the whole
+# session whenever auth completed without prompting (agent/default key
+# on the websh host, key + stray passphrase) - and the first later
+# "password:" on screen (sudo, `ssh other`, `cat` of a file containing
+# the word) got the stored password typed into the shell: echoed, in
+# history, in the recording.
+PASSWORD_ARM_MAX_BYTES = 16 * 1024
+PASSWORD_ARM_MAX_SECONDS = 60.0
 
 # Auth-failure patterns — if we see any of these AFTER we auto-typed the
 # password, ssh rejected our attempt and we should not keep the session
@@ -1739,6 +1750,8 @@ class SSHSession(object):
         self._password = password
         self._password_sent = False
         self._pw_buf = b""
+        self._pw_armed_at = time.time()
+        self._pw_bytes_seen = 0
         self.auth_failed = False
         self._auth_buf = b""
         # Number of PTY bytes already scanned for auth-fail patterns.
@@ -2066,8 +2079,15 @@ class SSHSession(object):
                         self._pw_buf += data
                         if len(self._pw_buf) > 256:
                             self._pw_buf = self._pw_buf[-256:]
+                        self._pw_bytes_seen += len(data)
                         text = self._pw_buf.decode("latin-1", errors="replace").lower()
-                        if any(p in text for p in PASSWORD_PROMPTS):
+                        prompted = any(p in text for p in PASSWORD_PROMPTS)
+                        if not prompted and (
+                                self._pw_bytes_seen > PASSWORD_ARM_MAX_BYTES or
+                                time.time() - self._pw_armed_at
+                                > PASSWORD_ARM_MAX_SECONDS):
+                            self._disarm_password("no prompt within the auth window")
+                        elif prompted:
                             time.sleep(0.1)
                             try:
                                 os.write(self.master_fd,
@@ -2457,10 +2477,26 @@ class SSHSession(object):
         # to deliver also signals.
         self._signal()
 
+    def _disarm_password(self, why):
+        """Forget the stored password without ever typing it. See
+        PASSWORD_ARM_MAX_BYTES."""
+        if self._password is None:
+            return
+        self._password = None
+        self._pw_buf = b""
+        _log("INFO", "session {} password auto-type disarmed: {}".format(
+            self.id, why))
+
     def write(self, data):
         """Send input to SSH process."""
         if not self.alive:
             return False
+        # A real keystroke means the user is at a shell (or answering the
+        # prompt themselves): whatever ssh prints from now on is not its
+        # own login prompt, so the auto-typer must not fire on it.
+        if (getattr(self, "_password", None) and not self._password_sent
+                and data.strip(b"\r\n\t ")):
+            self._disarm_password("user input")
         if self.master_fd < 0:
             # No PTY ever attached (or already closed) — treat as dead.
             self.alive = False
