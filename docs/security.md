@@ -99,13 +99,22 @@ Common `result` values on `connect` events:
 
 | `result` | Meaning |
 |---|---|
-| `ok` | Session created. Record includes `sid`, `target_host`, `target_user`, `persistent`, `latency_ms`. |
+| `ok` | ssh was spawned (not: authenticated — see the `auth_failed` event). Record includes `sid`, `target_host`, `target_user`, `persistent`, `latency_ms`. |
 | `rate_limited` | Caller exceeded `RATE_LIMIT_MAX` for the window. |
 | `deny_blocked` | Target host (or its resolved IP) is on `denied_hosts`. |
 | `session_cap_per_ip` | The per-source-IP active session cap (`MAX_SESSIONS_PER_IP`) was at the limit. |
 | `session_cap_global` | Global cap (`MAX_SESSIONS` for `foreground`, `MAX_BG_SESSIONS` for `background`) was at the limit. The `classification` field tells which. |
-| `scan_pattern` | The IP has reached `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets inside the window. Emitted in addition to the original `deny_blocked` record, starting on the Nth probe and on every probe after. ANY successful connect from the same IP clears state, so a power user touching many real servers never accumulates here. |
+| `scan_pattern` | The IP has reached `SCAN_PATTERN_THRESHOLD` distinct deny-listed targets inside the window. Emitted in addition to the original `deny_blocked` record, starting on the Nth probe and on every probe after. The first real keystroke into a session whose authentication did not fail clears the IP's state (a spawn alone does not — a scanner that also connects to a non-denied host and fails auth there must not reset its own counter), so a power user touching many real servers never accumulates here. |
 | `error` | Internal failure during session creation. The `error` field carries up to 200 Unicode characters of the exception (~800 UTF-8 bytes for non-ASCII text). |
+
+Other events:
+
+| `event` | When |
+|---|---|
+| `auth_failed` | The read loop saw ssh reject the credentials (or re-prompt) after the auto-typed password. Fields: `sid`, `target_host`, `target_user`. This — not `connect result=ok` — is the brute-force signal: every password attempt relayed through websh produces one. |
+| `upload`, `download` | One record per transfer with `path` and `bytes`; download `result` is `ok`, `partial` (known size not reached), `over_cap`, `timeout` or `client_gone`. |
+| `rm`, `mkdir`, `mv` | Every file-browser mutation, on both outcomes (`result` `ok`/`error`, plus `error`). These are keystroke-free, so they appear in neither the session recording nor the scrollback — the access log is their only audit surface. `mv` carries `name`. |
+| `save` | Vault write, with `target_host` / `target_user` / `target_port` of the entry (so a re-bound or mass-created entry is visible). |
 
 Common `result` values on `disconnect` events:
 
@@ -120,6 +129,7 @@ Common `result` values on `disconnect` events:
 ```ini
 [Definition]
 failregex = ^.*"ip":\s*"<HOST>".*"result":\s*"(rate_limited|session_cap_per_ip|scan_pattern)".*$
+            ^.*"event":\s*"auth_failed".*"ip":\s*"<HOST>".*$
 ignoreregex =
 ```
 

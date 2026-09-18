@@ -5,6 +5,7 @@ Split from the original test_server.py; class bodies are verbatim.
 """
 
 import base64
+import inspect
 import io
 import json
 import os
@@ -371,6 +372,38 @@ class TestScanPatternDetection(unittest.TestCase):
         server.SCAN_PATTERN_THRESHOLD = 1
         self.assertFalse(server._record_deny_for_scan("", "h"))
         self.assertFalse(server._record_deny_for_scan(None, "h"))
+
+    def test_spawn_does_not_forgive_but_a_keystroke_does(self):
+        """Regression: forgiveness fired on spawn, before auth ran, so a
+        scanner interleaving one connect to any non-denied host (auth
+        failing is fine) reset its own deny-list counter. Now the
+        forgiving signal is the first real keystroke into a session
+        whose auth did not fail - /api/input."""
+        ip = "198.51.100.7"
+        with server._scan_pattern_lock:
+            server._scan_pattern[ip] = [time.time()] * 3
+        # The connect success path: _forgive_scan_for_ip must NOT be
+        # called from there any more.
+        src = inspect.getsource(server.Handler._connect)
+        self.assertNotIn("_forgive_scan_for_ip(ip)", src)
+        # /api/input on a healthy session forgives.
+        h = server.Handler.__new__(server.Handler)
+        h._client_ip = lambda: ip
+        h._json = lambda *a, **k: None
+        h._json_body = lambda: {"session_id": "s", "data": "ls\n"}
+        sess = unittest.mock.MagicMock(alive=True, auth_failed=False)
+        sess.write.return_value = True
+        h._require_session = lambda sid: sess
+        h._input()
+        with server._scan_pattern_lock:
+            self.assertNotIn(ip, server._scan_pattern)
+        # ...but not when auth failed.
+        with server._scan_pattern_lock:
+            server._scan_pattern[ip] = [time.time()] * 3
+        sess.auth_failed = True
+        h._input()
+        with server._scan_pattern_lock:
+            self.assertIn(ip, server._scan_pattern)
 
     def test_forgive_no_op_on_empty_ip(self):
         # Should not raise
