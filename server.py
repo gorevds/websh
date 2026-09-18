@@ -989,6 +989,40 @@ def _parse_denied_hosts(entries):
     return frozenset(host_set), tuple(net_list)
 
 
+# What a client may name as an ssh destination / login. The deny-list
+# resolves the host with getaddrinfo() and FALLS OPEN when resolution
+# fails, so any syntax getaddrinfo rejects but ssh accepts - `user@host`,
+# `ssh://user@host:port` - used to slip straight past `denied_hosts`.
+# Hostnames: letters, digits, dot, dash, underscore (ssh_config aliases
+# included); IP literals (bare or [bracketed]) via the ipaddress module,
+# which also covers the IPv6 forms with a %scope. No `@ : / \` or
+# whitespace anywhere - those are exactly the characters that turn a
+# hostname into something ssh parses differently than we validated.
+_HOSTNAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,253}$')
+_USERNAME_RE = re.compile(r'^[A-Za-z0-9._@-]{1,64}$')
+
+
+def _valid_host(host):
+    """True when `host` is a plain hostname/alias or an IP literal."""
+    if not isinstance(host, str) or not host or host.startswith("-"):
+        return False
+    h = host[1:-1] if (host.startswith("[") and host.endswith("]")
+                       and len(host) > 2) else host
+    try:
+        ipaddress.ip_address(h)
+        return True
+    except ValueError:
+        pass
+    return bool(_HOSTNAME_RE.match(host))
+
+
+def _valid_username(username):
+    """True when `username` is a plain login name (no whitespace, no
+    shell/ssh-significant punctuation). `-l` takes it verbatim."""
+    return (isinstance(username, str) and not username.startswith("-")
+            and bool(_USERNAME_RE.match(username)))
+
+
 def _normalize_host(host):
     """Return host without RFC 3986 [...] wrapping.
 
@@ -3520,8 +3554,8 @@ class Handler(BaseHTTPRequestHandler):
             return _bad("invalid conn_id")
         if not host or not username:
             return _bad("host and username are required")
-        if host.startswith("-") or username.startswith("-"):
-            return _bad("host and username must not start with '-'")
+        if not _valid_host(host) or not _valid_username(username):
+            return _bad("invalid host or username")
         try:
             iv = base64.b64decode(iv_b64, validate=True)
             ct = base64.b64decode(ct_b64, validate=True)
@@ -3791,8 +3825,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "host and username are required"}, 400)
             return
 
-        # Reject values that could be interpreted as SSH flags
-        if host.startswith("-") or username.startswith("-"):
+        # Reject anything that isn't a plain hostname/IP + login name:
+        # ssh flags (`-o...`), and the `user@host` / `ssh://` destination
+        # forms that getaddrinfo() cannot resolve - which is how they
+        # used to bypass the deny-list (resolution failure = fall-open).
+        if not _valid_host(host) or not _valid_username(username):
             self._json({"error": "invalid host or username"}, 400)
             return
 
