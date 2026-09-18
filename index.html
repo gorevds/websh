@@ -239,6 +239,9 @@
     /* ── File browser modal ── */
     .fb-panel{background:var(--sf);border:1px solid var(--bd);border-radius:12px;width:680px;max-width:95vw;max-height:80vh;display:flex;flex-direction:column;overflow:hidden}
     .fb-hd{display:flex;align-items:center;gap:8px;padding:10px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
+    /* .panel-close is absolutely positioned for the other panels; here it
+       belongs in the header row, not in the page's top-right corner. */
+    .fb-hd .panel-close{position:static;flex-shrink:0;margin-left:auto}
     /* Breadcrumb path. Scrolls horizontally on a deep path rather than
        ellipsising, so every segment stays clickable; min-width:0 keeps
        it from shoving the close button off the row. */
@@ -249,7 +252,7 @@
     .fb-crumb.cur:hover{background:none}
     .fb-crumb-sep{color:var(--dim);opacity:.5;flex-shrink:0;padding:0 1px}
     /* Toolbar row: create/hidden/filter on the left, sort on the right. */
-    .fb-tools{display:flex;align-items:center;gap:6px;padding:7px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
+    .fb-tools{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:7px 14px;border-bottom:1px solid var(--bd);background:var(--bg);flex-shrink:0}
     .fb-tool{background:none;border:1px solid var(--bd);color:var(--dim);cursor:pointer;padding:3px 9px;border-radius:4px;font-size:11px;font-family:inherit;white-space:nowrap;flex-shrink:0;transition:.15s}
     .fb-tool:hover{color:var(--tx);border-color:var(--dim)}
     .fb-tool.on{color:var(--ac);border-color:var(--ac)}
@@ -311,6 +314,7 @@
       .fb-dt{display:none}
       .fb-sz{min-width:52px}
       .fb-sort button{padding:3px 5px}
+      .fb-sort{margin-left:auto}
       .fb-tool{padding:3px 6px}
     }
   </style>
