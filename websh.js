@@ -3944,6 +3944,8 @@ let _fbListedSid = null;
 // null. At most one is open at a time: opening a second runs this to
 // dismiss the first, so the list never shows two competing editors.
 let _fbConfirm = null;
+// The entries behind the rows on screen, for client-side re-sorting.
+let _fbEntries = null;
 
 // Escape while an inline editor is open dismisses it ("no") instead of
 // closing the whole browser, which is what the user means and saves
@@ -4118,6 +4120,7 @@ function renderFbEntries(entries, absPath) {
   // Every row here is about to be replaced, so an armed confirmation
   // from the previous listing no longer refers to anything on screen.
   _fbConfirm = null;
+  _fbEntries = entries;
   list.innerHTML = '';
   if (absPath !== '/') {
     let parent = absPath.lastIndexOf('/') > 0
@@ -4145,6 +4148,17 @@ function renderFbEntries(entries, absPath) {
     } else {
       activate(() => {
         let id = _fbId;
+        let tp = id && panes[id];
+        // One transfer per pane. startFastDownload() refuses a second
+        // one silently, and we used to close the browser first - so the
+        // click did nothing at all and said nothing. Keep the browser
+        // open and explain.
+        if (tp && (tp.upload || tp.download)) {
+          showToast('A ' + (tp.upload ? 'upload' : 'download') +
+                    ' is already running in this pane — wait for it or cancel it first.',
+                    'warn');
+          return;
+        }
         closeFb();
         if (id) startFastDownload(id, fullPath);
       });
@@ -4255,7 +4269,30 @@ function setFbSort(key) {
   else { settings.fbSort = key; settings.fbSortDir = key === 'name' ? 1 : -1; }
   saveSettings();
   syncFbSortUi();
-  reloadFbDir();
+  // Sorting is a reorder of rows already on screen - no roundtrip. It
+  // used to re-fetch the directory, which destroyed an open rename
+  // editor (and its typed text) and, offline, replaced a good listing
+  // with "Failed to load". The row NODES are moved, so an open editor
+  // or an armed delete confirmation survives the reorder.
+  if (!reorderFbRows()) reloadFbDir();
+}
+
+function reorderFbRows() {
+  let list = $('fbList');
+  if (!list || !_fbEntries) return false;
+  let byName = new Map();
+  for (let row of list.querySelectorAll('.fb-row')) {
+    if (row.dataset.parent !== '1') byName.set(row.dataset.name, row);
+  }
+  let parent = list.querySelector('.fb-row[data-parent="1"]');
+  let anchor = parent ? parent.nextSibling : list.firstChild;
+  for (let e of sortFbEntries(_fbEntries)) {
+    let row = byName.get(e.name);
+    if (!row) continue;
+    list.insertBefore(row, anchor);
+    anchor = row.nextSibling;
+  }
+  return true;
 }
 
 // Paint the active column and its arrow. Called on open as well as on
@@ -4312,6 +4349,7 @@ function askFbDelete(row, fullPath, name, type) {
     row.classList.remove('fb-confirm');
     row.innerHTML = restore;
     wireFbRow(row, fullPath, name, type);
+    applyFbVisibility();
   };
   _fbConfirm = done;
   row.querySelector('.fb-cf-no').addEventListener('click', ev => {
@@ -4357,15 +4395,35 @@ function applyFbVisibility() {
   let fInp = $('fbFilter');
   let filt = (fInp && fInp.value || '').trim().toLowerCase();
   let showHidden = !!settings.fbShowHidden;
+  let total = 0, shown = 0;
   for (let row of list.querySelectorAll('.fb-row')) {
-    // ".." and an open editor row are always shown.
-    if (row.dataset.parent === '1' || row.classList.contains('fb-edit')) {
-      row.classList.remove('fb-hide'); continue;
+    if (row.dataset.parent === '1') { row.classList.remove('fb-hide'); continue; }
+    total++;
+    // An open editor or an ARMED DELETE CONFIRMATION is always shown:
+    // hiding a pending destructive question (by typing in the filter or
+    // flipping Hidden) left it answerable by the next blind Escape.
+    if (row.classList.contains('fb-edit') ||
+        row.classList.contains('fb-confirm')) {
+      row.classList.remove('fb-hide'); shown++; continue;
     }
     let name = row.dataset.name || '';
     let hideDot = !showHidden && name.charAt(0) === '.';
     let hideFilt = filt && name.toLowerCase().indexOf(filt) < 0;
     row.classList.toggle('fb-hide', !!(hideDot || hideFilt));
+    if (!(hideDot || hideFilt)) shown++;
+  }
+  // A directory with entries but nothing visible must not look empty.
+  let note = $('fbNoMatch');
+  if (total && !shown) {
+    if (!note) {
+      note = document.createElement('div');
+      note.id = 'fbNoMatch'; note.className = 'fb-msg';
+      list.appendChild(note);
+    }
+    note.textContent = filt ? 'No matches for “' + filt + '”'
+                            : 'Only hidden files here — toggle Hidden to show them';
+  } else if (note) {
+    note.remove();
   }
 }
 function applyFbFilter() { applyFbVisibility(); }
@@ -4411,6 +4469,7 @@ function askFbRename(row, fullPath, name, type) {
     row.classList.remove('fb-edit');
     row.innerHTML = restore;
     wireFbRow(row, fullPath, name, type);
+    applyFbVisibility();
   };
   _fbConfirm = done;
   let commit = () => {
