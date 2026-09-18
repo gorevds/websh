@@ -154,8 +154,15 @@ in one `write(2)` call and stays safe to view in a terminal.
 
 ## Input validation
 
-- Host and username values starting with `-` are rejected (prevents SSH flag injection)
+- Host must be a plain hostname/alias (`[A-Za-z0-9._-]`) or an IP literal, username a plain login (`[A-Za-z0-9._@-]`); neither may start with `-`. This rejects SSH flags and the `user@host` / `ssh://` destination forms that `getaddrinfo()` cannot resolve — those used to slip past `denied_hosts`, which falls open on resolution failure by design
 - Session IDs are validated as UUID format
+
+## Cross-site request forgery
+
+State-changing methods (`POST`, `DELETE`) are gated twice:
+
+- **Origin.** A browser sends `Origin` on every cross-site request. If its host is not the `Host` this request was addressed to (or the first `X-Forwarded-Host` from a `TRUSTED_PROXIES` peer), the reply is `403 {"error":"cross-site request refused"}`; so is `Origin: null` and `Sec-Fetch-Site: cross-site`/`same-site`. A request with neither header comes from a non-browser client (curl, monitoring) and passes — those are not CSRF victims. The PHP shim enforces the same rule itself, because it forwards no browser headers to the backend.
+- **Media type.** JSON endpoints require `Content-Type: application/json` (`415` otherwise). A cross-site `<form>` can only produce `text/plain`, urlencoded or multipart bodies, so a forged form post never reaches a handler even without the Origin check.
 - Terminal dimensions are clamped to safe ranges
 - `MAX_SESSIONS` limits concurrent user sessions; `MAX_BG_SESSIONS` limits file transfer sessions separately
 - `MAX_SESSIONS_PER_IP` (off by default) caps how many sessions a single source IP can hold at once — useful when running a public-facing instance where one abuser shouldn't be able to fill all the global slots

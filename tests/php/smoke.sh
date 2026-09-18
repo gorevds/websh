@@ -76,4 +76,22 @@ code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' \
 [ "$code" = "404" ] || fail "malformed action status" "$code"
 grep -q 'unknown action' "$UNKNOWN_OUT" || fail "malformed action body" "$(cat "$UNKNOWN_OUT")"
 
+# 7. CSRF gate: a POST whose Origin host differs from the Host header
+#    is refused at the shim (the backend never sees browser headers
+#    through here). Same-origin and no-Origin (curl) both pass.
+code=$(curl -s -o "$UNKNOWN_OUT" -w '%{http_code}' -X POST \
+     -H 'Content-Type: application/json' -H 'Origin: https://evil.example' \
+     -d '{"session_id":"s1","data":"x"}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=input")
+[ "$code" = "403" ] || fail "cross-site POST not refused" "$code $(cat "$UNKNOWN_OUT")"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     -H 'Content-Type: application/json' -H "Origin: http://127.0.0.1:$PHP_PORT" \
+     -d '{"session_id":"s1","data":"x"}' \
+     "http://127.0.0.1:$PHP_PORT/api.php?action=input")
+[ "$code" = "200" ] || fail "same-origin POST refused" "$code"
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+     -H 'Content-Type: application/json' -H 'Origin: null' \
+     -d '{}' "http://127.0.0.1:$PHP_PORT/api.php?action=input")
+[ "$code" = "403" ] || fail "Origin: null not refused" "$code"
+
 echo "PHP proxy smoke: all assertions passed"
