@@ -3154,10 +3154,18 @@ function renderSaved() {
     div.innerHTML=
       `<div class="sv-info"><div class="sv-name">${esc(c.name)}</div>`+
       `<div class="sv-host">${esc(c.user)}@${esc(c.host)}:${Number(c.port) || 22}${suffix}${nokeyTag}</div></div>`+
-      `<div class="sv-actions"><button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
+      `<div class="sv-actions">` +
+        `<button class="sv-btn edit" data-edit="${i}" title="Edit" aria-label="Edit ${esc(c.name)}">${ic('pencil')}</button>` +
+        `<button class="sv-btn del" data-idx="${i}">Delete</button></div>`;
     el.appendChild(div);
   });
   el.onclick=e => {
+    let editBtn = e.target.closest('[data-edit]');
+    if (editBtn) {
+      e.stopPropagation();
+      editSaved(parseInt(editBtn.getAttribute('data-edit'), 10));
+      return;
+    }
     if(e.target.classList.contains('del')){
       let idx = parseInt(e.target.getAttribute('data-idx'));
       let c = list[idx];
@@ -3181,6 +3189,82 @@ function renderSaved() {
     }
     connectSaved(c);
   };
+}
+
+// Inline editor on a saved card. Without it the only way to fix a typo
+// in a name, port or username was Delete + create again - and for a
+// vault-backed entry that means re-entering the password.
+//
+// What can change depends on where the secret lives. A vault entry's
+// destination is inside the encrypted blob's AAD and in the server-side
+// record, and the client cannot rewrite either without the secret, so
+// only the display name is editable there; changing the destination
+// means saving the credentials again. Entries without a stored secret
+// carry all their metadata locally, so everything is editable.
+function editSaved(idx) {
+  let list = loadSaved(), c = list[idx];
+  if (!c) return;
+  let row = $('savedList').querySelector(`.sv[data-idx="${idx}"]`);
+  if (!row || row.classList.contains('editing')) return;
+  let locked = !!c.conn_id;             // secret lives in the vault
+  row.classList.add('editing');
+  row.innerHTML =
+    '<div class="sv-edit">' +
+      '<input class="e-name" maxlength="64" aria-label="Name" placeholder="Name">' +
+      '<input class="e-user" maxlength="64" aria-label="User" placeholder="user"' + (locked ? ' disabled' : '') + '>' +
+      '<input class="e-host" maxlength="253" aria-label="Host" placeholder="host"' + (locked ? ' disabled' : '') + '>' +
+      '<input class="e-port" type="number" min="1" max="65535" aria-label="Port" placeholder="22"' + (locked ? ' disabled' : '') + '>' +
+    '</div>' +
+    '<span class="sv-edit-note"></span>' +
+    '<div class="sv-edit-row">' +
+      '<button type="button" class="btn sv-cancel">Cancel</button>' +
+      '<button type="button" class="btn btn-p sv-save">Save</button>' +
+    '</div>';
+  let q = sel => row.querySelector(sel);
+  q('.e-name').value = c.name || '';
+  q('.e-user').value = c.user || '';
+  q('.e-host').value = c.host || '';
+  q('.e-port').value = Number(c.port) || 22;
+  let note = q('.sv-edit-note');
+  if (locked) {
+    note.textContent = 'Saved in the vault — re-save the credentials to change the destination.';
+  }
+  let close = () => renderSaved();
+  q('.sv-cancel').addEventListener('click', ev => { ev.stopPropagation(); close(); });
+  q('.sv-save').addEventListener('click', ev => { ev.stopPropagation(); commit(); });
+  row.addEventListener('keydown', ev => {
+    ev.stopPropagation();
+    if (ev.key === 'Enter') { ev.preventDefault(); commit(); }
+    if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+  });
+  row.addEventListener('click', ev => ev.stopPropagation());   // not a connect click
+  function fail(msg, sel) {
+    note.textContent = msg;
+    note.classList.add('sv-edit-err');
+    let el = q(sel); if (el) el.focus();
+  }
+  function commit() {
+    let name = q('.e-name').value.trim();
+    if (!name) return fail('Name cannot be empty.', '.e-name');
+    let next = Object.assign({}, c, {name: name});
+    if (!locked) {
+      let user = q('.e-user').value.trim(), host = q('.e-host').value.trim();
+      let port = parseInt(q('.e-port').value, 10);
+      // The same shapes the server accepts at /api/connect, so a saved
+      // entry can't be edited into one that is refused on use.
+      if (!/^[A-Za-z0-9._@-]{1,64}$/.test(user)) return fail('User: letters, digits and . _ - @ only.', '.e-user');
+      if (!/^[A-Za-z0-9._:\[\]-]{1,253}$/.test(host)) return fail('Host: a hostname or an IP address.', '.e-host');
+      if (!(port >= 1 && port <= 65535)) return fail('Port must be between 1 and 65535.', '.e-port');
+      Object.assign(next, {user: user, host: host, port: port});
+    }
+    let all = loadSaved();
+    all[idx] = next;
+    saveSaved(all);
+    renderSaved();
+    showToast('Saved “' + name + '”', 'ok');
+  }
+  q('.e-name').focus();
+  q('.e-name').select();
 }
 
 // Fire-and-forget DELETE /api/save for a vault-backed entry. The PHP
