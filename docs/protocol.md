@@ -139,10 +139,26 @@ Streams into `$HOME/<path>` over the ControlMaster. Reply
 `{"ok": true, "bytes": n, "path": "$HOME/<path>"}` / `{"error": ...}`.
 
 ### POST /api/upload_finalize
-Body: `session_id`, `tmp`, `final`. Moves `$HOME/<tmp>` into the
-foreground tmux pane's cwd with collision auto-increment. Reply
-`{"ok": true, "path": abs}` or `{"ok": false, "non_persistent": true}`
-(client falls back to a foreground `mv`).
+Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`
+to its destination with collision auto-increment (`a.txt` → `a(1).txt`).
+
+`dir` is an absolute remote path — the directory the client wants the
+file in, normally the one its file browser is showing. Same validation
+as `rm`/`mkdir`/`mv`: absolute, no NUL, ≤ 4096 bytes, not bare `/`s →
+`400 {"error": "invalid dir"}`. It confers no access the session does
+not already have; the same user could `mv` there from their shell. A
+placement is audited as an `upload_place` access-log event carrying the
+final path (the `upload` event only sees the staging name in `$HOME`).
+
+Without `dir` the destination is the foreground tmux pane's cwd, which
+only a tmux-backed session can resolve: others get
+`{"ok": false, "non_persistent": true}` and the client falls back to a
+foreground `mv`. With `dir` no tmux is involved, so the move is
+keystroke-free for every session.
+
+Reply `{"ok": true, "path": abs}`. Failures carry the remote's own
+reason with a matching status: `404` for a missing directory, `403` for
+a permission or read-only failure, `409` for a conflict, `502` otherwise.
 
 ### POST /api/upload_cancel
 Body: `session_id`, `tmp`. Best-effort `rm` of the staged file.

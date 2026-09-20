@@ -2974,18 +2974,26 @@ class SSHSession(object):
             return False, "client sent fewer bytes than Content-Length"
         return True, ""
 
-    def finalize_upload(self, tmp_name, final_name):
-        """Move $HOME/<tmp_name> into the foreground tmux pane's cwd
+    def finalize_upload(self, tmp_name, final_name, dest_dir=None):
+        """Move $HOME/<tmp_name> into a directory on the remote host
         with auto-increment-on-conflict — without typing into the
-        foreground PTY. Persistent-only: tmux's own `#{pane_current_path}`
-        format variable is the cross-platform way to know the pane's
-        current working directory, so we don't need /proc introspection.
+        foreground PTY.
 
-        Returns (ok, final_path_or_error). For non-persistent sessions
-        returns (False, 'non-persistent') so the caller can fall back
-        to a client-side foreground mv (which has its own alt-screen
-        guard for vim/less/htop)."""
-        if not self.persistent or not self.slot_id:
+        dest_dir is an absolute remote path (the directory the file
+        browser is showing) — validated by the caller. Without one the
+        destination is the foreground tmux pane's cwd, read from tmux's
+        own `#{pane_current_path}`, which is the cross-platform way to
+        learn it without /proc introspection; that path is
+        persistent-only and returns (False, 'non-persistent') for other
+        sessions so the caller can fall back to a client-side foreground
+        mv (which has its own alt-screen guard for vim/less/htop).
+
+        An explicit dest_dir needs no tmux — only the ControlMaster
+        side-channel every session has — so uploads aimed at a chosen
+        directory are keystroke-free for non-persistent panes too.
+
+        Returns (ok, final_path_or_error)."""
+        if dest_dir is None and (not self.persistent or not self.slot_id):
             return False, "non-persistent"
         if not self._mux_ready():
             return False, "control socket not ready"
@@ -2995,10 +3003,21 @@ class SSHSession(object):
         # decoded values land in shell vars and never touch the parser.
         b_tmp = base64.b64encode(tmp_name.encode("utf-8")).decode("ascii")
         b_final = base64.b64encode(final_name.encode("utf-8")).decode("ascii")
-        target = "websh-" + self.slot_id
+        target = "websh-" + (self.slot_id or "")
+
+        if dest_dir is not None:
+            # The caller named the directory: decode it into $cwd the same
+            # way as every other name, so a directory with spaces, quotes
+            # or a newline in it is never parsed as shell syntax.
+            b_dir = base64.b64encode(dest_dir.encode("utf-8")).decode("ascii")
+            cwd_expr = _sh_b64('c', b_dir) + '; cwd="$c"; '
+        else:
+            cwd_expr = ('cwd=$(' + self.tmux_cmd + ' display -p -t ' + target +
+                        ' "#{pane_current_path}" 2>/dev/null); '
+                        '[ -n "$cwd" ] || cwd="$HOME"; ')
 
         # One ssh roundtrip via ControlMaster:
-        #   1. ask tmux for the pane's cwd (cross-platform)
+        #   1. resolve the destination directory (named, or the pane's)
         #   2. fall back to $HOME if tmux didn't tell us
         #   3. cd there
         #   4. find a non-colliding final name with the same ext-aware
@@ -3009,11 +3028,15 @@ class SSHSession(object):
         #      surface it to the user
         remote_cmd = (
             _sh_b64('t', b_tmp) + '; ' +
-            _sh_b64('f', b_final) + '; '
-            'cwd=$(' + self.tmux_cmd + ' display -p -t ' + target +
-                ' "#{pane_current_path}" 2>/dev/null); '
-            '[ -n "$cwd" ] || cwd="$HOME"; '
-            'cd -- "$cwd" || exit 1; '
+            _sh_b64('f', b_final) + '; ' +
+            cwd_expr +
+            # Distinct exit codes, because the shells disagree about the
+            # wording: dash's cd says "can't cd to /x" with no errno at
+            # all, where bash says "No such file or directory". Deciding
+            # here keeps the reason (and its HTTP status) the same on
+            # every remote.
+            '[ -d "$cwd" ] || exit 3; '
+            'cd -- "$cwd" || exit 4; '
             'b="${f%.*}"; e="${f##*.}"; '
             'if [ "$b.$e" = "$f" ]; then '
                 'n=1; while [ -e "$f" ]; do f="$b($n).$e"; n=$((n+1)); done; '
@@ -3026,11 +3049,20 @@ class SSHSession(object):
                 # mangling and the name(1)(2)(3) accumulation.
                 'o="$f"; n=1; while [ -e "$f" ]; do f="$o($n)"; n=$((n+1)); done; '
             'fi; '
-            'mv -- "$HOME/$t" "./$f" && printf %s "$cwd/$f"'
+            'mv -- "$HOME/$t" "./$f" || exit 5; printf %s "$cwd/$f"'
         )
         proc, err = self._mux_run(remote_cmd, 15, "finalize timeout")
         if err:
             return False, err
+        if proc.returncode == 3:
+            return False, "no such file or directory"
+        if proc.returncode == 4:
+            return False, _remote_errno_text(proc.stderr, "permission denied")
+        if proc.returncode == 5:
+            # mv's own message carries the errno (busybox and coreutils
+            # both), so the user sees "Permission denied" / "Read-only
+            # file system" rather than an exit code.
+            return False, _remote_errno_text(proc.stderr, "move failed")
         if proc.returncode != 0:
             err = proc.stderr.decode("utf-8", "replace").strip()[:300]
             return False, "finalize exit %d: %s" % (proc.returncode, err)
@@ -4891,7 +4923,13 @@ class Handler(BaseHTTPRequestHandler):
         path on success, or `non-persistent` so the client knows to
         fall back to its own foreground-mv path.
 
-        Body: { session_id, tmp, final }."""
+        With an explicit `dir` (an absolute remote path — the directory
+        the file browser is showing) the file lands there instead, and
+        the move works for non-persistent sessions too: naming the
+        destination removes the only thing tmux was needed for. It grants
+        no new access — the same user could `mv` there from the shell.
+
+        Body: { session_id, tmp, final, dir? }."""
         if self._side_channel_throttled():
             return
         body = self._json_body()
@@ -4900,6 +4938,7 @@ class Handler(BaseHTTPRequestHandler):
         sid = body.get("session_id", "")
         tmp = body.get("tmp", "")
         final = body.get("final", "")
+        dest_dir = body.get("dir", None)
         # Order pinned by the dispatch tests: sid shape, then tmp/final
         # validation, then registry existence.
         if not self._valid_sid(sid):
@@ -4915,10 +4954,17 @@ class Handler(BaseHTTPRequestHandler):
                 or "/" in final or "\x00" in final or final in ("..", ".")):
             self._json({"error": "invalid final"}, 400)
             return
+        # Same rules as rm/mkdir/mv: absolute, no NUL, not bare "/"-padding.
+        # A non-string (or a relative path) is a client bug, not a request
+        # to fall back to the pane's cwd - reject it rather than guess.
+        if dest_dir is not None and (self._bad_abs_path(dest_dir)
+                                     or len(dest_dir) > 4096):
+            self._json({"error": "invalid dir"}, 400)
+            return
         session = self._require_session(sid)
         if session is None:
             return
-        ok, msg = session.finalize_upload(tmp, final)
+        ok, msg = session.finalize_upload(tmp, final, dest_dir)
         if not ok:
             # `non-persistent` is an expected, non-error outcome —
             # surface it with 200 so the client can branch cleanly
@@ -4926,9 +4972,18 @@ class Handler(BaseHTTPRequestHandler):
             if msg == "non-persistent":
                 self._json({"ok": False, "non_persistent": True})
                 return
-            self._json({"error": msg}, 502)
+            _access_log_emit("upload_place", self._client_ip(), sid=sid,
+                             target_host=getattr(session, "_host", ""),
+                             path=dest_dir or "", result="error", error=msg)
+            self._json({"error": msg}, _side_channel_status(msg))
             return
         session.last_activity = time.time()
+        # Where the bytes ended up. /api/upload logs the staging name in
+        # $HOME; without this the audit trail stopped short of the file's
+        # real resting place, which the client now gets to choose.
+        _access_log_emit("upload_place", self._client_ip(), sid=sid,
+                         target_host=getattr(session, "_host", ""),
+                         path=msg, result="ok")
         self._json({"ok": True, "path": msg})
 
     def _upload_cancel(self):
