@@ -6727,6 +6727,36 @@ test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pan
   cleanup(env);
 });
 
+test('status bars float over the terminal instead of resizing it', async () => {
+  // In the pane's flex column each bar shrank the terminal: the output
+  // jumped, xterm refit and the PTY was resized mid-disconnect - then
+  // again when the bar was hidden.
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  const stack = p.el.querySelector('.pane-overlays');
+  ok(stack && stack.parentElement.classList.contains('pane-term'),
+     'the stack is anchored to the terminal area, not the pane column');
+  const code = html.replace(/\/\*[\s\S]*?\*\//g, '');
+  ok(/\.pane-overlays\{position:absolute/.test(code), 'stack is out of flow');
+  ok(/\.pane-overlays\{[^}]*pointer-events:none/.test(code) &&
+     /\.pane-overlays>\*\{pointer-events:auto\}/.test(code),
+     'clicks pass through the stack, but not through the bars themselves');
+  ok(!/\.reconnect-bar\{[^}]*flex-shrink/.test(code) || !/\.pane>\s*\.reconnect-bar/.test(code),
+     'reconnect bar no longer participates in the pane column');
+  // All three bars end up in the stack, in DOM order, none in the column.
+  win.showReconnectBar(p);
+  win.showTmuxBar(p, 'tmux missing');
+  p.firstFailureAt = Date.now();
+  win.setReconnecting(p, true);
+  const inStack = ['[data-reconnect]', '[data-tmux-bar]', '.pane-reconnect']
+    .map(sel => { const el = p.el.querySelector(sel); return !!el && el.parentElement === stack; });
+  ok(inStack.every(Boolean), 'reconnect, tmux and retry banners all live in the stack; got ' + JSON.stringify(inStack));
+  ok(p.el.querySelector('.pane-bar').nextElementSibling.classList.contains('pane-term'),
+     'nothing sits between the pane bar and the terminal');
+  win.setReconnecting(p, false);
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
