@@ -287,12 +287,15 @@ function createPane(container) {
       `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">${ic('split-v')}</button>` +
       `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">${ic('close')}</button>` +
     `</div>` +
-    `<div class="reconnect-bar h" data-reconnect="${id}">` +
-      `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
-      `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
-      `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
+    `<div class="pane-term">` +
+      `<div class="pane-overlays" data-overlays="${id}">` +
+        `<div class="reconnect-bar h" data-reconnect="${id}">` +
+          `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
+          `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
+          `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
+        `</div>` +
+      `</div>` +
     `</div>` +
-    `<div class="pane-term"></div>` +
     `<div class="search-bar h" data-search="${id}">` +
       `<input type="text" placeholder="Search...">` +
       `<button onclick="searchPrev()" title="Previous match" aria-label="Previous match">${ic('chevron-up')}</button>` +
@@ -1679,8 +1682,7 @@ function setReconnecting(p, on) {
     el = document.createElement('div');
     el.className = 'pane-reconnect';
     el.setAttribute('role', 'status');
-    let body = p.el;                      // .pane is position:relative
-    body.appendChild(el);
+    p.el.querySelector('.pane-overlays').appendChild(el);
   }
   let paint = () => {
     let left = Math.max(0, Math.ceil(
@@ -2101,8 +2103,9 @@ function showTmuxBar(p, note) {
     shortBtn.textContent = 'Connect short-lived';
     shortBtn.onclick = () => { tmuxSwitchToShortLived(p.id); };
     bar.appendChild(shortBtn);
-    let panebar = p.el.querySelector('.pane-bar');
-    panebar.after(bar);
+    // Into the overlay stack, not the pane's flex column: a bar that
+    // takes layout space resizes the terminal (and the remote PTY).
+    p.el.querySelector('.pane-overlays').appendChild(bar);
   }
   bar.querySelector('[data-tmux-msg]').textContent = note || 'tmux failed on this target';
   bar.classList.remove('h');
