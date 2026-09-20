@@ -4153,6 +4153,10 @@ function closeUploadSession(u) {
 // paint the progress bar + text for this outcome, then after `delay` clear
 // the transfer slot, hide the bar and refresh the badge. Painting differs
 // per outcome and stays at the call sites via `paint(bar, text)`.
+// Resolves once the slot is released - the moment another transfer may
+// start. A queue (fbBulkDownload) must wait for THAT, not for the bytes:
+// the finished transfer keeps p[slot] set while its banner is showing,
+// and startFastDownload refuses to start while it is.
 function settleTransfer(p, slot, delay, paint) {
   let el = p.el && p.el.querySelector('[data-upload-progress]');
   if (el && paint) {
@@ -4160,12 +4164,13 @@ function settleTransfer(p, slot, delay, paint) {
           el.querySelector('.upload-progress-text'));
     paintFbXfer(p);          // the outcome, not just the progress
   }
-  setTimeout(() => {
+  return new Promise(resolve => setTimeout(() => {
     p[slot] = null;
     hideUploadProgress(p);
     updatePaneBadge(p);
     if (el) el.querySelector('.upload-progress-bar').style.background = '';
-  }, delay);
+    resolve();
+  }, delay));
 }
 
 function finishUpload(p, success, reason) {
@@ -4315,22 +4320,23 @@ function startFastDownload(id, path, o) {
         document.body.appendChild(a); a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(a.href);
-        finishDownload(p, true, null, settleDelay);
-        return true;
+        return finishDownload(p, true, null, settleDelay).then(() => true);
       });
     })
     .catch(e => {
       if (p.download && !p.download.cancelled)
-        finishDownload(p, false, e.message || 'download failed', settleDelay);
+        return finishDownload(p, false, e.message || 'download failed', settleDelay)
+          .then(() => false);
       return false;
     });
 }
 
+// Resolves when the pane can take another transfer (see settleTransfer).
 function finishDownload(p, success, msg, settleDelay) {
   let dl = p.download;
-  if (!dl) return;
+  if (!dl) return Promise.resolve();
   dl.cancelled = true;
-  settleTransfer(p, 'download', settleDelay || 2000, (bar, text) => {
+  return settleTransfer(p, 'download', settleDelay || 2000, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       text.textContent = 'Download complete';
@@ -5246,8 +5252,9 @@ function fbBulkDownload() {
     let it = items[done];
     $('fbSelN').textContent = 'Downloading ' + (done + 1) + '/' + items.length +
                               ' — ' + it.name;
-    // A short settle so the next file can start: the pane keeps the
-    // finished transfer on screen for a couple of seconds otherwise.
+    // startFastDownload resolves once the pane's slot is free again; a
+    // short settle keeps the queue moving instead of showing each
+    // "Download complete" for two seconds.
     return startFastDownload(id, it.path, {settleDelay: 250})
       .then(ok => {
         if (!ok) { stopped = it.name; return; }
