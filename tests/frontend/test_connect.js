@@ -7044,6 +7044,35 @@ test('bulk download: the second file starts once the first has settled', async (
   cleanup(env);
 });
 
+test('file browser: the checkbox survives Cancel on a delete or rename editor', async () => {
+  // The editors restore the row with innerHTML, which recreates the
+  // checkbox without its listener; a click on it then bubbled to the
+  // row and downloaded the file instead of selecting it.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const dl = [];
+  win.startFastDownload = (id, path) => { dl.push(path); return Promise.resolve(true); };
+  // Delete editor, then Cancel.
+  let row = rowFor(win, 'zeta.txt');
+  row.querySelector('[data-fb-del]').click();
+  row.querySelector('.fb-cf-no').click();
+  pick(win, 'zeta.txt');
+  ok(rowFor(win, 'zeta.txt').classList.contains('fb-picked'), 'picked after a cancelled delete');
+  ok(dl.length === 0, 'and nothing was downloaded; got ' + JSON.stringify(dl));
+  ok(!$(win, 'fbOv').classList.contains('h'), 'browser still open');
+  // Rename editor, then Cancel.
+  row = rowFor(win, 'alpha.txt');
+  row.querySelector('[data-fb-ren]').click();
+  row.querySelector('.fb-ed-no').click();
+  pick(win, 'alpha.txt');
+  ok(rowFor(win, 'alpha.txt').classList.contains('fb-picked'), 'picked after a cancelled rename');
+  ok(dl.length === 0, 'still no download');
+  ok(/2 files selected/.test($(win, 'fbSelN').textContent), 'both counted');
+  cleanup(env);
+});
+
 // ── Upload into the directory the file browser is showing ───────────
 // Before this, an upload always landed wherever the shell happened to
 // be standing - so the one place the user could not send a file to was
