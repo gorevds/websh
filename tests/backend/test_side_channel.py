@@ -1081,6 +1081,49 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_finalize_accepts_the_root_directory(self):
+        # rm/mkdir/mv refuse a bare "/" because there it can only be a
+        # bug; for an upload it is where root's files go, and the browser
+        # can show it. The shared validator was the wrong rule here.
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            persistent = False
+            slot_id = None
+            last_activity = 0
+            _host = "host.example"
+            def finalize_upload(self, tmp, final, dest_dir=None):
+                captured["dir"] = dest_dir
+                return True, "/" + final
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": ".websh-tmp-r",
+                "final": "a.txt", "dir": "/"})
+            self.assertEqual(code, 200, body)
+            self.assertEqual(captured["dir"], "/")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_non_string_session_id_is_a_404_not_a_500(self):
+        # re.match raised TypeError on a list/dict/int, which the dispatch
+        # backstop turned into a 500 and an ERROR log line - for every
+        # endpoint that names a session. Cheap log spam, wrong status.
+        for sid in (["x"], {"a": 1}, 7, None):
+            for path, extra in (("/api/input", {"data": "x"}),
+                                ("/api/rm", {"path": "/tmp/x"}),
+                                ("/api/upload_finalize", {"tmp": "t", "final": "f"}),
+                                ("/api/upload_cancel", {"tmp": "t"})):
+                body = dict(extra, session_id=sid)
+                _, code = self._post(path, body)
+                self.assertEqual(code, 404, "%s sid=%r -> %s" % (path, sid, code))
+            # Disconnect is idempotent: "not an id" is answered like
+            # "already gone", never as a 500.
+            body, code = self._post("/api/disconnect", {"session_id": sid})
+            self.assertEqual((code, body.get("ok")), (200, True), repr(sid))
+
     def test_finalize_rejects_an_unusable_destination(self):
         # Relative, empty, NUL-bearing or non-string: a client bug, not a
         # request to silently fall back to the pane's cwd.
@@ -1094,7 +1137,7 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
         try:
-            for bad in ("relative/dir", "", "/", "/bad\x00dir", 7, ["/tmp"],
+            for bad in ("relative/dir", "", "/bad\x00dir", 7, ["/tmp"],
                         "/" + "x" * 5000):
                 body, code = self._post("/api/upload_finalize", {
                     "session_id": sid, "tmp": "x", "final": "f", "dir": bad})
