@@ -3990,6 +3990,29 @@ function foregroundMv(p, fname, tmp) {
                                 data: makeUploadMvCmd(fname, tmp) } });
 }
 
+// The bytes are safe in $HOME/<tmp>; only the move failed. Say where
+// they are and WHY the move failed - the server's reason (a folder that
+// vanished, a read-only one) is what the user needs to act on, and the
+// destination is the one they chose, not "the current directory".
+function describeFinalizeError(err, u) {
+  let where = u && u.destDir ? u.destDir : 'the current directory';
+  let tmp = u && u.currentTmp ? ' as ' + u.currentTmp : '';
+  let reason = typeof err === 'string' ? err : (err && err.message) || '';
+  let why;
+  if (/no such file/i.test(reason)) {
+    why = where + ' no longer exists';
+  } else if (/permission|not permitted|read-only/i.test(reason)) {
+    why = 'no permission to write to ' + where;
+  } else if (/control socket not ready/i.test(reason)) {
+    why = 'the connection to the host is not ready yet';
+  } else if (/not a directory/i.test(reason)) {
+    why = where + ' is not a folder';
+  } else {
+    why = 'it could not be moved to ' + where + (reason ? ' (' + reason + ')' : '');
+  }
+  return 'saved to your home folder' + tmp + ', but ' + why;
+}
+
 // Turn a failed upload into a reason that names the actual problem.
 // The server already returns a precise {error} string with a matching
 // HTTP status (see server.py _upload) — we surface that instead of a
@@ -4095,9 +4118,7 @@ function uploadNextFile(p) {
     .catch((err) => {
       if (!u || u.cancelled) return;
       if (err) console.warn('websh: upload finalize failed:', err);
-      finishUpload(p, false,
-        'the file was uploaded to your home folder but could not be moved' +
-        ' into the current directory');
+      finishUpload(p, false, describeFinalizeError(err, u));
     });
   };
   xhr.onerror = () => {
