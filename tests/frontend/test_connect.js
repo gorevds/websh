@@ -6700,13 +6700,331 @@ test('drag-and-drop: the highlight never gets stuck after a cancelled drag', asy
   cleanup(env);
 });
 
+// ── Picking several entries at once ─────────────────────────────────
+// Before this the browser could only act on one row at a time: clearing
+// out twenty files meant twenty confirmations.
+const pick = (win, name, shift) => {
+  const row = rowFor(win, name);
+  const ck = row.querySelector('.fb-ck');
+  const ev = new win.MouseEvent('click', {bubbles: true, cancelable: true,
+                                          shiftKey: !!shift});
+  ck.dispatchEvent(ev);
+  return row;
+};
+
+test('file browser: checkboxes pick rows without opening or downloading them', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const bar = $(win, 'fbSel');
+  ok(bar.classList.contains('h'), 'no action strip until something is picked');
+  ok(!rowFor(win, '..').querySelector('.fb-ck'), '".." has no checkbox');
+
+  const lsBefore = env.log.filter(r => r.action === 'ls').length;
+  pick(win, 'zeta.txt');
+  ok(!bar.classList.contains('h'), 'strip appears');
+  ok(/1 file selected/.test($(win, 'fbSelN').textContent),
+     'counts what is picked; got ' + $(win, 'fbSelN').textContent);
+  ok(rowFor(win, 'zeta.txt').classList.contains('fb-picked'), 'row marked');
+  // The click must not have navigated or started a transfer.
+  ok(env.log.filter(r => r.action === 'ls').length === lsBefore, 'did not navigate');
+  ok(!p.download, 'did not start a download');
+
+  pick(win, 'adir');
+  ok(/1 file, 1 folder selected/.test($(win, 'fbSelN').textContent),
+     'files and folders counted apart; got ' + $(win, 'fbSelN').textContent);
+  pick(win, 'zeta.txt');           // toggle back off
+  ok(/1 folder selected/.test($(win, 'fbSelN').textContent), 'toggles off again');
+  cleanup(env);
+});
+
+test('file browser: shift-click picks the run between two rows', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  // Default order is newest-first with directories pinned on top.
+  const order = Array.from($(win, 'fbList').querySelectorAll('.fb-row'))
+    .filter(r => r.dataset.parent !== '1').map(r => r.dataset.name);
+  pick(win, order[1]);
+  pick(win, order[3], true);
+  const picked = Array.from($(win, 'fbList').querySelectorAll('.fb-row.fb-picked'))
+    .map(r => r.dataset.name);
+  ok(picked.length === 3 && picked.join() === order.slice(1, 4).join(),
+     'the whole run is picked; got ' + picked.join());
+  cleanup(env);
+});
+
+test('file browser: a selection never outlives what is on screen', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  pick(win, 'zeta.txt');
+  pick(win, 'alpha.txt');
+  ok(/2 files selected/.test($(win, 'fbSelN').textContent), 'two picked');
+  // Filtering one of them away must drop it: the strip may never count
+  // something the user cannot see.
+  $(win, 'fbFilter').value = 'zeta'; win.applyFbFilter();
+  ok(/1 file selected/.test($(win, 'fbSelN').textContent),
+     'hidden row left the selection; got ' + $(win, 'fbSelN').textContent);
+  $(win, 'fbFilter').value = ''; win.applyFbFilter();
+  ok(/1 file selected/.test($(win, 'fbSelN').textContent), 'and does not come back');
+  // A new listing starts clean - the same name elsewhere is a different file.
+  win.loadFbDir('/srv');
+  await sleep(40);
+  ok($(win, 'fbSel').classList.contains('h'), 'selection cleared on navigation');
+  cleanup(env);
+});
+
+test('file browser: bulk delete asks once, then deletes one by one', async () => {
+  const rm = [];
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').map(e => e.action === 'rm'
+    ? {action: 'rm', response: b => { rm.push(b.path);
+        return b.path.endsWith('mid.txt') ? {error: 'Permission denied'} : {ok: true}; }}
+    : e);
+  const env = await mkEnv(plan); const win = env.win;
+  const toasts = [];
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.showToast = (m, k) => toasts.push([k, m]);
+  pick(win, 'zeta.txt'); pick(win, 'mid.txt'); pick(win, 'alpha.txt');
+
+  win.fbAskBulkDelete();
+  ok(/Delete 3 items\?/.test($(win, 'fbSelN').textContent),
+     'one question for the batch; got ' + $(win, 'fbSelN').textContent);
+  ok(rm.length === 0, 'nothing deleted before the answer');
+  // Cancel puts the strip back without deleting anything.
+  Array.from($(win, 'fbSelActs').querySelectorAll('button'))
+    .find(b => b.textContent === 'Cancel').click();
+  ok(/3 files selected/.test($(win, 'fbSelN').textContent), 'cancel restores the strip');
+  ok(rm.length === 0, 'cancel deleted nothing');
+
+  win.fbAskBulkDelete();
+  Array.from($(win, 'fbSelActs').querySelectorAll('button'))
+    .find(b => /^Delete 3$/.test(b.textContent)).click();
+  await sleep(80);
+  ok(rm.length === 3, 'one rm per entry; got ' + rm.length);
+  ok(rm.every(path => /^\/home\/alice\//.test(path)),
+     'absolute paths in the listed directory; got ' + rm.join());
+  // One failed: the others still went, and the user is told which failed.
+  const err = toasts.find(t => t[0] === 'err');
+  ok(err && /Deleted 2 of 3/.test(err[1]) && /mid\.txt/.test(err[1]),
+     'summary names the failure; got ' + JSON.stringify(err));
+  ok($(win, 'fbSel').classList.contains('h'), 'selection cleared afterwards');
+  cleanup(env);
+});
+
+test('file browser: bulk delete stops when the server says rate-limited', async () => {
+  let n = 0;
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').map(e => e.action === 'rm'
+    ? {action: 'rm', response: () => (++n > 1
+        ? {error: 'rate_limited', code: 'rate_limited'} : {ok: true})}
+    : e);
+  const env = await mkEnv(plan); const win = env.win;
+  const toasts = [];
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.showToast = (m, k) => toasts.push([k, m]);
+  pick(win, 'zeta.txt'); pick(win, 'mid.txt'); pick(win, 'alpha.txt');
+  win.fbAskBulkDelete();
+  Array.from($(win, 'fbSelActs').querySelectorAll('button'))
+    .find(b => /^Delete 3$/.test(b.textContent)).click();
+  await sleep(80);
+  ok(n === 2, 'stopped hammering after the refusal; got ' + n + ' calls');
+  const warn = toasts.find(t => t[0] === 'warn');
+  ok(warn && /deleted 1 of 3/.test(warn[1]),
+     'says how far it got; got ' + JSON.stringify(warn));
+  cleanup(env);
+});
+
+test('file browser: bulk download runs one at a time and skips folders', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const toasts = [];
+  win.showToast = (m, k) => toasts.push([k, m]);
+  // Record the order and prove only one transfer is ever in flight.
+  const started = [];
+  let live = 0, overlap = false;
+  win.startFastDownload = (id, path, o) => {
+    started.push(path);
+    if (live > 0) overlap = true;
+    live++;
+    return sleep(5).then(() => { live--; return true; });
+  };
+  pick(win, 'zeta.txt'); pick(win, 'adir'); pick(win, 'alpha.txt');
+  win.fbBulkDownload();
+  await sleep(80);
+  ok(started.length === 2, 'folders skipped; got ' + started.join());
+  ok(!overlap, 'never two transfers at once');
+  ok(toasts.some(t => /Folders can/.test(t[1])), 'says why the folder was skipped');
+  ok(toasts.some(t => /Downloaded 2 files/.test(t[1])),
+     'reports the total; got ' + JSON.stringify(toasts));
+  cleanup(env);
+});
+
+// ── Upload into the directory the file browser is showing ───────────
+// Before this, an upload always landed wherever the shell happened to
+// be standing - so the one place the user could not send a file to was
+// the folder they had just opened in the browser.
+
+// Minimal XHR that always succeeds, so tests exercise the finalize step.
+function okXhr(win) {
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 200; this.responseText = '{"ok":true}'; }
+    open() {} setRequestHeader() {} abort() {}
+    send() { if (this.onload) this.onload(); }
+  };
+}
+const FB_UPLOAD_PLAN = (path) => FB_PLAN(FB_ENTRIES, path).concat([
+  {action: 'upload_finalize',
+   response: b => ({ok: true, path: (b.dir || '/elsewhere') + '/' + b.final})},
+]);
+const fakeFile = (name, size) => ({name: name, size: size || 4});
+
+test('file browser: an upload lands in the folder on screen, not the shell cwd', async () => {
+  // The first listing answers /home/alice, the next one /srv/www - the
+  // fake server echoes no paths, so the moves are scripted.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sa', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+    {action: 'ls', response: {path: '/home/alice', entries: FB_ENTRIES}, once: true},
+    {action: 'ls', response: {path: '/srv/www', entries: FB_ENTRIES}},
+    {action: 'upload_finalize',
+     response: b => ({ok: true, path: (b.dir || '/elsewhere') + '/' + b.final})},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  // Navigate somewhere else first: the destination must follow the
+  // browser, not the directory it opened at.
+  win.loadFbDir('/srv/www');
+  await sleep(40);
+  ok($(win, 'fbPath').getAttribute('data-path') === '/srv/www', 'browser moved');
+  const lsBefore = env.log.filter(r => r.action === 'ls').length;
+
+  win.fbStartUpload([fakeFile('report.csv', 12)]);
+  await sleep(60);
+  const fin = env.log.filter(r => r.action === 'upload_finalize');
+  ok(fin.length === 1, 'one finalize call; got ' + fin.length);
+  ok(fin[0].body.dir === '/srv/www',
+     'finalize names the directory on screen; got ' + fin[0].body.dir);
+  ok(fin[0].body.final === 'report.csv', 'and the original file name');
+  // A non-persistent pane used to be sent an `mv` as keystrokes; with a
+  // named destination the server does it, so nothing is typed.
+  ok(!env.log.some(r => r.action === 'input'), 'nothing typed into the terminal');
+  // The listing refreshes so the file is simply there.
+  ok(env.log.filter(r => r.action === 'ls').length > lsBefore,
+     'directory listed again after the file landed');
+  cleanup(env);
+});
+
+test('file browser: the transfer is visible while the browser covers the pane', async () => {
+  const env = await mkEnv(FB_UPLOAD_PLAN('/home/alice')); const win = env.win;
+  // An XHR that reports progress but never completes, so the strip can
+  // be inspected mid-flight.
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 200; this.responseText = '{"ok":true}'; }
+    open() {} setRequestHeader() {} abort() {}
+    send() { if (this.upload.onprogress) this.upload.onprogress({loaded: 50}); }
+  };
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const strip = $(win, 'fbXfer');
+  ok(strip.classList.contains('h'), 'no strip while nothing is transferring');
+  win.fbStartUpload([fakeFile('big.bin', 100)]);
+  await sleep(20);
+  ok(!strip.classList.contains('h'), 'strip shown during the upload');
+  ok(/big\.bin/.test(strip.querySelector('.fb-xfer-text').textContent),
+     'names the file; got ' + strip.querySelector('.fb-xfer-text').textContent);
+  ok(strip.querySelector('.fb-xfer-bar').style.width === '50%',
+     'mirrors the pane bar; got ' + strip.querySelector('.fb-xfer-bar').style.width);
+  // Cancelling from the browser cancels the pane's transfer.
+  win.fbCancelXfer();
+  await sleep(5);
+  ok(/Cancelled/.test(strip.querySelector('.fb-xfer-text').textContent),
+     'cancel reaches the pane; got ' + strip.querySelector('.fb-xfer-text').textContent);
+  cleanup(env);
+});
+
+test('file browser: refuses an upload it cannot aim, and says why', async () => {
+  const env = await mkEnv(FB_UPLOAD_PLAN('/home/alice')); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const toasts = [];
+  win.showToast = (m, k) => toasts.push(m);
+
+  // A transfer already running in this pane.
+  p.upload = {files: [], fileIndex: 0};
+  win.fbStartUpload([fakeFile('a.txt')]);
+  ok(/already running/i.test(toasts.pop() || ''), 'busy pane refused with a reason');
+  p.upload = null;
+
+  // Rows that belong to a session this pane no longer has: the path on
+  // screen may not exist on the host we would be uploading to.
+  const realSid = p.sid;
+  p.sid = 'other-sid';
+  win.fbStartUpload([fakeFile('a.txt')]);
+  ok(/still loading/i.test(toasts.pop() || ''), 'stale listing refused');
+  p.sid = realSid;
+
+  // Nothing at all selected is a no-op, not an error.
+  win.fbStartUpload([]);
+  ok(toasts.length === 0, 'empty selection says nothing');
+  ok(!env.log.some(r => r.action === 'upload_finalize'), 'no upload was attempted');
+  cleanup(env);
+});
+
+test('file browser: dropping files on the panel uploads into that folder', async () => {
+  const env = await mkEnv(FB_UPLOAD_PLAN('/home/alice')); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const panel = win.document.querySelector('#fbOv .fb-panel');
+  const dt = {types: ['Files'], files: [fakeFile('dropped.bin', 9)], items: null,
+              dropEffect: ''};
+  const ev = (type) => {
+    const e = new win.Event(type, {bubbles: true, cancelable: true});
+    e.dataTransfer = dt;
+    panel.dispatchEvent(e);
+    return e;
+  };
+  ev('dragenter');
+  ok(panel.classList.contains('drop-target'), 'panel highlights for a file drag');
+  ok(/\/home\/alice/.test(panel.getAttribute('data-drop-msg')),
+     'the prompt names the destination; got ' + panel.getAttribute('data-drop-msg'));
+  const dropped = ev('drop');
+  await sleep(60);
+  ok(dropped.defaultPrevented, 'the browser must not navigate to the file');
+  ok(!panel.classList.contains('drop-target'), 'highlight cleared after the drop');
+  const fin = env.log.filter(r => r.action === 'upload_finalize');
+  ok(fin.length === 1 && fin[0].body.dir === '/home/alice',
+     'uploaded into the shown directory; got ' + JSON.stringify(fin.map(f => f.body.dir)));
+  cleanup(env);
+});
+
 test('drag-and-drop frame is its own layer above the terminal, not an outline', async () => {
   // An `outline` on .pane paints UNDER xterm's positioned render layers:
   // only the top (pane bar) and bottom strip of the frame were visible.
   // The frame must be a pseudo-element stacked above the terminal.
   const css = html;
   ok(!/\.pane\.drop-target\{[^}]*outline/.test(css), 'no outline-based frame on .pane.drop-target');
-  const before = (css.match(/\.pane\.drop-target::before\{([^}]*)\}/) || [])[1] || '';
+  // The rule is shared with the file browser's panel, so match the
+  // declaration block by its selector list rather than an exact string.
+  const before = (css.match(/\.pane\.drop-target::before[^{]*\{([^}]*)\}/) || [])[1] || '';
   ok(/border:2px dashed/.test(before), 'dashed frame drawn by ::before');
   const z = +((before.match(/z-index:(\d+)/) || [])[1] || 0);
   ok(z > 20, 'frame stacks above the terminal layers (z-index ' + z + ' > 20)');
