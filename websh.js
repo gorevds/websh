@@ -4640,7 +4640,6 @@ function renderFbEntries(entries, absPath) {
       });
     }
     wireFbRow(row, fullPath, e.name, e.type);
-    wireFbSelect(row);
     makeFbRowKeyboardable(row);
     list.appendChild(row);
   }
@@ -4818,9 +4817,14 @@ function syncFbSortUi() {
 // restore must re-wire BOTH. One helper, so neither `done()` can forget
 // one: the delete editor used to re-wire only its own button, and the
 // orphaned Rename click then bubbled to the row and downloaded the file.
+// Everything a row's markup needs to work - called on first render AND
+// after an editor (delete confirm, rename) restores the row's innerHTML,
+// which recreates every element inside it without its listeners. A
+// handler wired anywhere else is lost on the first Cancel.
 function wireFbRow(row, fullPath, name, type) {
   wireFbDelete(row, fullPath, name, type);
   wireFbRename(row, fullPath, name, type);
+  wireFbSelect(row);
 }
 
 function wireFbDelete(row, fullPath, name, type) {
