@@ -3900,7 +3900,11 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _valid_sid(self, sid):
-        return bool(sid and _UUID_RE.match(sid))
+        # A JSON body can carry any type here. re.match raises TypeError
+        # on a list/dict/int, which the dispatch backstop turned into a
+        # 500 (and an ERROR log line) for every session endpoint - a
+        # request that should simply be told "no such session".
+        return isinstance(sid, str) and bool(sid) and bool(_UUID_RE.match(sid))
 
     def _require_session(self, sid):
         """Validate `sid`, look it up, and reply 404 when it does not name
@@ -4957,8 +4961,7 @@ class Handler(BaseHTTPRequestHandler):
         # Same rules as rm/mkdir/mv: absolute, no NUL, not bare "/"-padding.
         # A non-string (or a relative path) is a client bug, not a request
         # to fall back to the pane's cwd - reject it rather than guess.
-        if dest_dir is not None and (self._bad_abs_path(dest_dir)
-                                     or len(dest_dir) > 4096):
+        if dest_dir is not None and self._bad_dest_dir(dest_dir):
             self._json({"error": "invalid dir"}, 400)
             return
         session = self._require_session(sid)
@@ -5058,10 +5061,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # Absolute-only: the file browser always has a resolved path, and
         # refusing everything else keeps this endpoint from quietly
-        # deleting a $HOME-relative name the caller didn't mean. The
-        # bare-root check stops a delete that could only be a bug.
-        if (not isinstance(path, str) or not path.startswith("/")
-                or "\x00" in path or path.rstrip("/") == ""):
+        # deleting a $HOME-relative name the caller didn't mean.
+        if self._bad_abs_path(path):
             self._json({"error": "invalid path"}, 400)
             return
         session = self._require_session(sid)
@@ -5088,9 +5089,18 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _bad_abs_path(path):
         """True when `path` is not usable as an absolute remote path.
-        Shared by the mutating side-channel endpoints (rm/mkdir/mv)."""
+        Shared by the mutating side-channel endpoints (rm/mkdir/mv). The
+        bare-root rule stops an rm/mv of "/" that could only be a bug."""
         return (not isinstance(path, str) or not path.startswith("/")
                 or "\x00" in path or path.rstrip("/") == "")
+
+    @staticmethod
+    def _bad_dest_dir(path):
+        """True when `path` cannot be an upload destination. Unlike
+        _bad_abs_path this accepts "/": root's home is a legitimate place
+        to put a file, and the browser can show it."""
+        return (not isinstance(path, str) or not path.startswith("/")
+                or "\x00" in path or len(path) > 4096)
 
     @staticmethod
     def _bad_name(name):
@@ -5316,6 +5326,15 @@ class Handler(BaseHTTPRequestHandler):
 
         sid = body.get("session_id", "")
         terminate = bool(body.get("terminate", False))
+        # Type check first: a list is unhashable and sessions.get() would
+        # raise before the lookup even happens. Disconnect is idempotent -
+        # an id that names nothing gets the same {"ok": true} as one that
+        # was already gone - so something that isn't a string is answered
+        # the same way, not as a 500. (Only the type, not the UUID shape:
+        # this endpoint looks the key up as-is, and must keep doing so.)
+        if not isinstance(sid, str):
+            self._json({"ok": True})
+            return
         with sessions_lock:
             session = sessions.get(sid)
             if (session is not None and WEBSH_AUTH_HEADER
