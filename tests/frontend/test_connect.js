@@ -2681,17 +2681,21 @@ test('reconnect-bar: one alarm, not two - the card is quiet unless it must not b
   ok(msg() === '', 'no text repeated from the badge; got "' + msg() + '"');
   ok(!bar.classList.contains('sev-err') && !bar.classList.contains('sev-warn'),
      'a dropped link is not painted as an error');
+  // ...and with nothing but the button left, the card around it goes too.
+  ok(bar.classList.contains('bare'), 'no card drawn around a lone button');
 
   // Plain drop with no creds: say what to do, still no alarm colour.
   p.password = '';
   win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
   ok(/type the password/i.test(msg()), 'tells the user what to do; got "' + msg() + '"');
+  ok(!bar.classList.contains('bare'), 'the card is back once it carries text');
   ok(!/disconnected/i.test(msg()), 'still no duplicated status word');
   ok(!bar.classList.contains('sev-err'), 'no error colour for a plain drop');
 
   // Credentials rejected: that IS an error.
   win.eval(`showReconnectBar(panes['${p.id}'], 'auth_failed')`);
   ok(bar.classList.contains('sev-err'), 'auth failure keeps the red edge');
+  ok(!bar.classList.contains('bare'), 'and its card, to carry the edge');
   // ...and the class is dropped again when the reason is no longer one.
   win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
   ok(!bar.classList.contains('sev-err'), 'severity cleared on the next show');
@@ -2728,6 +2732,8 @@ test('reconnect-bar: one alarm, not two - the card is quiet unless it must not b
      'a rejected password still reads as an error');
   ok(/\.xterm\{padding:4px 6px 2px/.test(css),
      'top padding keeps the first row and its cursor off the pane bar');
+  ok(/\.reconnect-bar\.bare\{background:none;border:none;box-shadow:none/.test(css),
+     'the bare state drops every bit of card chrome');
   cleanup(env);
 });
 

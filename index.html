@@ -260,6 +260,11 @@
     /* Plain "the link dropped" is not an error: the card is neutral and the
        coloured edge is kept for states the user has to act on. */
     .reconnect-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:5px 10px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;flex-shrink:0;box-shadow:0 4px 14px rgba(0,0,0,.35)}
+    /* A lone Reconnect button needs no card around it: the button is
+       already a shape. The shadow moves onto the button so it still
+       lifts off busy output. */
+    .reconnect-bar.bare{background:none;border:none;box-shadow:none;padding:0}
+    .reconnect-bar.bare .btn{box-shadow:0 4px 14px rgba(0,0,0,.45)}
     .reconnect-bar.sev-err{border-left:3px solid var(--dg)}
     .reconnect-bar.sev-warn{border-left:3px solid var(--wn)}
     .reconnect-bar span:empty{display:none}
