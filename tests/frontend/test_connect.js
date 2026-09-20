@@ -6710,6 +6710,12 @@ test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pan
      'active pane is marked on its name only');
   const symbols = (code.match(/<symbol id="i-/g) || []).length;
   ok(symbols >= 15, 'icon sprite present (' + symbols + ' symbols)');
+  // The gear must be a cog, not the "circle + straight rays" that reads as a
+  // sun, and Export must be a document (it writes a file), not a bare arrow.
+  const gear = code.match(/<symbol id="i-gear"[\s\S]*?<\/symbol>/)[0];
+  ok(/A10 10 0/.test(gear) && !/M12 2\.8v2\.4/.test(gear), 'Options icon is a toothed cog');
+  const exp = code.match(/<symbol id="i-export"[\s\S]*?<\/symbol>/)[0];
+  ok(/M13\.4 3\.6v5h5/.test(exp), 'Export icon is a document with a down arrow');
   ok(!/[\u{1F300}-\u{1FAFF}]/u.test(code), 'no emoji left in the markup');
   const paneIcons = p.el.querySelectorAll('.pane-bar svg.ic use');
   ok(paneIcons.length === 6, 'pane bar buttons (5 + transfer cancel) use the sprite; got ' + paneIcons.length);
