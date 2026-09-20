@@ -8,6 +8,19 @@ function storageKey(name) { return storagePrefix + name; }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 function $(id){ return document.getElementById(id) }
+// Markup for one icon from the sprite in index.html. Kept in one place
+// so dynamically built buttons (pane bar, search bar, file rows) use the
+// same set as the static markup instead of ad-hoc emoji/glyphs.
+function ic(name){ return '<svg class="ic"><use href="#i-' + name + '"></use></svg>' }
+function icEl(name){
+  const SVG = 'http://www.w3.org/2000/svg';
+  let svg = document.createElementNS(SVG, 'svg');
+  svg.setAttribute('class', 'ic');
+  let use = document.createElementNS(SVG, 'use');
+  use.setAttribute('href', '#i-' + name);
+  svg.appendChild(use);
+  return svg;
+}
 // HTML-escape for BOTH text and attribute context. The old
 // textContent->innerHTML trick only covered & < > - a remote filename
 // containing a double quote could then close an attribute and add its
@@ -265,14 +278,14 @@ function createPane(container) {
       `<div class="upload-progress h" data-upload-progress="${id}">` +
         `<div class="upload-progress-track"><div class="upload-progress-bar"></div>` +
         `<div class="upload-progress-text"></div></div>` +
-        `<button class="upload-progress-cancel" onclick="cancelTransfer('${id}')" title="Cancel" aria-label="Cancel transfer">&#x2715;</button>` +
+        `<button class="upload-progress-cancel" onclick="cancelTransfer('${id}')" title="Cancel" aria-label="Cancel transfer">${ic('close')}</button>` +
       `</div>` +
-      `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>&#x2B06;</button>` +
+      `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>${ic('upload')}</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
-      `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>&#x2B07;</button>` +
-      `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">&#x2194;</button>` +
-      `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">&#x2195;</button>` +
-      `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">&#x2715;</button>` +
+      `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>${ic('download')}</button>` +
+      `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">${ic('split-h')}</button>` +
+      `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">${ic('split-v')}</button>` +
+      `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">${ic('close')}</button>` +
     `</div>` +
     `<div class="reconnect-bar h" data-reconnect="${id}">` +
       `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
@@ -282,9 +295,9 @@ function createPane(container) {
     `<div class="pane-term"></div>` +
     `<div class="search-bar h" data-search="${id}">` +
       `<input type="text" placeholder="Search...">` +
-      `<button onclick="searchPrev()">&#x25B2;</button>` +
-      `<button onclick="searchNext()">&#x25BC;</button>` +
-      `<button onclick="closeSearch()">&#x2715;</button>` +
+      `<button onclick="searchPrev()" title="Previous match" aria-label="Previous match">${ic('chevron-up')}</button>` +
+      `<button onclick="searchNext()" title="Next match" aria-label="Next match">${ic('chevron-down')}</button>` +
+      `<button onclick="closeSearch()" title="Close search" aria-label="Close search">${ic('close')}</button>` +
     `</div>`;
   container.appendChild(el);
 
@@ -4460,7 +4473,7 @@ function makeFbRowKeyboardable(row) {
 function makeFbRow(type, name, size, mtime, o) {
   let row = document.createElement('div');
   row.className = 'fb-row';
-  let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
+  let icon = ic(type === 'd' ? 'folder' : type === 'l' ? 'link' : 'file');
   let sizeStr = '';
   if (size !== null && size !== undefined) {
     if (size < 1024) sizeStr = size + ' B';
@@ -4471,6 +4484,7 @@ function makeFbRow(type, name, size, mtime, o) {
   // Rename + delete live in a fixed-width group at the far right, after
   // the metadata columns. The ".." row gets no buttons, but the empty
   // group keeps its width so the size/date columns stay aligned.
+  row.dataset.type = type;
   row.innerHTML =
     '<span class="fb-ic">' + icon + '</span>' +
     '<span class="fb-nm">' + esc(name) + '</span>' +
@@ -4483,14 +4497,14 @@ function makeFbRow(type, name, size, mtime, o) {
   if (!(o && o.noActions)) {
     let acts = row.querySelector('.fb-act');
     for (let [cls, attr, title, glyph] of [
-        ['fb-ren', 'data-fb-ren', 'Rename', '\u270E'],
-        ['fb-del', 'data-fb-del', 'Delete', '\u00D7']]) {
+        ['fb-ren', 'data-fb-ren', 'Rename', 'pencil'],
+        ['fb-del', 'data-fb-del', 'Delete', 'close']]) {
       let b = document.createElement('button');
       b.type = 'button'; b.className = cls;
       b.setAttribute(attr, '');
       b.title = title;
       b.setAttribute('aria-label', title + ' ' + name);
-      b.textContent = glyph;
+      b.appendChild(icEl(glyph));
       acts.appendChild(b);
     }
   }
@@ -4755,7 +4769,7 @@ function askFbRename(row, fullPath, name, type) {
   if (row.classList.contains('fb-edit')) return;
   cancelFbConfirm();                    // close any other open editor
   let restore = row.innerHTML;
-  let icon = type === 'd' ? '📁' : type === 'l' ? '🔗' : '📄';
+  let icon = ic(type === 'd' ? 'folder' : type === 'l' ? 'link' : 'file');
   row.classList.add('fb-edit');
   row.innerHTML =
     '<span class="fb-ic">' + icon + '</span>' +
@@ -4828,7 +4842,7 @@ function fbNewFolder() {
   let row = document.createElement('div');
   row.className = 'fb-row fb-edit';
   row.innerHTML =
-    '<span class="fb-ic">📁</span>' +
+    '<span class="fb-ic">' + ic('folder') + '</span>' +
     '<input type="text" class="fb-ed-inp" placeholder="Folder name" aria-label="Folder name">' +
     '<button type="button" class="fb-ed-no">Cancel</button>' +
     '<button type="button" class="fb-ed-ok">Create</button>';
@@ -4873,7 +4887,8 @@ function doFbMkdir(row, name, undo) {
   // Join onto the current directory; avoid a double slash at the root.
   let base = _fbCurPath === '/' ? '' : _fbCurPath;
   let full = base + '/' + name;
-  row.innerHTML = '<span class="fb-ic">📁</span><span class="fb-cf-q">Creating…</span>';
+  row.innerHTML = '<span class="fb-ic">' + ic('folder') + '</span>' +
+                  '<span class="fb-cf-q">Creating…</span>';
   api('mkdir', {body: {session_id: p.sid, path: full}})
     .then(r => {
       if (r && r.error) throw new Error(r.error);

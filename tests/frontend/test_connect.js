@@ -6696,6 +6696,37 @@ test('lossless reconnect: replayed output is trimmed by cursor, gaps are announc
   cleanup(env);
 });
 
+test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pane', async () => {
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  // Every button icon comes from the sprite - no emoji, no ad-hoc glyphs.
+  // Comments mention both emoji and scrollbar-color on purpose; test the code.
+  const code = html.replace(/\/\*[\s\S]*?\*\//g, '').replace(/<!--[\s\S]*?-->/g, '');
+  ok(/color-scheme:\s*dark/.test(code), 'dark color-scheme for native controls');
+  ok(/\*::-webkit-scrollbar\{/.test(code), 'scrollbars styled app-wide');
+  ok(!/scrollbar-color/.test(code),
+     'no inherited scrollbar-color (it overrides the webkit rules in Chromium)');
+  ok(/\.pane\.active>\.pane-bar>\.pane-label\{color:var\(--ac\)\}/.test(code),
+     'active pane is marked on its name only');
+  const symbols = (code.match(/<symbol id="i-/g) || []).length;
+  ok(symbols >= 15, 'icon sprite present (' + symbols + ' symbols)');
+  ok(!/[\u{1F300}-\u{1FAFF}]/u.test(code), 'no emoji left in the markup');
+  const paneIcons = p.el.querySelectorAll('.pane-bar svg.ic use');
+  ok(paneIcons.length === 6, 'pane bar buttons (5 + transfer cancel) use the sprite; got ' + paneIcons.length);
+  ok(Array.from(paneIcons).every(u => /^#i-/.test(u.getAttribute('href'))), 'each references a symbol');
+  // File rows: icon by type, actions as icons with their labels intact.
+  win.showFileBrowser(p.id);
+  await sleep(30);
+  const dir = rowFor(win, 'adir'), file = rowFor(win, 'zeta.txt');
+  ok(dir.dataset.type === 'd' && file.dataset.type === 'f', 'row type exposed for styling');
+  ok(dir.querySelector('.fb-ic use').getAttribute('href') === '#i-folder', 'folder icon');
+  ok(file.querySelector('.fb-ic use').getAttribute('href') === '#i-file', 'file icon');
+  const ren = file.querySelector('[data-fb-ren]');
+  ok(ren.querySelector('use').getAttribute('href') === '#i-pencil' &&
+     ren.getAttribute('aria-label') === 'Rename zeta.txt', 'icon button keeps its label');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
