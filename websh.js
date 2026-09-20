@@ -953,6 +953,12 @@ function showReconnectBar(p, reason) {
       setTimeout(() => { try { pwInput.focus(); } catch(e){} }, 0);
     }
   }
+  // Nothing but the button left? Then the card is a box drawn around a
+  // button that already has its own edges - drop the chrome and show
+  // the button alone. The card comes back as soon as it has to carry
+  // text or the password input.
+  bar.classList.toggle('bare',
+    !(msg && msg.textContent) && !(pwInput && !pwInput.classList.contains('h')));
   bar.classList.remove('h');
 }
 function hideReconnectBar(p) {
