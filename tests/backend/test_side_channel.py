@@ -1032,10 +1032,11 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             persistent = True
             slot_id = "ok"
             last_activity = 0
-            def finalize_upload(self, tmp, final):
+            def finalize_upload(self, tmp, final, dest_dir=None):
                 captured["tmp"] = tmp
                 captured["final"] = final
-                return True, "/home/alice/work/" + final
+                captured["dir"] = dest_dir
+                return True, (dest_dir or "/home/alice/work") + "/" + final
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
         try:
@@ -1047,9 +1048,88 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             self.assertEqual(body["path"], "/home/alice/work/report.csv")
             self.assertEqual(captured["tmp"], ".websh-tmp-x")
             self.assertEqual(captured["final"], "report.csv")
+            # No "dir" in the body: the pane's own cwd decides, as before.
+            self.assertIsNone(captured["dir"])
         finally:
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
+
+    def test_finalize_accepts_a_destination_directory(self):
+        # The directory the file browser is showing. Naming it means tmux
+        # is no longer needed to know where the file goes, so this works
+        # for a non-persistent pane too.
+        sid = str(uuid.uuid4())
+        captured = {}
+        class FakeSession:
+            persistent = False
+            slot_id = None
+            last_activity = 0
+            _host = "host.example"
+            def finalize_upload(self, tmp, final, dest_dir=None):
+                captured["dir"] = dest_dir
+                return True, dest_dir + "/" + final
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            body, code = self._post("/api/upload_finalize", {
+                "session_id": sid, "tmp": ".websh-tmp-y",
+                "final": "a.txt", "dir": "/srv/www/uploads"})
+            self.assertEqual(code, 200)
+            self.assertEqual(captured["dir"], "/srv/www/uploads")
+            self.assertEqual(body["path"], "/srv/www/uploads/a.txt")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_finalize_rejects_an_unusable_destination(self):
+        # Relative, empty, NUL-bearing or non-string: a client bug, not a
+        # request to silently fall back to the pane's cwd.
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = True
+            slot_id = "ok"
+            last_activity = 0
+            def finalize_upload(self, tmp, final, dest_dir=None):
+                raise AssertionError("must not reach the session")
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            for bad in ("relative/dir", "", "/", "/bad\x00dir", 7, ["/tmp"],
+                        "/" + "x" * 5000):
+                body, code = self._post("/api/upload_finalize", {
+                    "session_id": sid, "tmp": "x", "final": "f", "dir": bad})
+                self.assertEqual(code, 400, "dir=%r should reject" % (bad,))
+                self.assertEqual(body["error"], "invalid dir")
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
+    def test_finalize_failure_status_matches_the_reason(self):
+        # A missing or read-only destination is the user's mistake, not a
+        # bad gateway: 502 across the board made the client show
+        # "the host refused the transfer" for a typo in a path.
+        for reason, want in (("no such file or directory", 404),
+                             ("Permission denied", 403),
+                             ("Read-only file system", 403)):
+            sid = str(uuid.uuid4())
+            class FakeSession:
+                persistent = True
+                slot_id = "ok"
+                last_activity = 0
+                _host = "host.example"
+                def finalize_upload(self, tmp, final, dest_dir=None, _r=reason):
+                    return False, _r
+            with server.sessions_lock:
+                server.sessions[sid] = FakeSession()
+            try:
+                body, code = self._post("/api/upload_finalize", {
+                    "session_id": sid, "tmp": "x", "final": "f",
+                    "dir": "/srv/nope"})
+                self.assertEqual(code, want, reason)
+                self.assertEqual(body["error"], reason)
+            finally:
+                with server.sessions_lock:
+                    server.sessions.pop(sid, None)
 
     def test_finalize_non_persistent_returns_200_with_flag(self):
         # The client uses non_persistent: true to know it should fall
@@ -1060,7 +1140,7 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             persistent = False
             slot_id = None
             last_activity = 0
-            def finalize_upload(self, tmp, final):
+            def finalize_upload(self, tmp, final, dest_dir=None):
                 return False, "non-persistent"
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
@@ -1080,7 +1160,7 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             persistent = True
             slot_id = "ok"
             last_activity = 0
-            def finalize_upload(self, tmp, final):
+            def finalize_upload(self, tmp, final, dest_dir=None):
                 return False, "finalize exit 1: mv refused"
         with server.sessions_lock:
             server.sessions[sid] = FakeSession()
@@ -2501,6 +2581,77 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
             self.assertIn("ermission denied", err, sh)
             self.assertEqual(server._side_channel_status(err), 403)
             shutil.rmtree(d)
+
+    def _finalize_in(self, sh, dest, tmp_name, final_name):
+        """Run finalize_upload against a real directory. $HOME is the
+        staging area (that is where /api/upload puts the bytes), so it is
+        pointed at the test's tmp dir for the duration of the call."""
+        s = self._session(sh)
+        old_home = os.environ.get("HOME")
+        os.environ["HOME"] = self.tmp
+        try:
+            return s.finalize_upload(tmp_name, final_name, dest)
+        finally:
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
+    def test_finalize_into_a_named_directory_with_hostile_names(self):
+        # The destination the file browser is showing can be any directory
+        # the user can reach - including one whose name ends in a space or
+        # a newline. It must be decoded into a variable, never parsed.
+        for sh in self.SHELLS:
+            dest = os.path.join(self.tmp, "drop dir\n")
+            os.makedirs(dest, exist_ok=True)
+            self._touch(".websh-tmp-1")
+            ok, path = self._finalize_in(sh, dest, ".websh-tmp-1", "my report.txt")
+            self.assertTrue(ok, (sh, path))
+            self.assertEqual(path, dest + "/my report.txt", sh)
+            self.assertEqual(os.listdir(dest), ["my report.txt"], sh)
+            self.assertNotIn(".websh-tmp-1", os.listdir(self.tmp), sh)
+            shutil.rmtree(dest)
+
+    def test_finalize_into_a_named_directory_auto_increments(self):
+        for sh in self.SHELLS:
+            dest = os.path.join(self.tmp, "d")
+            os.makedirs(dest, exist_ok=True)
+            open(os.path.join(dest, "a.txt"), "w").close()
+            self._touch(".websh-tmp-2")
+            ok, path = self._finalize_in(sh, dest, ".websh-tmp-2", "a.txt")
+            self.assertTrue(ok, (sh, path))
+            # The existing file is untouched; the new one lands beside it.
+            self.assertEqual(sorted(os.listdir(dest)), ["a(1).txt", "a.txt"], sh)
+            shutil.rmtree(dest)
+
+    def test_finalize_into_a_missing_directory_says_why(self):
+        for sh in self.SHELLS:
+            self._touch(".websh-tmp-3")
+            ok, err = self._finalize_in(
+                sh, os.path.join(self.tmp, "nope"), ".websh-tmp-3", "a.txt")
+            self.assertFalse(ok, sh)
+            self.assertIn("o such file", err, sh)
+            self.assertEqual(server._side_channel_status(err), 404, sh)
+            # The staged bytes are still there for a retry elsewhere.
+            self.assertIn(".websh-tmp-3", os.listdir(self.tmp), sh)
+            os.remove(os.path.join(self.tmp, ".websh-tmp-3"))
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_finalize_into_a_read_only_directory_says_why(self):
+        for sh in self.SHELLS:
+            dest = os.path.join(self.tmp, "ro")
+            os.makedirs(dest, exist_ok=True)
+            os.chmod(dest, 0o555)
+            self._touch(".websh-tmp-4")
+            try:
+                ok, err = self._finalize_in(sh, dest, ".websh-tmp-4", "a.txt")
+            finally:
+                os.chmod(dest, 0o755)
+            self.assertFalse(ok, sh)
+            self.assertIn("ermission denied", err, sh)
+            self.assertEqual(server._side_channel_status(err), 403, sh)
+            shutil.rmtree(dest)
+            os.remove(os.path.join(self.tmp, ".websh-tmp-4"))
 
     def test_rename_refuses_to_clobber_and_stays_in_dir(self):
         for sh in self.SHELLS:
