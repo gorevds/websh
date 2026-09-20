@@ -3708,13 +3708,17 @@ function uploadBlocker(p) {
   return '';
 }
 
-function startUploadFiles(id, files) {
+// o.destDir: an absolute remote directory to drop the files into -
+// what the file browser is showing. Without it the destination is the
+// pane's own working directory, as before.
+function startUploadFiles(id, files, o) {
   let p = panes[id];
   if (!files.length || uploadBlocker(p)) return;
   let totalSize = 0;
   files.forEach(f => { totalSize += f.size });
   p.upload = {
     files:files, fileIndex:0, cancelled:false,
+    destDir: (o && o.destDir) || null,
     totalSize:totalSize, sentBytes:0, fileOffset:0, fileSize:0,
     currentFile:null, currentTmp:null, xhr:null,
     // Persistent sessions: server-side finalize landed each file at
@@ -3748,15 +3752,17 @@ function _dragHasFiles(ev) {
 const DROP_HEARTBEAT_MS = 1200;
 let _dropHighlighted = false;
 
-function showDropTarget(p) {
-  let el = p.el;
-  let why = uploadBlocker(p);
+function showDropTargetOn(el, why, msg) {
   el.classList.add('drop-target');
   el.classList.toggle('drop-refused', !!why);
-  el.setAttribute('data-drop-msg', why || 'Drop to upload');
+  el.setAttribute('data-drop-msg', why || msg);
   _dropHighlighted = true;
   clearTimeout(el._dropTimer);
   el._dropTimer = setTimeout(() => hideDropTarget(el), DROP_HEARTBEAT_MS);
+}
+
+function showDropTarget(p) {
+  showDropTargetOn(p.el, uploadBlocker(p), 'Drop to upload');
 }
 
 function hideDropTarget(el) {
@@ -3768,7 +3774,8 @@ function hideDropTarget(el) {
 function clearAllDropTargets() {
   if (!_dropHighlighted) return;
   _dropHighlighted = false;
-  document.querySelectorAll('.pane.drop-target').forEach(hideDropTarget);
+  document.querySelectorAll('.pane.drop-target,.fb-panel.drop-target')
+    .forEach(hideDropTarget);
 }
 
 function wirePaneDrop(p) {
@@ -3805,22 +3812,29 @@ function wirePaneDrop(p) {
     clearAllDropTargets();
     let why = uploadBlocker(p);
     if (why) { showToast(why, 'warn'); return; }
-    let items = ev.dataTransfer.items ? Array.from(ev.dataTransfer.items) : [];
-    let files = [], folders = 0;
-    if (items.length) {
-      for (let it of items) {
-        if (it.kind !== 'file') continue;
-        let entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
-        if (entry && entry.isDirectory) { folders++; continue; }
-        let f = it.getAsFile();
-        if (f) files.push(f);
-      }
-    } else {
-      files = Array.from(ev.dataTransfer.files || []);
-    }
-    if (folders) showToast('Folders can’t be uploaded — drop the files inside instead.', 'warn');
+    let files = droppedFiles(ev);
     if (files.length) { activatePane(p.id); startUploadFiles(p.id, files); }
   });
+}
+
+// The files in a drop, minus folders (the upload pipeline streams single
+// files), warning once if any were skipped.
+function droppedFiles(ev) {
+  let items = ev.dataTransfer.items ? Array.from(ev.dataTransfer.items) : [];
+  let files = [], folders = 0;
+  if (items.length) {
+    for (let it of items) {
+      if (it.kind !== 'file') continue;
+      let entry = it.webkitGetAsEntry && it.webkitGetAsEntry();
+      if (entry && entry.isDirectory) { folders++; continue; }
+      let f = it.getAsFile();
+      if (f) files.push(f);
+    }
+  } else {
+    files = Array.from(ev.dataTransfer.files || []);
+  }
+  if (folders) showToast('Folders can’t be uploaded — drop the files inside instead.', 'warn');
+  return files;
 }
 
 // A file dropped anywhere else would make the browser navigate to it -
@@ -3883,9 +3897,13 @@ function makeUploadMvCmd(finalName, tmpName) {
 function finalizeUploadedFile(p, file) {
   let u = p.upload;
   let tmp = u.currentTmp, fname = u.currentFile;
-  if (p.persistent) {
-    return api('upload_finalize', { body: { session_id: p.sid,
-                                             tmp: tmp, final: fname } })
+  // A named destination needs no tmux and no keystrokes, so it is the
+  // server path for every pane - the foreground mv below exists only
+  // because a non-persistent shell's cwd is unknowable from here.
+  if (p.persistent || u.destDir) {
+    let body = { session_id: p.sid, tmp: tmp, final: fname };
+    if (u.destDir) body.dir = u.destDir;
+    return api('upload_finalize', { body: body })
       .then(r => {
         if (r && r.ok && r.path) {
           u.placed.push({ name: fname, path: r.path });
@@ -3895,7 +3913,7 @@ function finalizeUploadedFile(p, file) {
         // pane, but is the documented graceful-fallback shape) — fall
         // through to the keystroke path. Any other error is a hard
         // failure.
-        if (r && r.non_persistent) return foregroundMv(p, fname, tmp);
+        if (r && r.non_persistent && !u.destDir) return foregroundMv(p, fname, tmp);
         return Promise.reject(r && r.error ? r.error : 'finalize failed');
       });
   }
@@ -4044,6 +4062,7 @@ function showUploadProgress(p) {
     prog.querySelector('.upload-progress-text').textContent = '';
     prog.classList.remove('h');
   }
+  paintFbXfer(p);
 }
 
 function hideUploadProgress(p) {
@@ -4051,6 +4070,7 @@ function hideUploadProgress(p) {
   let prog = p.el.querySelector('[data-upload-progress]');
   if (label) label.classList.remove('h');
   if (prog) prog.classList.add('h');
+  paintFbXfer(p);
 }
 
 function updateUploadProgress(p) {
@@ -4066,6 +4086,7 @@ function updateUploadProgress(p) {
   el.querySelector('.upload-progress-bar').style.width = pct + '%';
   let prefix = total > 1 ? `(${Math.min(done + 1, total)}/${total}) ` : '';
   el.querySelector('.upload-progress-text').textContent = prefix + name + ' ' + pct + '%';
+  paintFbXfer(p);
 }
 
 function closeUploadSession(u) {
@@ -4082,6 +4103,7 @@ function settleTransfer(p, slot, delay, paint) {
   if (el && paint) {
     paint(el.querySelector('.upload-progress-bar'),
           el.querySelector('.upload-progress-text'));
+    paintFbXfer(p);          // the outcome, not just the progress
   }
   setTimeout(() => {
     p[slot] = null;
@@ -4098,6 +4120,12 @@ function finishUpload(p, success, reason) {
   closeUploadSession(u);
   let staged = u.staged || [];
   let placed = u.placed || [];
+  // The browser is showing the directory the file just landed in: list
+  // it again so the user sees the file instead of having to refresh.
+  if (success && u.destDir && _fbId === p.id && _fbCurPath === u.destDir
+      && !$('fbOv').classList.contains('h')) {
+    reloadFbDir();
+  }
   // Banner stays visible longer when there's something the user needs to
   // read and act on — a destination path, or a specific failure reason —
   // so it doesn't vanish before they can take it in.
@@ -4115,6 +4143,8 @@ function finishUpload(p, success, reason) {
       } else if (placed.length === 1) {
         // Persistent finalize gave us the absolute path — show it.
         text.textContent = 'Saved to ' + placed[0].path;
+      } else if (placed.length > 1 && u.destDir) {
+        text.textContent = 'Saved ' + placed.length + ' files to ' + u.destDir;
       } else {
         text.textContent = 'Upload complete';
       }
@@ -4159,9 +4189,14 @@ function triggerDownload(id) {
   showFileBrowser(id);
 }
 
-function startFastDownload(id, path) {
+// Resolves true when the file has been saved, false on any failure or
+// cancellation - fbBulkDownload chains the queue on it. o.settleDelay
+// shortens how long the finished transfer stays on the pane bar so the
+// next file in a queue isn't blocked behind it.
+function startFastDownload(id, path, o) {
   let p = panes[id];
-  if (!p || !p.sid || p.upload || p.download) return;
+  if (!p || !p.sid || p.upload || p.download) return Promise.resolve(false);
+  let settleDelay = (o && o.settleDelay) || 2000;
   let filename = path.split('/').pop() || 'download';
   let ctrl = new AbortController();
   p.download = {cancelled: false, filename: filename, abort: () => ctrl.abort()};
@@ -4170,7 +4205,7 @@ function startFastDownload(id, path) {
 
   let url = API + '?action=download&session_id=' + encodeURIComponent(p.sid) +
             '&path=' + encodeURIComponent(path);
-  fetch(url, {signal: ctrl.signal})
+  return fetch(url, {signal: ctrl.signal})
     .then(resp => {
       if (!resp.ok) {
         return resp.json().then(e => { throw new Error(e.error || 'failed'); });
@@ -4217,7 +4252,7 @@ function startFastDownload(id, path) {
         // the promise. Without this guard we'd still build a partial
         // Blob and trigger a save dialog with success UI. The .catch
         // branch below has the same guard.
-        if (!p.download || p.download.cancelled) return;
+        if (!p.download || p.download.cancelled) return false;
         let blob = new Blob(chunks, {type: 'application/octet-stream'});
         let a = document.createElement('a');
         a.href = URL.createObjectURL(blob);
@@ -4225,20 +4260,22 @@ function startFastDownload(id, path) {
         document.body.appendChild(a); a.click();
         document.body.removeChild(a);
         URL.revokeObjectURL(a.href);
-        finishDownload(p, true);
+        finishDownload(p, true, null, settleDelay);
+        return true;
       });
     })
     .catch(e => {
       if (p.download && !p.download.cancelled)
-        finishDownload(p, false, e.message || 'download failed');
+        finishDownload(p, false, e.message || 'download failed', settleDelay);
+      return false;
     });
 }
 
-function finishDownload(p, success, msg) {
+function finishDownload(p, success, msg, settleDelay) {
   let dl = p.download;
   if (!dl) return;
   dl.cancelled = true;
-  settleTransfer(p, 'download', 2000, (bar, text) => {
+  settleTransfer(p, 'download', settleDelay || 2000, (bar, text) => {
     if (success) {
       bar.style.width = '100%'; bar.style.background = 'var(--ok)';
       text.textContent = 'Download complete';
@@ -4327,6 +4364,7 @@ function showFileBrowser(id) {
   _fbTrap.open(() => $('fbManual'));
   syncFbSortUi();
   syncFbHiddenUi();
+  paintFbXfer(p);            // a transfer may already be running
   let f = $('fbFilter'); if (f) f.value = '';
   // Open where the user is standing, not at $HOME. Three sources, best
   // first: OSC 7 told us directly; the server can ask tmux; otherwise
@@ -4381,6 +4419,7 @@ function closeFb() {
   // list is about to be discarded, and a stale closure would otherwise
   // keep a detached row alive.
   _fbConfirm = null;
+  fbClearSel();
   _fbTrap.close();
   _fbId = null;
   _fbSeq++;              // a reply still in flight must not paint a closed browser
@@ -4492,6 +4531,10 @@ function renderFbEntries(entries, absPath) {
   // from the previous listing no longer refers to anything on screen.
   _fbConfirm = null;
   _fbEntries = entries;
+  // Names are only meaningful within one listing: keeping them across a
+  // navigation (or a delete) would aim an action at a different file.
+  _fbSel.clear();
+  _fbSelAnchor = null;
   list.innerHTML = '';
   if (absPath !== '/') {
     let parent = absPath.lastIndexOf('/') > 0
@@ -4536,6 +4579,7 @@ function renderFbEntries(entries, absPath) {
       });
     }
     wireFbRow(row, fullPath, e.name, e.type);
+    wireFbSelect(row);
     makeFbRowKeyboardable(row);
     list.appendChild(row);
   }
@@ -4580,6 +4624,8 @@ function makeFbRow(type, name, size, mtime, o) {
   // group keeps its width so the size/date columns stay aligned.
   row.dataset.type = type;
   row.innerHTML =
+    (o && o.noActions ? '<span class="fb-ck-sp" style="width:14px;flex-shrink:0"></span>'
+                      : '<input type="checkbox" class="fb-ck" tabindex="-1">') +
     '<span class="fb-ic">' + icon + '</span>' +
     '<span class="fb-nm">' + esc(name) + '</span>' +
     '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
@@ -4602,6 +4648,8 @@ function makeFbRow(type, name, size, mtime, o) {
       acts.appendChild(b);
     }
   }
+  let ck = row.querySelector('.fb-ck');
+  if (ck) ck.setAttribute('aria-label', 'Select ' + name);
   // The visibility pass (dotfile toggle + name filter) reads the name here.
   row.dataset.name = name;
   return row;
@@ -4832,6 +4880,9 @@ function applyFbVisibility() {
   } else if (note) {
     note.remove();
   }
+  // Rows just hidden by the filter drop out of the selection: the strip
+  // must never count something the user can no longer see.
+  syncFbSel();
 }
 function applyFbFilter() { applyFbVisibility(); }
 
@@ -4925,6 +4976,342 @@ function doFbRename(row, fullPath, newName, undo, type) {
       showToast('Rename failed: ' + (e.message || 'error'), 'err');
       undo();
     });
+}
+
+// ── File browser: selecting several entries ─────────────────────────
+// Names (not paths) of the picked entries in the directory on screen.
+// A fresh listing always starts empty: a name that survived a navigation
+// or a delete would point at a different file.
+let _fbSel = new Set();
+let _fbSelAnchor = null;        // last row toggled, for shift-range picks
+
+function fbClearSel() {
+  _fbSel.clear();
+  _fbSelAnchor = null;
+  syncFbSel();
+}
+
+function fbVisibleRows() {
+  let list = $('fbList');
+  if (!list) return [];
+  return Array.from(list.querySelectorAll('.fb-row'))
+    .filter(r => r.dataset.parent !== '1' && !r.classList.contains('fb-hide'));
+}
+
+// One place decides what the checkboxes, the row tint and the action
+// strip say, so they cannot drift apart.
+function syncFbSel() {
+  let list = $('fbList'), bar = $('fbSel');
+  if (!list || !bar) return;
+  // Drop names that are no longer on screen (filtered out, or gone from
+  // the listing) - acting on them would act on something unseen.
+  let onScreen = new Set(fbVisibleRows().map(r => r.dataset.name));
+  for (let n of Array.from(_fbSel)) if (!onScreen.has(n)) _fbSel.delete(n);
+  for (let row of list.querySelectorAll('.fb-row')) {
+    let picked = _fbSel.has(row.dataset.name) && row.dataset.parent !== '1';
+    row.classList.toggle('fb-picked', picked);
+    let ck = row.querySelector('.fb-ck');
+    if (ck) ck.checked = picked;
+  }
+  list.classList.toggle('has-sel', _fbSel.size > 0);
+  bar.classList.toggle('h', _fbSel.size === 0);
+  if (!_fbSel.size) return;
+  let files = 0, dirs = 0;
+  for (let row of fbVisibleRows()) {
+    if (!_fbSel.has(row.dataset.name)) continue;
+    if (row.dataset.type === 'd') dirs++; else files++;
+  }
+  let parts = [];
+  if (files) parts.push(files + (files === 1 ? ' file' : ' files'));
+  if (dirs) parts.push(dirs + (dirs === 1 ? ' folder' : ' folders'));
+  $('fbSelN').textContent = parts.join(', ') + ' selected';
+  let acts = $('fbSelActs');
+  acts.innerHTML = '';
+  let btn = (cls, label, fn) => {
+    let b = document.createElement('button');
+    b.type = 'button'; b.className = cls; b.textContent = label;
+    b.addEventListener('click', ev => { ev.stopPropagation(); fn(); });
+    acts.appendChild(b);
+    return b;
+  };
+  // Folders are not downloadable (the transfer streams one file), so the
+  // button is offered only when there is something it can act on.
+  if (files) btn('fb-sel-go', 'Download', fbBulkDownload);
+  btn('fb-sel-del', 'Delete', fbAskBulkDelete);
+  btn('', 'Clear', fbClearSel);
+}
+
+// Shift-click picks the run between the last toggled row and this one -
+// the behaviour every file manager has, and the only bearable way to
+// pick forty files.
+function fbToggleRow(row, shiftKey) {
+  let rows = fbVisibleRows();
+  let name = row.dataset.name;
+  if (shiftKey && _fbSelAnchor !== null) {
+    let a = rows.findIndex(r => r.dataset.name === _fbSelAnchor);
+    let b = rows.indexOf(row);
+    if (a >= 0 && b >= 0) {
+      let [lo, hi] = a <= b ? [a, b] : [b, a];
+      let want = !_fbSel.has(name);
+      for (let i = lo; i <= hi; i++) {
+        if (want) _fbSel.add(rows[i].dataset.name);
+        else _fbSel.delete(rows[i].dataset.name);
+      }
+      _fbSelAnchor = name;
+      syncFbSel();
+      return;
+    }
+  }
+  if (_fbSel.has(name)) _fbSel.delete(name); else _fbSel.add(name);
+  _fbSelAnchor = name;
+  syncFbSel();
+}
+
+function wireFbSelect(row) {
+  let ck = row.querySelector('.fb-ck');
+  if (!ck) return;
+  // The row's own click navigates or downloads; the checkbox must not.
+  // No preventDefault here: a checkbox is toggled BEFORE its click event,
+  // and preventing the default reverts it after the handler has run - so
+  // the box that syncFbSel had just ticked went blank again (visible on a
+  // shift-range pick). Let the native toggle stand; syncFbSel then writes
+  // the authoritative state onto every box.
+  ck.addEventListener('click', ev => {
+    ev.stopPropagation();
+    fbToggleRow(row, ev.shiftKey);
+  });
+  ck.addEventListener('keydown', ev => {
+    if (ev.key !== ' ' && ev.key !== 'Enter') return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    fbToggleRow(row, ev.shiftKey);
+  });
+}
+
+// The absolute paths of the selected rows, in the order they appear.
+function fbSelected(kind) {
+  let dir = _fbCurPath;
+  return fbVisibleRows()
+    .filter(r => _fbSel.has(r.dataset.name))
+    .filter(r => !kind || (kind === 'f' ? r.dataset.type !== 'd'
+                                        : r.dataset.type === 'd'))
+    .map(r => ({name: r.dataset.name, type: r.dataset.type, row: r,
+                path: (dir === '/' ? '' : dir) + '/' + r.dataset.name}));
+}
+
+// ── Bulk delete ─────────────────────────────────────────────────────
+// One question for the whole batch, then one rm per entry: each delete
+// stays a separate, individually audited side-channel call, and a
+// failure in the middle names the entry that failed.
+function fbAskBulkDelete() {
+  let items = fbSelected();
+  if (!items.length) return;
+  let dirs = items.filter(i => i.type === 'd').length;
+  let bar = $('fbSel');
+  $('fbSelN').textContent = 'Delete ' + items.length +
+    (items.length === 1 ? ' item' : ' items') + '?' +
+    (dirs ? ' (folders only if empty)' : '');
+  let acts = $('fbSelActs');
+  acts.innerHTML = '';
+  let mk = (cls, label, fn) => {
+    let b = document.createElement('button');
+    b.type = 'button'; b.className = cls; b.textContent = label;
+    b.addEventListener('click', ev => { ev.stopPropagation(); fn(); });
+    acts.appendChild(b);
+    return b;
+  };
+  mk('', 'Cancel', syncFbSel);
+  let go = mk('fb-sel-del armed', 'Delete ' + items.length, () => fbBulkDelete(items));
+  try { go.focus(); } catch (e) {}
+  bar.classList.remove('h');
+}
+
+function fbBulkDelete(items) {
+  let p = fbSessionForAction();
+  if (!p) return;
+  let sid = p.sid;
+  $('fbSelActs').innerHTML = '';
+  let done = 0, failed = [];
+  let step = () => {
+    if (done >= items.length) return Promise.resolve();
+    let it = items[done];
+    $('fbSelN').textContent = 'Deleting ' + (done + 1) + '/' + items.length +
+                              ' — ' + it.name;
+    return api('rm', {body: {session_id: sid, path: it.path}})
+      .then(r => {
+        if (r && r.error) {
+          // The side-channel rate limit is the one failure that makes
+          // continuing pointless: stop and say so.
+          if (r.code === 'rate_limited' || /rate.?limit/i.test(r.error)) {
+            throw new Error('rate_limited');
+          }
+          failed.push(it.name + ': ' + r.error);
+        }
+        done++;
+        return step();
+      });
+  };
+  step()
+    .catch(e => {
+      if (e && e.message === 'rate_limited') {
+        showToast('Too many requests — deleted ' + done + ' of ' + items.length +
+                  ', try the rest in a moment.', 'warn');
+      } else {
+        failed.push(e && e.message ? e.message : 'error');
+      }
+    })
+    .then(() => {
+      let ok = done - failed.length;
+      if (failed.length) {
+        showToast('Deleted ' + ok + ' of ' + items.length + ' — ' + failed[0] +
+                  (failed.length > 1 ? ' (+' + (failed.length - 1) + ' more)' : ''), 'err');
+      } else if (ok) {
+        showToast('Deleted ' + ok + (ok === 1 ? ' item' : ' items'), 'ok');
+      }
+      fbClearSel();
+      reloadFbDir();
+    });
+}
+
+// ── Bulk download ───────────────────────────────────────────────────
+// Strictly one at a time: a pane carries one transfer, and the browser
+// stays open so the queue's progress is visible.
+function fbBulkDownload() {
+  let items = fbSelected('f');
+  if (!items.length) return;
+  let p = fbSessionForAction();
+  if (!p) return;
+  let why = uploadBlocker(p);
+  if (why && /already running/.test(why)) { showToast(why, 'warn'); return; }
+  let skipped = fbSelected().length - items.length;
+  if (skipped) showToast('Folders can’t be downloaded — skipping ' + skipped + '.', 'warn');
+  let id = p.id, done = 0, stopped = null;
+  let step = () => {
+    if (done >= items.length || stopped) return Promise.resolve();
+    let it = items[done];
+    $('fbSelN').textContent = 'Downloading ' + (done + 1) + '/' + items.length +
+                              ' — ' + it.name;
+    // A short settle so the next file can start: the pane keeps the
+    // finished transfer on screen for a couple of seconds otherwise.
+    return startFastDownload(id, it.path, {settleDelay: 250})
+      .then(ok => {
+        if (!ok) { stopped = it.name; return; }
+        done++;
+        return step();
+      });
+  };
+  step().then(() => {
+    if (stopped) {
+      showToast('Stopped at ' + stopped + ' — downloaded ' + done +
+                ' of ' + items.length + '.', 'err');
+    } else {
+      showToast('Downloaded ' + done + (done === 1 ? ' file' : ' files'), 'ok');
+    }
+    fbClearSel();
+  });
+}
+
+// ── File browser: upload into the directory on screen ───────────────
+// Until the server learned to take a destination, an upload always
+// landed wherever the shell happened to be standing - so the folder the
+// user had just navigated to in the browser was the one place they
+// could not send a file to.
+
+// Why this browser can't take an upload right now, or '' when it can.
+function fbUploadBlocker() {
+  let p = _fbId && panes[_fbId];
+  if (!p || !p.sid) return 'This pane is not connected.';
+  // Never upload into a path we are not sure of: the rows (and _fbCurPath)
+  // must belong to the session we are about to send the file through.
+  if (!_fbCurPath || p.sid !== _fbListedSid) return 'The listing is still loading.';
+  return uploadBlocker(p);
+}
+
+function fbUploadHere() {
+  let why = fbUploadBlocker();
+  if (why) { showToast(why, 'warn'); return; }
+  let inp = $('fbUploadInput');
+  if (inp) inp.click();
+}
+
+function fbHandleUpload(input) {
+  let files = Array.prototype.slice.call(input.files || []);
+  input.value = '';
+  fbStartUpload(files);
+}
+
+function fbStartUpload(files) {
+  if (!files.length) return;
+  let why = fbUploadBlocker();
+  if (why) { showToast(why, 'warn'); return; }
+  let dir = _fbCurPath;
+  startUploadFiles(_fbId, files, {destDir: dir});
+  paintFbXfer(panes[_fbId]);
+}
+
+function fbCancelXfer() {
+  if (_fbId) cancelTransfer(_fbId);
+}
+
+// The pane's own progress bar is behind this modal, so mirror it into
+// the browser's footer while the browser is the thing the user is
+// looking at. Reads the pane's bar rather than keeping a second copy of
+// the state, so the two can't disagree.
+function paintFbXfer(p) {
+  let el = $('fbXfer');
+  if (!el) return;
+  let open = _fbId && p && p.id === _fbId && !$('fbOv').classList.contains('h');
+  let src = open && p.el && p.el.querySelector('[data-upload-progress]');
+  if (!src || src.classList.contains('h')) { el.classList.add('h'); return; }
+  let bar = src.querySelector('.upload-progress-bar');
+  let mine = el.querySelector('.fb-xfer-bar');
+  mine.style.width = bar.style.width;
+  mine.style.background = bar.style.background || '';
+  el.querySelector('.fb-xfer-text').textContent =
+    src.querySelector('.upload-progress-text').textContent;
+  el.classList.remove('h');
+}
+
+function wireFbDrop() {
+  let el = document.querySelector('#fbOv .fb-panel');
+  if (!el) return;
+  let msg = () => 'Drop to upload to ' + (_fbCurPath || 'this folder');
+  el.addEventListener('dragenter', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    showDropTargetOn(el, fbUploadBlocker(), msg());
+  });
+  el.addEventListener('dragover', ev => {
+    if (!_dragHasFiles(ev)) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = fbUploadBlocker() ? 'none' : 'copy';
+    showDropTargetOn(el, fbUploadBlocker(), msg());
+  });
+  el.addEventListener('dragleave', ev => {
+    if (!_dragHasFiles(ev)) return;
+    if (ev.relatedTarget && el.contains(ev.relatedTarget)) return;
+    hideDropTarget(el);
+  });
+  el.addEventListener('drop', ev => {
+    if (!_dragHasFiles(ev)) return;
+    // Stop here: the document-level handler would otherwise tell the user
+    // to drop onto a pane, about a drop that just worked.
+    ev.preventDefault();
+    ev.stopPropagation();
+    clearAllDropTargets();
+    let why = fbUploadBlocker();
+    if (why) { showToast(why, 'warn'); return; }
+    fbStartUpload(droppedFiles(ev));
+  });
+}
+
+// The panel exists before this script runs (scripts are at the end of
+// the body), but guard anyway so load-order changes can't silently drop
+// the browser's drop zone.
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', wireFbDrop);
+} else {
+  wireFbDrop();
 }
 
 // ── File browser: new folder (mkdir) ────────────────────────────────
