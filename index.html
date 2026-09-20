@@ -213,12 +213,19 @@
     .upload-progress-cancel:hover{color:var(--dg);background:rgba(248,81,73,.1)}
     .pane-term{flex:1;overflow:hidden;position:relative}
     /* Status bars (reconnect, tmux, transport-retry) live HERE, over the
-       top rows of the terminal, instead of in the pane's flex column.
-       In the column each one shrank the terminal: the text jumped, xterm
-       refit and the PTY was resized mid-disconnect - twice, since hiding
-       the bar resized it back. The stack is anchored to the terminal
-       area, so it needs no knowledge of the pane bar's height. */
-    .pane-overlays{position:absolute;top:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:center;gap:4px;padding:4px;pointer-events:none}
+       terminal, instead of in the pane's flex column. In the column each
+       one shrank the terminal: the text jumped, xterm refit and the PTY
+       was resized mid-disconnect - twice, since hiding the bar resized it
+       back. The stack is anchored to the terminal area, so it needs no
+       knowledge of the pane bar's height.
+
+       Bottom-right, not top-centre: centred at the top the card landed
+       squarely on the first line of output ("tail -f /va[Reconnect]ted")
+       and pressed against the pane bar. The bottom-right corner is the
+       emptiest part of a terminal - lines are left-aligned and rarely
+       full width - and it is where the eye already is when a session
+       dies, next to the prompt. */
+    .pane-overlays{position:absolute;bottom:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:6px;pointer-events:none}
     .pane-overlays>*{max-width:100%}
     .pane-overlays>*{pointer-events:auto}
     /* Dim the terminal of inactive panes so the one in use stands out: a
@@ -321,6 +328,7 @@
     .panel-title + .opt-section-hd{margin-top:0;padding-top:0;border-top:none}
     .opt-ctl input[type=checkbox]{accent-color:var(--ac);width:16px;height:16px;cursor:pointer;margin:0}
     .opt-hint{font-size:11px;color:var(--dim);margin-top:-8px;margin-bottom:14px;line-height:1.4}
+    .opt-hint code{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:10px;background:var(--bg);border:1px solid var(--bd);border-radius:3px;padding:0 4px}
     .opt-ctl{display:flex;align-items:center;gap:10px;flex:1;justify-content:flex-end}
     .opt-ctl input[type=range]{flex:1;max-width:180px;accent-color:var(--ac)}
     .opt-ctl input[type=number]{width:58px;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:4px 6px;font:inherit;font-size:13px;text-align:right}
@@ -568,6 +576,14 @@
       <div class="opt-preview-hd">Preview</div>
       <div class="opt-preview-body" id="optPreview"></div>
     </div>
+    <div class="opt-section-hd">Keyboard &amp; clipboard</div>
+    <div class="opt-row">
+      <label>Ctrl+V pastes</label>
+      <div class="opt-ctl">
+        <input type="checkbox" id="optCtrlVPaste">
+      </div>
+    </div>
+    <div class="opt-hint">On by default. Turn it off to send <code>^V</code> to the shell instead — readline&rsquo;s quoted-insert, and Ctrl-V in vim. Ctrl+Shift+V and right-click paste either way; macOS keeps &#8984;V.</div>
     <div class="opt-section-hd">Terminal behavior (persistent session)</div>
     <div class="opt-row">
       <label>Auto-copy</label>

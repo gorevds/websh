@@ -41,6 +41,10 @@ function makeFakes(win) {
     write() {} dispose() {}
     onData(cb) { this._onDataCb = cb || null; return { dispose: () => { this._onDataCb = null; } }; }
     onBinary() {} onResize() {} onBell() {}
+    // Real xterm calls this handler for every key event and skips ALL of
+    // its own handling (including preventDefault) when it returns false -
+    // which is how Ctrl+V is handed back to the browser to paste.
+    attachCustomKeyEventHandler(fn) { this._customKey = fn; }
     // Real xterm paste() wraps the text in bracketed-paste markers (when
     // the app enabled the mode) and emits it via onData. The stub doesn't
     // model bracketed mode; it records the call and forwards to onData so
@@ -121,8 +125,18 @@ function makeFakes(win) {
 // `match` filters on the request body. `response` may be a function(body).
 // `once` consumes the entry. `fallthrough` lets an unmatched entry fall
 // through silently (used so we can register a "catch-all" last).
-function makeFetch(plan, log) {
-  return function(url, init) {
+// Once its env is marked dead, a reply still in flight never settles:
+// the app's own .then/.catch would otherwise run against a window that
+// has already been closed. Each fetch carries the state it belongs to
+// (`fn.__state`), so cleanup() can kill even a window a test built for
+// itself - and never the wrong one.
+function makeFetch(plan, log, state) {
+  const st = state || {dead: false};
+  const NEVER = new Promise(() => {});
+  const dead = () => !!st.dead;
+  const reply = resp => dead() ? NEVER
+    : ({json: () => dead() ? NEVER : Promise.resolve(resp)});
+  const fn = function(url, init) {
     const u = new URL(url, 'http://x/');
     const action = u.searchParams.get('action');
     const body = init && init.body ? JSON.parse(init.body) : null;
@@ -134,12 +148,14 @@ function makeFetch(plan, log) {
       if (p.once) plan.splice(i, 1);
       const resp = typeof p.response === 'function' ? p.response(body) : p.response;
       const d = p.delay || 1;
-      return sleep(d).then(() => ({json: () => Promise.resolve(resp)}));
+      return sleep(d).then(() => reply(resp));
     }
     // Keep the test moving on unexpected actions (output polls after a
     // test's assertions have already run, for example).
-    return sleep(1).then(() => ({json: () => Promise.resolve({alive: false})}));
+    return sleep(1).then(() => reply({alive: false}));
   };
+  fn.__state = st;
+  return fn;
 }
 
 // Expose module-scope const/let bindings from websh.js onto `window` so
@@ -196,13 +212,14 @@ async function mkEnv(plan) {
                                url: 'http://localhost/websh/'});
   const win = dom.window;
   const log = [];
+  const state = {dead: false};
   makeFakes(win);
-  win.fetch = makeFetch(plan, log);
+  win.fetch = makeFetch(plan, log, state);
   _injectVaultGlobals(win);
   win.localStorage.clear();
   win.eval(js + EXPOSE);
   await sleep(30);
-  return {dom, win, log};
+  return {dom, win, log, state};
 }
 
 function cleanup(env) {
@@ -215,6 +232,17 @@ function cleanup(env) {
     try {
       if (env.win.currentConnectRun) env.win.currentConnectRun.cancelled = true;
     } catch(e) {}
+    // Stop every in-flight reply from settling BEFORE the window closes
+    // (see makeFetch): its continuation inside the app would otherwise
+    // run against a closed window, find `document === undefined` and
+    // kill the whole run - intermittently, depending on which test was
+    // waiting on a reply. Leaving the window open instead is not an
+    // option: two hundred dead environments' timers keep firing and
+    // starve the timing-sensitive tests.
+    // env.state for mkEnv; __state covers a window a test built itself
+    // (and a fetch re-armed mid-test, which replaces win.fetch).
+    if (env.state) env.state.dead = true;
+    try { if (env.win.fetch && env.win.fetch.__state) env.win.fetch.__state.dead = true; } catch(e) {}
     env.dom.window.close();
   } catch(e) {}
 }
@@ -2678,10 +2706,108 @@ test('reconnect-bar: one alarm, not two - the card is quiet unless it must not b
      'disconnected state shown by a dot');
   ok(/\.pane-badge\.s-on,\.pane-badge\.s-wait,\.pane-badge\.s-off\{background:none;padding:0;color:var\(--dim\)\}/.test(css),
      'badge text is dim, not a coloured pill');
-  ok(/\.pane-overlays\{[^}]*align-items:center/.test(css),
+  ok(/\.pane-overlays\{[^}]*align-items:flex-end/.test(css),
      'overlay cards size to their content instead of spanning the pane');
+  // Centred at the top the card landed on the first line of output and
+  // pressed against the pane bar.
+  ok(/\.pane-overlays\{position:absolute;bottom:0/.test(css),
+     'the stack sits in the bottom corner, off the first line of output');
+  ok(!/class="reconnect-bar h"[^>]*>\s*<span[^>]*>Disconnected/.test(js),
+     'the card carries no pre-baked status word to leak');
+  // Every line websh writes into the terminal shares one form, so ours
+  // are never mistaken for the remote's output - and a link that simply
+  // dropped no longer shouts in bright red next to a red badge.
+  const notices = js.match(/term\.write\('\\r\\n\\x1b\[[^']*'/g) || [];
+  ok(notices.length >= 4, 'terminal notices found (' + notices.length + ')');
+  ok(notices.every(n => /\[websh: /.test(n)),
+     'all of them are [websh: ...]; got ' + JSON.stringify(notices));
+  ok(!/\\x1b\[91m/.test(js), 'none of them is bright red');
+  ok(/\\x1b\[2m\[websh: connection lost\]/.test(js),
+     'a dropped link is a dim note, not an error');
+  ok(/\\x1b\[31m\[websh: authentication failed\]/.test(js),
+     'a rejected password still reads as an error');
   ok(/\.xterm\{padding:4px 6px 2px/.test(css),
      'top padding keeps the first row and its cursor off the pane bar');
+  cleanup(env);
+});
+
+// ── Ctrl+V ──────────────────────────────────────────────────────────
+test('Ctrl+V pastes by default, and only Ctrl+V', async () => {
+  // In a terminal Ctrl+letter is a control code: xterm sends ^V and
+  // cancels the browser's paste, so Ctrl+V looked broken (the shell sat
+  // waiting for readline's quoted-insert). The fix is to DECLINE the
+  // event - any handling at all ends in preventDefault, which kills the
+  // native paste - so the test is about what the key handler returns.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  ok(win.settings.ctrlVPaste === true, 'on by default');
+  const k = (o) => Object.assign({type: 'keydown', ctrlKey: true, shiftKey: false,
+                                  altKey: false, metaKey: false, code: 'KeyV', key: 'v'}, o);
+  const paste = e => win._ctrlVShouldPaste(e);
+  ok(paste(k({})), 'plain Ctrl+V pastes');
+  ok(paste(k({code: '', key: 'V'})), 'and with CapsLock / no KeyboardEvent.code');
+  ok(paste(k({code: 'KeyV', key: 'м'})), 'and on a non-Latin layout (physical V)');
+  ok(!paste(k({type: 'keyup'})), 'only on keydown - one paste per press');
+  ok(!paste(k({shiftKey: true})), 'Ctrl+Shift+V is left to the browser (it already pastes)');
+  ok(!paste(k({altKey: true})), 'Ctrl+Alt+V / AltGr keeps its own meaning');
+  ok(!paste(k({metaKey: true})), 'Meta chords untouched');
+  ok(!paste(k({ctrlKey: false})), 'a bare v is typing, not pasting');
+  ok(!paste(k({code: 'KeyC', key: 'c'})), 'Ctrl+C still interrupts');
+  ok(!paste(k({code: 'KeyD', key: 'd'})), 'Ctrl+D still sends EOF');
+  // Turning it off restores ^V for readline's quoted-insert and vim.
+  win.settings.ctrlVPaste = false;
+  ok(!paste(k({})), 'setting off → the key goes to the shell');
+  win.settings.ctrlVPaste = true;
+  cleanup(env);
+});
+
+test('Ctrl+V paste stays out of the way on macOS', async () => {
+  // Cmd+V already pastes there, and ^V is the expected binding in every
+  // Mac terminal.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  Object.defineProperty(win.navigator, 'platform', {value: 'MacIntel', configurable: true});
+  ok(win._isMacLike(), 'platform recognised');
+  ok(!win._ctrlVShouldPaste({type: 'keydown', ctrlKey: true, code: 'KeyV', key: 'v'}),
+     'Ctrl+V is left as ^V on a Mac');
+  cleanup(env);
+});
+
+test('Ctrl+V paste has a switch in Options that takes effect at once', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.openOptions();
+  const box = $(win, 'optCtrlVPaste');
+  ok(box && box.checked === true, 'the box reflects the default');
+  box.checked = false;
+  box.dispatchEvent(new win.Event('change'));
+  ok(win.settings.ctrlVPaste === false, 'unticking writes the setting');
+  // No key handler is re-attached: the predicate reads the live value,
+  // so every open pane follows immediately.
+  ok(!win._ctrlVShouldPaste({type: 'keydown', ctrlKey: true, code: 'KeyV', key: 'v'}),
+     'and the change applies with no reconnect or re-open');
+  const stored = JSON.parse(win.localStorage.getItem(
+    Object.keys(win.localStorage).find(key => /settings/.test(key))) || '{}');
+  ok(stored.ctrlVPaste === false, 'and it survives a reload');
+  win.resetOptions();
+  ok(win.settings.ctrlVPaste === true, '"Reset to defaults" brings it back');
+  cleanup(env);
+});
+
+test('a dead session shows no cursor', async () => {
+  // Nothing accepts keystrokes once the session is gone, and on a pane
+  // whose output starts at the top the blinking cursor sat right under
+  // the pane bar, looking welded to the pane name.
+  const env = await mkEnv(FB_PLAN([], '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  let blurred = 0, focused = 0;
+  p.term.blur = () => blurred++;
+  p.term.focus = () => focused++;
+  win.endSession(p, {});
+  ok(blurred === 1, 'the terminal is blurred when the session ends');
+  // ...and a reconnect takes the focus back.
+  win.beginSessionIO(p);
+  ok(focused === 1, 'focus returns when a session starts again');
   cleanup(env);
 });
 

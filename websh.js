@@ -109,7 +109,9 @@ const DEFAULT_SETTINGS = {
   // order buries it. 'name' | 'size' | 'mtime'; dir -1 = descending.
   fbSort: 'mtime', fbSortDir: -1,
   // Dotfiles hidden by default, as in every file manager and `ls`.
-  fbShowHidden: false
+  fbShowHidden: false,
+  // Ctrl+V pastes instead of sending ^V. See _ctrlVShouldPaste().
+  ctrlVPaste: true
 };
 // id → [label, webfont-name-or-null, fallback-stack, google-weights]
 // webfont-name is the family loaded via Google Fonts; null = system
@@ -152,6 +154,30 @@ function ensureFontLink(id) {
     document.head.appendChild(link);
   }
   link.setAttribute('href', href);
+}
+
+// True when this key event is a Ctrl+V that should paste rather than
+// send ^V. Deliberately narrow: only a plain Ctrl+V keydown, and only
+// where ^V is not already the better binding.
+function _ctrlVShouldPaste(e) {
+  if (!settings.ctrlVPaste) return false;
+  if (e.type !== 'keydown') return false;
+  // Ctrl alone. Ctrl+Shift+V already pastes natively (xterm ignores it),
+  // and Ctrl+Alt+V / AltGr must keep their own meaning.
+  if (!e.ctrlKey || e.shiftKey || e.altKey || e.metaKey) return false;
+  // macOS pastes with Cmd+V, which needs nothing from us; there Ctrl+V
+  // stays what it is on every Mac terminal - quoted-insert.
+  if (_isMacLike()) return false;
+  // e.code is layout-independent (a Cyrillic or Dvorak layout still
+  // reports KeyV for the physical V); e.key covers browsers without it.
+  return e.code === 'KeyV' || e.key === 'v' || e.key === 'V';
+}
+
+function _isMacLike() {
+  let n = typeof navigator === 'object' && navigator ? navigator : {};
+  let s = (n.userAgentData && n.userAgentData.platform) || n.platform ||
+          n.userAgent || '';
+  return /Mac|iPhone|iPad|iPod/i.test(s);
 }
 
 // Copy `text` to the system clipboard. Yandex Browser silently rejects
@@ -290,7 +316,7 @@ function createPane(container) {
     `<div class="pane-term">` +
       `<div class="pane-overlays" data-overlays="${id}">` +
         `<div class="reconnect-bar h" data-reconnect="${id}">` +
-          `<span style="font-size:12px;color:var(--dim)">Disconnected</span>` +
+          `<span style="font-size:12px;color:var(--dim)"></span>` +
           `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
           `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
         `</div>` +
@@ -501,6 +527,19 @@ function createPane(container) {
   term.onBell(() => {
     el.classList.remove('bell'); void el.offsetWidth; el.classList.add('bell');
   });
+
+  // Ctrl+V. In a terminal Ctrl+letter is a control code: xterm sends
+  // ^V (0x16) and cancels the browser's own paste, so Ctrl+V looked
+  // broken - the shell sat waiting for readline's quoted-insert to
+  // swallow the next key. With the setting on we decline the event
+  // instead of handling it: xterm leaves it alone, the browser performs
+  // its native paste into xterm's hidden textarea, and xterm's own
+  // paste handler wraps the text in bracketed-paste markers (so a
+  // multi-line paste is not executed line by line).
+  //
+  // Returning false here is the ONLY way to get that: any handling at
+  // all ends in preventDefault, which kills the native paste.
+  term.attachCustomKeyEventHandler(e => !_ctrlVShouldPaste(e));
 
   // Right-click paste. Also swallow button-2 mousedown at capture phase
   // so xterm.js never forwards it to the remote — otherwise tmux (with
@@ -1436,6 +1475,12 @@ function endSession(p, o) {
   p.outCursor = 0;       // cursors are per session
   clearTimeout(p.saveCommitTimer);
   p.saveCommitTimer = null;
+  // Nothing accepts keystrokes any more (queueInput is guarded on
+  // p.sid), so a blinking cursor is a lie - and, on a pane whose output
+  // starts at the top, it sat right under the pane bar looking welded to
+  // it. Blurring hides it outright: cursorInactiveStyle is 'none'.
+  // Reconnecting focuses the terminal again (activatePane/connectPane).
+  try { p.term.blur(); } catch (e) {}
   if (o.disconnect && sid) {
     api('disconnect', {body: {session_id: sid}}).catch(() => {});
   }
@@ -1606,7 +1651,7 @@ function handleOutputPayload(p, r, sid) {
   // (reconnect placeholder). The login form never reopens on its own.
   if (r.auth_failed) {
     p.pendingSave = null;
-    p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
+    p.term.write('\r\n\x1b[31m[websh: authentication failed]\x1b[0m\r\n');
     endSession(p, {disconnect: true, badge: true});
     p.recentOutput = '';
     if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
@@ -1620,7 +1665,7 @@ function handleOutputPayload(p, r, sid) {
     commitPendingSave(p);
   }
   if(r.alive===false){
-    p.term.write('\r\n\x1b[90m--- connection closed ---\x1b[0m\r\n');
+    p.term.write('\r\n\x1b[2m[websh: connection closed]\x1b[0m\r\n');
     endSession(p, {save: true});
     // Smart tmux fallback: a persistent pane whose session dies quickly
     // with a "not found" shape in the output is almost certainly a
@@ -1711,9 +1756,13 @@ function transportFatal(p, e) {
   setReconnecting(p, false);
   // Final fallback: budget exhausted, give up and surface banner.
   console.error('transport gave up:', p.id, e);
+  // All websh-injected lines share one form - dim "[websh: …]" for the
+  // expected outcomes, red for a real error - so the terminal doesn't
+  // shout in bright red about a link that simply dropped, and our lines
+  // are never mistaken for the remote's own output.
   let msg = (e && e.message && e.message.indexOf('502') !== -1)
-    ? '\r\n\x1b[91m--- backend restarted, session lost ---\x1b[0m\r\n'
-    : '\r\n\x1b[91m--- connection lost ---\x1b[0m\r\n';
+    ? '\r\n\x1b[2m[websh: backend restarted, session lost]\x1b[0m\r\n'
+    : '\r\n\x1b[2m[websh: connection lost]\x1b[0m\r\n';
   p.term.write(msg);
   endSession(p, {save: true});
   if(p.host || p.connection) showReconnectBar(p);
@@ -2011,7 +2060,7 @@ async function connectPane(p, opts) {
         if (formOpen) {
           showErr('Authentication failed — check password or key.');
         } else {
-          p.term.write('\r\n\x1b[91m--- authentication failed ---\x1b[0m\r\n');
+          p.term.write('\r\n\x1b[31m[websh: authentication failed]\x1b[0m\r\n');
           if (p.host || p.connection) showReconnectBar(p, 'auth_failed');
           connectingFor = null;
           overlayMode = null;
@@ -2537,7 +2586,7 @@ function hideErr(){ $('err').classList.remove('on') }
 // toast, so even a target-less pane never loses the text.)
 function surfaceConnectError(p, msg, reason) {
   if (!$('ov').classList.contains('h')) { showErr(msg); return; }
-  try { p.term.write('\r\n\x1b[91m--- ' + msg + ' ---\x1b[0m\r\n'); } catch (e) {}
+  try { p.term.write('\r\n\x1b[31m[websh: ' + msg + ']\x1b[0m\r\n'); } catch (e) {}
   if (p.host || p.connection) showReconnectBar(p, reason || 'error');
   connectingFor = null;
   overlayMode = null;
@@ -5735,6 +5784,7 @@ function openOptions(){
   $('optLineHeightVal').textContent = Number(settings.lineHeight).toFixed(2);
   $('optWeight').value = settings.fontWeight;
   $('optWeightVal').textContent = settings.fontWeight;
+  let cv = $('optCtrlVPaste'); if (cv) cv.checked = !!settings.ctrlVPaste;
   let cc = $('optTmuxClipboard'); if (cc) cc.checked = !!settings.tmuxClipboard;
   let ch = $('optTmuxHistory'); if (ch) ch.value = settings.tmuxHistory;
   renderOptPreview();
@@ -5896,6 +5946,12 @@ document.addEventListener('DOMContentLoaded', () => {
   lh.addEventListener('input', () => onOptInput('lineHeight', lh, lhv, v => v.toFixed(2)));
   w.addEventListener('input', () => onOptInput('fontWeight', w, wv, v => String(v)));
   f.addEventListener('change', () => { settings.font = f.value; saveSettings(); applySettings(); renderOptPreview(); });
+  let cv = $('optCtrlVPaste');
+  // Read live by _ctrlVShouldPaste, so the change takes effect in every
+  // open pane immediately - no re-attaching of key handlers.
+  if (cv) cv.addEventListener('change', () => {
+    settings.ctrlVPaste = cv.checked; saveSettings();
+  });
   let cc = $('optTmuxClipboard'), ch = $('optTmuxHistory');
   if (cc) cc.addEventListener('change', () => { settings.tmuxClipboard = cc.checked; saveSettings(); pushTmuxOptionsToActiveSessions(); });
   if (ch) ch.addEventListener('change', () => {
