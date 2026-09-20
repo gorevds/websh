@@ -419,8 +419,11 @@
        stroke-linecap="round" stroke-linejoin="round"></g>
   </defs>
   <symbol id="i-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M15.5 15.5 21 21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
-  <symbol id="i-export" viewBox="0 0 24 24"><path d="M12 3v11m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
-  <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M12 2.8v2.4M12 18.8v2.4M21.2 12h-2.4M5.2 12H2.8M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7M18.5 18.5l-1.7-1.7M7.2 7.2 5.5 5.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+  <!-- Export = "write this out as a file": a document with a down arrow, not the
+       bare tray arrow, which is already what a plain download looks like. -->
+  <symbol id="i-export" viewBox="0 0 24 24"><path d="M13.5 3.5H7a1.5 1.5 0 0 0-1.5 1.5v14A1.5 1.5 0 0 0 7 20.5h10a1.5 1.5 0 0 0 1.5-1.5V8.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M13.4 3.6v5h5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M12 11v6m0 0 2.5-2.5M12 17l-2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+  <!-- A real cog: the old "circle + eight straight rays" read as a sun, not as settings. -->
+  <symbol id="i-gear" viewBox="0 0 24 24"><path d="M9.61 2.29A10 10 0 0 1 14.39 2.29L13.72 5.01A7.2 7.2 0 0 1 17.2 7.02L19.22 5.08A10 10 0 0 1 21.6 9.21L18.91 9.99A7.2 7.2 0 0 1 18.91 14.01L21.6 14.79A10 10 0 0 1 19.22 18.92L17.2 16.98A7.2 7.2 0 0 1 13.72 18.99L14.39 21.71A10 10 0 0 1 9.61 21.71L10.28 18.99A7.2 7.2 0 0 1 6.8 16.98L4.78 18.92A10 10 0 0 1 2.4 14.79L5.09 14.01A7.2 7.2 0 0 1 5.09 9.99L2.4 9.21A10 10 0 0 1 4.78 5.08L6.8 7.02A7.2 7.2 0 0 1 10.28 5.01Z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><circle cx="12" cy="12" r="3.4" fill="none" stroke="currentColor" stroke-width="1.7"/></symbol>
   <symbol id="i-fullscreen" viewBox="0 0 24 24"><path d="M4 9V5a1 1 0 0 1 1-1h4M20 9V5a1 1 0 0 0-1-1h-4M4 15v4a1 1 0 0 0 1 1h4M20 15v4a1 1 0 0 1-1 1h-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
   <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 20V6m0 0 5 5m-5-5-5 5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v14m0 0 5-5m-5 5-5-5" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
@@ -476,7 +479,7 @@
     <button class="tbtn" onclick="toggleSearch()" title="Search (Ctrl+Shift+F)" aria-label="Search"><svg class="ic"><use href="#i-search"></use></svg></button>
     <button class="tbtn" onclick="zoomIn()" title="Zoom in (Ctrl+Plus)" aria-label="Zoom in">A+</button>
     <button class="tbtn" onclick="zoomOut()" title="Zoom out (Ctrl+Minus)" aria-label="Zoom out">A-</button>
-    <button class="tbtn" onclick="exportTerminal()" title="Export terminal (save the buffer to a file)" aria-label="Export terminal"><svg class="ic"><use href="#i-export"></use></svg></button>
+    <button class="tbtn" onclick="exportTerminal()" title="Export terminal (save the output to a .txt file)" aria-label="Export terminal"><svg class="ic"><use href="#i-export"></use></svg></button>
     <button class="tbtn" onclick="openOptions()" title="Options" aria-label="Options"><svg class="ic"><use href="#i-gear"></use></svg></button>
     <button class="tbtn" onclick="toggleFullscreen()" title="Fullscreen (F11)" aria-label="Fullscreen"><svg class="ic"><use href="#i-fullscreen"></use></svg></button>
   </div>
