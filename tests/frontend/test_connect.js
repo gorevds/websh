@@ -5163,7 +5163,10 @@ test('upload finalize failure reports bytes-landed without jargon', async () => 
   win.handleUpload(p.id, {files: [{name: 'doc.pdf', size: 10}], value: ''});
   await sleep(20);
   const text = p.el.querySelector('[data-upload-progress] .upload-progress-text');
-  ok(text.textContent === 'Upload failed: the file was uploaded to your home folder but could not be moved into the current directory',
+  // The bytes are in $HOME/<tmp>; the banner now names that file AND the
+  // server's reason ("control socket not ready" here) instead of a fixed
+  // sentence about "the current directory".
+  ok(/^Upload failed: saved to your home folder as \.websh-tmp-[a-z0-9-]+, but the connection to the host is not ready yet$/.test(text.textContent),
      'finalize-fail message; got ' + JSON.stringify(text.textContent));
   ok(text.textContent.indexOf('$HOME') === -1, 'no $HOME jargon');
   ok(text.textContent.indexOf('control socket') === -1, 'no raw server string');
@@ -7070,6 +7073,42 @@ test('file browser: the checkbox survives Cancel on a delete or rename editor', 
   ok(rowFor(win, 'alpha.txt').classList.contains('fb-picked'), 'picked after a cancelled rename');
   ok(dl.length === 0, 'still no download');
   ok(/2 files selected/.test($(win, 'fbSelN').textContent), 'both counted');
+  cleanup(env);
+});
+
+test('a failed move after upload says where the file is and why', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const d = (err, u) => win.describeFinalizeError(err, u);
+  const u = {destDir: '/srv/www', currentTmp: '.websh-tmp-abc'};
+  ok(/\/srv\/www no longer exists/.test(d('no such file or directory', u)),
+     'missing folder named; got ' + d('no such file or directory', u));
+  ok(/no permission to write to \/srv\/www/.test(d('Permission denied', u)), 'permission');
+  ok(/no permission to write to \/srv\/www/.test(d('Read-only file system', u)), 'read-only');
+  ok(/\.websh-tmp-abc/.test(d('Permission denied', u)), 'tells where the bytes are');
+  ok(/not ready yet/.test(d('control socket not ready', u)), 'side channel');
+  ok(/moved to \/srv\/www \(finalize exit 1: boom\)/.test(d('finalize exit 1: boom', u)),
+     'unknown reasons are passed through; got ' + d('finalize exit 1: boom', u));
+  ok(/the current directory/.test(d('Permission denied', {currentTmp: 't'})),
+     'no chosen folder → the pane cwd wording');
+  ok(/moved to/.test(d(new TypeError('Failed to fetch'), u)), 'an Error object is handled too');
+  cleanup(env);
+});
+
+test('file browser: an upload whose move fails shows the server reason in the strip', async () => {
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').concat([
+    {action: 'upload_finalize', response: {error: 'no such file or directory'}},
+  ]);
+  const env = await mkEnv(plan); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.fbStartUpload([fakeFile('a.txt', 3)]);
+  await sleep(60);
+  const text = $(win, 'fbXfer').querySelector('.fb-xfer-text').textContent;
+  ok(/Upload failed: saved to your home folder/.test(text) && /\/home\/alice no longer exists/.test(text),
+     'reason and folder in the strip; got ' + JSON.stringify(text));
   cleanup(env);
 });
 
