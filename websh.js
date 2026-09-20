@@ -5113,18 +5113,19 @@ function syncFbSel() {
   $('fbSelN').textContent = parts.join(', ') + ' selected';
   let acts = $('fbSelActs');
   acts.innerHTML = '';
-  let btn = (cls, label, fn) => {
-    let b = document.createElement('button');
-    b.type = 'button'; b.className = cls; b.textContent = label;
-    b.addEventListener('click', ev => { ev.stopPropagation(); fn(); });
-    acts.appendChild(b);
-    return b;
-  };
   // Folders are not downloadable (the transfer streams one file), so the
   // button is offered only when there is something it can act on.
-  if (files) btn('fb-sel-go', 'Download', fbBulkDownload);
-  btn('fb-sel-del', 'Delete', fbAskBulkDelete);
-  btn('', 'Clear', fbClearSel);
+  if (files) fbSelButton(acts, 'fb-sel-go', 'Download', fbBulkDownload);
+  fbSelButton(acts, 'fb-sel-del', 'Delete', fbAskBulkDelete);
+  fbSelButton(acts, '', 'Clear', fbClearSel);
+}
+
+function fbSelButton(acts, cls, label, fn) {
+  let b = document.createElement('button');
+  b.type = 'button'; b.className = cls; b.textContent = label;
+  b.addEventListener('click', ev => { ev.stopPropagation(); fn(); });
+  acts.appendChild(b);
+  return b;
 }
 
 // Shift-click picks the run between the last toggled row and this one -
@@ -5199,15 +5200,9 @@ function fbAskBulkDelete() {
     (dirs ? ' (folders only if empty)' : '');
   let acts = $('fbSelActs');
   acts.innerHTML = '';
-  let mk = (cls, label, fn) => {
-    let b = document.createElement('button');
-    b.type = 'button'; b.className = cls; b.textContent = label;
-    b.addEventListener('click', ev => { ev.stopPropagation(); fn(); });
-    acts.appendChild(b);
-    return b;
-  };
-  mk('', 'Cancel', syncFbSel);
-  let go = mk('fb-sel-del armed', 'Delete ' + items.length, () => fbBulkDelete(items));
+  fbSelButton(acts, '', 'Cancel', syncFbSel);
+  let go = fbSelButton(acts, 'fb-sel-del armed', 'Delete ' + items.length,
+                       () => fbBulkDelete(items));
   try { go.focus(); } catch (e) {}
   bar.classList.remove('h');
 }
@@ -5331,9 +5326,8 @@ function fbStartUpload(files) {
   if (!files.length) return;
   let why = fbUploadBlocker();
   if (why) { showToast(why, 'warn'); return; }
-  let dir = _fbCurPath;
-  startUploadFiles(_fbId, files, {destDir: dir});
-  paintFbXfer(panes[_fbId]);
+  // showUploadProgress (inside startUploadFiles) paints the strip.
+  startUploadFiles(_fbId, files, {destDir: _fbCurPath});
 }
 
 function fbCancelXfer() {
