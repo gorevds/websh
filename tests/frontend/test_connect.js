@@ -7000,6 +7000,50 @@ test('file browser: bulk download runs one at a time and skips folders', async (
   cleanup(env);
 });
 
+// ── Review fixes: bulk download really queues, editors keep the checkbox ──
+test('bulk download: the second file starts once the first has settled', async () => {
+  // startFastDownload resolved as soon as the bytes were saved, but the
+  // pane's slot (p.download) is only released by settleTransfer's timer;
+  // the next call in the queue found it still taken and the whole batch
+  // stopped after one file with "Stopped at ...". Drive the real
+  // startFastDownload, not a stub.
+  const env = await mkEnv(FB_PLAN(FB_ENTRIES, '/home/alice')); const win = env.win;
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  const requested = [];
+  const inner = win.fetch;
+  win.fetch = (url, init) => {
+    const u = new URL(url, 'http://x/');
+    if (u.searchParams.get('action') !== 'download') return inner(url, init);
+    requested.push(u.searchParams.get('path'));
+    let sent = false;
+    return Promise.resolve({
+      ok: true, status: 200,
+      headers: {get: h => h === 'Content-Length' ? '4' : null},
+      body: {getReader: () => ({
+        read: () => Promise.resolve(sent ? {done: true}
+          : (sent = true, {done: false, value: new Uint8Array([1, 2, 3, 4])})),
+        cancel: () => {},
+      })},
+    });
+  };
+  win.URL.createObjectURL = () => 'blob:x';
+  win.URL.revokeObjectURL = () => {};
+  win.HTMLAnchorElement.prototype.click = () => {};   // no jsdom navigation
+  const toasts = [];
+  win.showToast = (m, k) => toasts.push([k, m]);
+  pick(win, 'zeta.txt'); pick(win, 'alpha.txt');
+  win.fbBulkDownload();
+  await sleep(900);                 // two transfers + two 250 ms settles
+  ok(requested.length === 2, 'both files requested; got ' + JSON.stringify(requested));
+  ok(requested.every(r => /^\/home\/alice\//.test(r)), 'absolute paths');
+  ok(!toasts.some(t => /Stopped at/.test(t[1])), 'no "Stopped at"; got ' + JSON.stringify(toasts));
+  ok(toasts.some(t => /Downloaded 2 files/.test(t[1])), 'reports both; got ' + JSON.stringify(toasts));
+  ok(p.download === null || p.download === undefined, 'slot released at the end');
+  cleanup(env);
+});
+
 // ── Upload into the directory the file browser is showing ───────────
 // Before this, an upload always landed wherever the shell happened to
 // be standing - so the one place the user could not send a file to was
