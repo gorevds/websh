@@ -2628,6 +2628,63 @@ test('reconnect-bar: inline password input hidden for vault-backed pane', async 
   cleanup(env);
 });
 
+test('reconnect-bar: one alarm, not two - the card is quiet unless it must not be', async () => {
+  // The pane badge already says "Disconnected"; the card used to repeat
+  // the word AND paint a red edge, so a plain dropped link lit up the
+  // pane twice in red. The word belongs to the badge, the colour to a
+  // state the user has to act on.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-quiet', alive: true}, once: true},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  $(win, 'iH').value = '10.0.0.52'; $(win, 'iU').value = 'a'; $(win, 'iPw').value = 'p3';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(80);
+  const p = paneList(win)[0];
+  const bar = p.el.querySelector('[data-reconnect]');
+  const msg = () => bar.querySelector('span').textContent;
+
+  // Plain drop, creds still in memory: the button alone says it all.
+  win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
+  ok(msg() === '', 'no text repeated from the badge; got "' + msg() + '"');
+  ok(!bar.classList.contains('sev-err') && !bar.classList.contains('sev-warn'),
+     'a dropped link is not painted as an error');
+
+  // Plain drop with no creds: say what to do, still no alarm colour.
+  p.password = '';
+  win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
+  ok(/type the password/i.test(msg()), 'tells the user what to do; got "' + msg() + '"');
+  ok(!/disconnected/i.test(msg()), 'still no duplicated status word');
+  ok(!bar.classList.contains('sev-err'), 'no error colour for a plain drop');
+
+  // Credentials rejected: that IS an error.
+  win.eval(`showReconnectBar(panes['${p.id}'], 'auth_failed')`);
+  ok(bar.classList.contains('sev-err'), 'auth failure keeps the red edge');
+  // ...and the class is dropped again when the reason is no longer one.
+  win.eval(`showReconnectBar(panes['${p.id}'], 'closed')`);
+  ok(!bar.classList.contains('sev-err'), 'severity cleared on the next show');
+  win.eval(`showReconnectBar(panes['${p.id}'], 'no_vault_key')`);
+  ok(bar.classList.contains('sev-warn') && !bar.classList.contains('sev-err'),
+     'missing vault key is a warning, not an error');
+
+  // The badge carries the state as a dot; it is no longer a red pill, and
+  // the terminal's first row is held off the pane bar's edge.
+  const css = html.replace(/\/\*[\s\S]*?\*\//g, '');
+  ok(/\.pane-badge\.s-off::before\{background:var\(--dg\)\}/.test(css),
+     'disconnected state shown by a dot');
+  ok(/\.pane-badge\.s-on,\.pane-badge\.s-wait,\.pane-badge\.s-off\{background:none;padding:0;color:var\(--dim\)\}/.test(css),
+     'badge text is dim, not a coloured pill');
+  ok(/\.pane-overlays\{[^}]*align-items:center/.test(css),
+     'overlay cards size to their content instead of spanning the pane');
+  ok(/\.xterm\{padding:4px 6px 2px/.test(css),
+     'top padding keeps the first row and its cursor off the pane bar');
+  cleanup(env);
+});
+
 test('reconnect-bar: Enter / Reconnect with typed password feeds connectPane', async () => {
   // The inline-input recovery uses the typed value as opts.password and
   // dispatches the body with it. We assert the body that lands at the

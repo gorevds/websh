@@ -881,10 +881,13 @@ function showReconnectBar(p, reason) {
   let msg = bar.querySelector('span');
   let pwInput = bar.querySelector('input[type=password]');
   let showInput = _needsReconnectPwInput(p, reason);
+  // Severity drives the card's coloured edge; a plain drop gets none.
+  bar.classList.remove('sev-err', 'sev-warn');
   if (msg) {
     if (reason === 'auth_failed') {
       msg.textContent = showInput ? 'Authentication failed — type password' : 'Authentication failed';
       msg.style.color = 'var(--dg)';
+      bar.classList.add('sev-err');
     } else if (reason === 'no_vault_key') {
       // Distinct from auth-fail (creds rejected): the encryption key
       // that wraps this pane's saved creds is missing in this browser.
@@ -893,8 +896,12 @@ function showReconnectBar(p, reason) {
       // the user needs to sign in again on this browser to recover.
       msg.textContent = 'Vault key missing — sign in again to recover';
       msg.style.color = 'var(--wn)';
+      bar.classList.add('sev-warn');
     } else {
-      msg.textContent = showInput ? 'Disconnected — type password to reconnect' : 'Disconnected';
+      // The pane badge already says "Disconnected"; repeating it here in
+      // red just doubled the alarm. Say only what the card adds - what to
+      // do next - and let the lone Reconnect button speak for itself.
+      msg.textContent = showInput ? 'Type the password to reconnect' : '';
       msg.style.color = 'var(--dim)';
     }
   }
