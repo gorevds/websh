@@ -69,6 +69,29 @@
     .sv-actions{display:flex;gap:4px;flex-shrink:0;margin-left:8px}
     .sv-btn{padding:4px 10px;border-radius:6px;border:1px solid transparent;background:transparent;color:var(--dim);font-size:11px;cursor:pointer;transition:.15s}
     .sv-btn.del:hover{color:var(--dg);background:rgba(248,81,73,.1)}
+    .sv-btn.edit:hover{color:var(--ac);background:rgba(88,166,255,.1)}
+    .sv-btn .ic{width:14px;height:14px;vertical-align:-2px}
+    /* Inline editor inside a saved card: rename without deleting and
+       re-entering the credentials. */
+    .sv.editing{cursor:default;display:block;padding:10px 12px}
+    .sv-edit{display:flex;flex-wrap:wrap;gap:6px;align-items:center}
+    .sv-edit input{background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:6px;padding:5px 8px;font-size:12px;min-width:0}
+    .sv-edit input:focus{outline:none;border-color:var(--ac)}
+    .sv-edit input:disabled{opacity:.5;cursor:not-allowed}
+    .sv-edit .e-name{flex:1 1 100%}
+    .sv-edit .e-user{flex:1 1 90px}
+    .sv-edit .e-host{flex:2 1 150px}
+    .sv-edit .e-port{flex:0 0 68px}
+    /* Note on its own line, buttons right-aligned and sized to content:
+       as one flex row the note was squeezed into a narrow column and
+       Save stretched across the card. */
+    .sv-edit-row{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:8px}
+    /* .panel .btn-p is the full-width Connect button of the login form;
+       the card's buttons live inside that panel and must stay small. */
+    .sv-edit-row .btn,.panel .sv-edit-row .btn-p{flex:0 0 auto;width:auto;padding:5px 16px;font-size:12px;margin-top:0}
+    .sv-edit-note{display:block;margin-top:8px;font-size:11px;color:var(--dim)}
+    .sv-edit-note:empty{display:none}
+    .sv-edit-err{color:var(--dg)}
     .saved-list::-webkit-scrollbar{width:6px}
     .saved-list::-webkit-scrollbar-track{background:transparent}
     .saved-list::-webkit-scrollbar-thumb{background:var(--bd);border-radius:3px}

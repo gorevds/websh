@@ -6757,6 +6757,63 @@ test('status bars float over the terminal instead of resizing it', async () => {
   cleanup(env);
 });
 
+test('saved connections can be edited in place', async () => {
+  // Before this, a typo in a name, user or port meant Delete + create
+  // again - and for a vault-backed entry, re-entering the password.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: [], vault_enabled: true}}];
+  const env = await mkEnv(plan); const win = env.win;
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'typo prod', host: 'prod.example', user: 'alcie', port: 22},
+    {name: 'vault one', host: 'db.example', user: 'root', port: 2222, conn_id: 'C'.repeat(26)},
+  ]));
+  win._idbHasKeyCache = true;
+  win.renderSaved();
+  const card = i => $(win, 'savedList').querySelector(`.sv[data-idx="${i}"]`);
+  ok(card(0).querySelector('[data-edit]'), 'each card has an edit button');
+  // Local entry: everything is editable and validated.
+  card(0).querySelector('[data-edit]').click();
+  let row = card(0);
+  ok(row.classList.contains('editing'), 'editor opened in place');
+  row.querySelector('.e-user').value = 'alice with space';
+  row.querySelector('.sv-save').click();
+  ok(/User:/.test(row.querySelector('.sv-edit-note').textContent), 'invalid user refused; got ' +
+     row.querySelector('.sv-edit-note').textContent);
+  row.querySelector('.e-user').value = 'alice';
+  row.querySelector('.e-port').value = '70000';
+  row.querySelector('.sv-save').click();
+  ok(/Port/.test(row.querySelector('.sv-edit-note').textContent), 'invalid port refused');
+  row.querySelector('.e-port').value = '2200';
+  row.querySelector('.e-name').value = 'prod web';
+  row.querySelector('.sv-save').click();
+  let saved = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(saved[0].name === 'prod web' && saved[0].user === 'alice' && saved[0].port === 2200,
+     'edits persisted; got ' + JSON.stringify(saved[0]));
+  ok(!card(0).classList.contains('editing'), 'editor closed after saving');
+  ok(/prod web/.test(card(0).textContent) && /alice@prod.example:2200/.test(card(0).textContent),
+     'card re-rendered; got ' + card(0).textContent);
+  // Vault entry: the destination is inside the encrypted blob, so only
+  // the name can change - and the UI says why.
+  card(1).querySelector('[data-edit]').click();
+  row = card(1);
+  ok(row.querySelector('.e-host').disabled && row.querySelector('.e-user').disabled &&
+     row.querySelector('.e-port').disabled, 'destination locked for a vault entry');
+  ok(/re-save the credentials/i.test(row.querySelector('.sv-edit-note').textContent), 'and it explains why');
+  row.querySelector('.e-name').value = 'db primary';
+  row.querySelector('.sv-save').click();
+  saved = JSON.parse(win.localStorage.getItem('websh_connections'));
+  ok(saved[1].name === 'db primary' && saved[1].host === 'db.example' && saved[1].conn_id,
+     'only the name changed, conn_id kept; got ' + JSON.stringify(saved[1]));
+  // Cancel leaves everything alone, and clicking inside the editor
+  // must not start a connection.
+  const before = win.localStorage.getItem('websh_connections');
+  card(0).querySelector('[data-edit]').click();
+  card(0).querySelector('.e-name').value = 'discarded';
+  card(0).querySelector('.sv-cancel').click();
+  ok(win.localStorage.getItem('websh_connections') === before, 'cancel discards');
+  ok(env.log.filter(e => e.action === 'connect').length === 0, 'editing never connects');
+  cleanup(env);
+});
+
 // =====================================================================
 (async () => {
   for (const s of scenarios) {
