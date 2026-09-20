@@ -1907,7 +1907,18 @@ class SSHSession(object):
         if key:
             self._key_file = self._write_key(key)
 
-        self._spawn(host, port, username, cols, rows)
+        try:
+            self._spawn(host, port, username, cols, rows)
+        except BaseException:
+            # Half-built session: the caller never gets a handle to close,
+            # so release what is already on disk - the 0600 key file and
+            # the recording opened before the fork - here. If the fork
+            # itself failed there is no child to reap; if it succeeded and
+            # a later step raised, close() reaps it as usual.
+            if self.pid is None:
+                self._child_reaped = True
+            self.close()
+            raise
 
         self._reader = Thread(target=self._read_loop, daemon=True)
         self._reader.start()
