@@ -1666,5 +1666,37 @@ class TestHeaderTrustAuth(unittest.TestCase):
             _sh.rmtree(d, ignore_errors=True)
 
 
+
+class TestFailedSpawnLeavesNothingBehind(unittest.TestCase):
+    """SSHSession.__init__ writes the private key to a 0600 temp file (and
+    opens the recording) BEFORE pty.fork(). If the fork raised, the
+    exception escaped the constructor, the caller never got a session to
+    close, and the key file stayed on disk for the life of the host."""
+
+    def test_key_file_is_removed_when_fork_fails(self):
+        import glob
+        import tempfile
+        tmp = tempfile.gettempdir()
+        before = set(glob.glob(os.path.join(tmp, "websh_key_*.pem")))
+        with unittest.mock.patch.object(server.pty, "fork",
+                                        side_effect=OSError(11, "EAGAIN")):
+            with self.assertRaises(OSError):
+                server.SSHSession("sid-leak", "h.example", 22, "alice", None,
+                                  80, 24, key="-----BEGIN KEY-----\nabc\n-----END KEY-----")
+        after = set(glob.glob(os.path.join(tmp, "websh_key_*.pem")))
+        self.assertEqual(after - before, set(),
+                         "private key left on disk after a failed spawn")
+
+    def test_close_after_failed_fork_does_not_touch_a_child(self):
+        # No fork happened, so there is no pid to signal: close() must
+        # not try to kill/reap anything.
+        with unittest.mock.patch.object(server.pty, "fork",
+                                        side_effect=OSError(11, "EAGAIN")), \
+             unittest.mock.patch.object(server.os, "kill") as kill:
+            with self.assertRaises(OSError):
+                server.SSHSession("sid-leak2", "h.example", 22, "alice", "pw",
+                                  80, 24)
+        kill.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
