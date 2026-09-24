@@ -3482,6 +3482,52 @@ test('manual pane F5 same-tab: secrets restored from sessionStorage', async () =
   cleanup(env);
 });
 
+test('a background reconnect does not hijack the split the user is connecting', async () => {
+  // beginSessionIO ran for EVERY session start and always hid the login
+  // form and nulled pendingSplit/connectingFor. A background pane that
+  // finished reconnecting while the user was connecting a split made the
+  // split connect fall back to the active pane: its session was
+  // overwritten (and never disconnected) and no split was created.
+  let release2;
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: (b) => {
+      connects.push(b.host);
+      return {session_id: 'sid-' + b.host, alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}, delay: 50},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p1 = await _onePane(win);                       // host a.host
+  const p1sid = p1.sid;
+  // A second, background pane whose reconnect is still in flight.
+  const p2 = win.createPane(win.document.getElementById('panes'));
+  p2.host = 'bg.host'; p2.user = 'u'; p2.password = 'x';
+  win.activatePane(p1.id);
+  // The user starts a split from p1 and fills in the form...
+  win.splitPane(p1.id, 'h');
+  ok(!$(win, 'ov').classList.contains('h'), 'form open for the split');
+  // ...meanwhile p2's reconnect completes.
+  await win.connectPane(p2, {label: 'bg', host: 'bg.host', user: 'u', password: 'x'});
+  await sleep(40);
+  ok(!$(win, 'ov').classList.contains('h'), 'the form the user is typing in stays open');
+  ok(win.overlayMode === 'split' && win.pendingSplit && win.pendingSplit.fromId === p1.id,
+     'the split request survives; got ' + win.overlayMode + ' ' + JSON.stringify(win.pendingSplit));
+  // Now the user's split connect completes.
+  $(win, 'iH').value = 'split.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  win.doConnect();
+  await sleep(150);
+  const ps = paneList(win);
+  ok(ps.length === 3, 'a new split pane was created; got ' + ps.length);
+  ok(p1.sid === p1sid && p1.host === 'a.host', 'p1 keeps its own session; got ' + p1.sid + ' ' + p1.host);
+  ok(ps.some(p => p.host === 'split.host' && p !== p1 && p !== p2), 'split.host is in its own pane');
+  ok($(win, 'ov').classList.contains('h'), 'and the form closes on ITS success');
+  ps.forEach(p => { p.polling = false; });
+  cleanup(env);
+});
+
 test('F5 after splits: every pane reconnects with ITS OWN password', async () => {
   // build() mints ids in layout order while the manifest is walked in
   // creation order, so after splits old->new ids are a permutation
