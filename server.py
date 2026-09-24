@@ -1067,6 +1067,14 @@ _CONFIG_EMPTY = {"connections": [], "restrict_hosts": False,
                  "isolate_storage": False,
                  "denied_host_set": frozenset(),
                  "denied_net_list": ()}
+# What an unusable websh.json means when there is no earlier good version
+# to keep: nothing may be reached. restrict_hosts with no connections
+# refuses every connect. The file the operator named carries their
+# policy (restrict_hosts, denied_hosts); losing it must not quietly mean
+# "anyone may go anywhere".
+_CONFIG_LOCKED = dict(_CONFIG_EMPTY, restrict_hosts=True)
+# Why the named websh.json can't be used right now, or None.
+_config_unusable = None
 
 
 def _normalize_user_list(value):
@@ -1272,10 +1280,12 @@ def load_config():
                   denied_users lists constrain which usernames may connect,
                   but only when no fixed username is set on the entry.
     """
-    global _config_cache, _config_mtime, _config_rejected
+    global _config_cache, _config_mtime, _config_rejected, _config_unusable
     path = os.environ.get("WEBSH_CONFIG", "")
-    if not path or not os.path.isfile(path):
+    if not path:
         return _CONFIG_EMPTY
+    if not os.path.isfile(path):
+        return _config_fallback(path, "file not found")
     try:
         mtime = os.path.getmtime(path)
         if _config_cache is not None and mtime == _config_mtime:
@@ -1319,22 +1329,52 @@ def load_config():
             # Raw passthrough; validated field-by-field in config_public.
             "form_defaults": cfg.get("form_defaults"),
         }
+        if _config_unusable is not None:
+            _log("INFO", "websh.json at {} loaded again".format(path))
+        _config_unusable = None
         _config_cache = result
         _config_mtime = mtime
         _config_rejected = None
         return result
     except _PlaintextCredsRejected as e:
-        # Cache the rejection under this file version so the ERROR is
-        # logged once per edit, not once per request.
+        # Logged once per edit, not once per request (the fallback only
+        # logs when the reason changes).
         _config_rejected = str(e)
-        _config_cache = _CONFIG_EMPTY
-        _config_mtime = mtime
-        _log("ERROR", "websh.json rejected (WEBSH_REQUIRE_VAULT=1): {}"
-             .format(e))
-        return _CONFIG_EMPTY
+        return _config_fallback(path, "rejected (WEBSH_REQUIRE_VAULT=1): " + str(e))
     except Exception as e:
-        _log("WARN", "failed to load config: {}".format(e))
+        # Not cached under this mtime: a half-written file (non-atomic
+        # save) is re-read on the next request and recovers by itself.
+        return _config_fallback(path, str(e) or type(e).__name__)
+
+
+def _config_fallback(path, reason):
+    """websh.json is named but unusable (missing, unreadable, malformed,
+    rejected). Keep enforcing the last version that loaded - the policy
+    in force a moment ago is the operator's actual intent - or, with none
+    to keep, lock everything. Returning the empty config instead silently
+    turned restrict_hosts off and emptied denied_hosts: a trailing comma
+    in an edit opened the proxy to every host."""
+    global _config_unusable
+    kept = _config_cache if (_config_cache is not None
+                             and _config_cache is not _CONFIG_LOCKED) else None
+    if kept is None and reason == "file not found":
+        # Never loaded and not there: an install without a config (the
+        # PHP shim always passes a default WEBSH_CONFIG path, whether or
+        # not the operator created the file). That is "no config", as it
+        # always was - not a broken one. Only a file that was loaded and
+        # then vanished keeps its last version, below.
+        if _config_unusable != reason:
+            _log("INFO", "WEBSH_CONFIG={} does not exist - running without "
+                 "a websh.json".format(path))
+        _config_unusable = reason
         return _CONFIG_EMPTY
+    if _config_unusable != reason:
+        _log("ERROR", "websh.json at {} unusable ({}) - {}".format(
+            path, reason,
+            "keeping the last good configuration" if kept is not None else
+            "refusing all connections until it is fixed"))
+    _config_unusable = reason
+    return kept if kept is not None else _CONFIG_LOCKED
 
 
 # ── Credential vault (websh.creds.json) ─────────────────────────────
@@ -5749,6 +5789,13 @@ def main():
     load_config()
     if _config_rejected:
         _log("ERROR", "refusing to start: " + _config_rejected)
+        raise SystemExit(1)
+    if _config_unusable and _config_unusable != "file not found":
+        # A config that is named but can't be loaded at startup has no
+        # earlier good version to fall back on: say so loudly instead of
+        # serving a locked (or, before, a wide-open) proxy.
+        _log("ERROR", "refusing to start: WEBSH_CONFIG={} is unusable: {}".format(
+            os.environ.get("WEBSH_CONFIG", ""), _config_unusable))
         raise SystemExit(1)
     _warn_ignored_server_knobs()
     _warn_per_ip_misconfig()

@@ -33,9 +33,14 @@ class TestConfigLoading(unittest.TestCase):
         self.tmpdir = tempfile.mkdtemp()
         server._config_cache = None
         server._config_mtime = 0
+        server._config_unusable = None
 
     def tearDown(self):
         shutil.rmtree(self.tmpdir)
+        os.environ.pop("WEBSH_CONFIG", None)
+        server._config_cache = None
+        server._config_mtime = 0
+        server._config_unusable = None
 
     def _write_config(self, data):
         path = os.path.join(self.tmpdir, "websh.json")
@@ -58,10 +63,47 @@ class TestConfigLoading(unittest.TestCase):
         self.assertFalse(cfg["restrict_hosts"])
 
     def test_missing_file(self):
+        # Never created (api.php always passes a default path): no config,
+        # exactly as before - not a broken one.
         os.environ["WEBSH_CONFIG"] = "/nonexistent/websh.json"
         cfg = server.load_config()
         self.assertEqual(cfg["connections"], [])
         self.assertFalse(cfg["restrict_hosts"])
+
+    def test_broken_config_keeps_the_last_good_policy(self):
+        """A running server with restrict_hosts and a deny-list used to
+        drop both the moment websh.json stopped parsing (a trailing comma
+        in an edit, a half-written save, a rename): every connect was
+        then allowed, with a WARN per request as the only sign."""
+        path = self._write_config({"restrict_hosts": True,
+                                   "denied_hosts": ["10.0.0.0/8"],
+                                   "connections": [{"name": "a", "host": "a.example"}]})
+        good = server.load_config()
+        self.assertTrue(good["restrict_hosts"])
+        for broken in ('{"restrict_hosts": true,}', "", "[1]"):
+            with open(path, "w") as f:
+                f.write(broken)
+            os.utime(path, (time.time() + 5, time.time() + 5))   # new mtime
+            cfg = server.load_config()
+            self.assertTrue(cfg["restrict_hosts"], repr(broken))
+            self.assertEqual(len(cfg["denied_net_list"]), 1, repr(broken))
+            self.assertEqual([c["name"] for c in cfg["connections"]], ["a"])
+            self.assertTrue(server._config_unusable)
+        os.rename(path, path + ".bak")                            # renamed away
+        self.assertTrue(server.load_config()["restrict_hosts"])
+        # Fixed: the new version is used and the flag clears.
+        self._write_config({"restrict_hosts": False, "connections": []})
+        self.assertFalse(server.load_config()["restrict_hosts"])
+        self.assertIsNone(server._config_unusable)
+
+    def test_broken_config_without_a_good_version_locks_everything(self):
+        path = os.path.join(self.tmpdir, "websh.json")
+        with open(path, "w") as f:
+            f.write('{"restrict_hosts": false,}')
+        os.environ["WEBSH_CONFIG"] = path
+        server._config_cache = None
+        server._config_mtime = 0
+        self.assertFalse(server.is_host_allowed("198.51.100.7", 22, "u"))
 
     def test_valid_config(self):
         self._write_config({
