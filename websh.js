@@ -1978,12 +1978,23 @@ function queueInput(p, data) {
 // deferred-save arming, slot semantics), so only this verbatim-
 // identical tail is shared; do not try to merge more of them without
 // re-reading both flows end to end.
-function beginSessionIO(p) {
-  hideOverlay();
-  connectingFor = null;
-  overlayMode = null;
-  pendingSplit = null;
-  p.term.focus();
+// o.fromForm: this session is the one the login form was opened for (the
+// form's own success path). Only then does it close the form and clear
+// the form's state. A BACKGROUND pane finishing a reconnect or an F5
+// restore used to do it too: it hid a form the user was typing in (the
+// next keystrokes went to that pane's shell) and nulled pendingSplit, so
+// the user's split connect then landed in the active pane - overwriting
+// its session, which was never disconnected - instead of a new split.
+function beginSessionIO(p, o) {
+  if ((o && o.fromForm) || connectingFor === p.id) {
+    hideOverlay();
+    connectingFor = null;
+    overlayMode = null;
+    pendingSplit = null;
+    p.term.focus();
+  } else if (activeId === p.id && $('ov').classList.contains('h')) {
+    p.term.focus();            // the pane in front, nothing else open
+  }
   p.polling = true;
   p.pollRetries = 0;
   // Force a resize so resumed tmux sessions redraw at the real size.
@@ -2462,7 +2473,7 @@ function finalizeSuccess(opts, result, run) {
   // Close the status popup and login form as a single success step.
   $('tmuxOv').classList.add('h');
   currentConnectRun = null;
-  beginSessionIO(p);
+  beginSessionIO(p, {fromForm: true});
 }
 
 function cleanupRun(run) {
