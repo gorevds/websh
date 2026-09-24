@@ -139,10 +139,17 @@ your own boxes, add a `denied_hosts` array:
 
 Each entry is parsed as an IP address or CIDR network when possible
 (IPv4 and IPv6 both supported); otherwise it's matched as an exact
-hostname (case-insensitive). At connect time websh resolves the target
+hostname (case-insensitive; a trailing root dot is ignored, so
+`bastion.corp.` is the same entry as `bastion.corp`). At connect time websh resolves the target
 hostname via the system resolver and rejects the request if any of the
 returned addresses fall inside a denied range — so a public-looking
 domain whose A record points into RFC1918 is also blocked.
+
+A connection to `0.0.0.0` / `::` (the "unspecified" address, also
+written `0`) or to `::1` lands on the websh host itself, so these are
+tested as loopback: denying `127.0.0.0/8` blocks all of them. IPv6
+literals may carry a `%scope` only when it is a plain interface name or
+index (`fe80::1%eth0`); anything else is rejected as not a host.
 
 DNS resolution failures fail open (the request goes through; ssh's own
 resolver will then fail with a clear error). Hosts you've put in

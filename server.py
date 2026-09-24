@@ -1098,8 +1098,15 @@ def _parse_denied_hosts(entries):
         try:
             net_list.append(ipaddress.ip_network(s, strict=False))
         except ValueError:
-            host_set.add(s.lower())
+            host_set.add(_host_key(s))
     return frozenset(host_set), tuple(net_list)
+
+
+def _host_key(host):
+    """The form a hostname is compared in: lowercase, without the
+    trailing root dot. "bastion.corp." is the same host as "bastion.corp"
+    to ssh and to DNS; compared raw, it walked past a deny-list entry."""
+    return host.strip().lower().rstrip(".")
 
 
 # What a client may name as an ssh destination / login. The deny-list
@@ -1112,6 +1119,7 @@ def _parse_denied_hosts(entries):
 # whitespace anywhere - those are exactly the characters that turn a
 # hostname into something ssh parses differently than we validated.
 _HOSTNAME_RE = re.compile(r'^[A-Za-z0-9._-]{1,253}$')
+_SCOPE_ID_RE = re.compile(r'^[A-Za-z0-9_.-]{1,64}$')
 _USERNAME_RE = re.compile(r'^[A-Za-z0-9._@-]{1,64}$')
 
 
@@ -1123,10 +1131,16 @@ def _valid_host(host):
                        and len(host) > 2) else host
     try:
         ipaddress.ip_address(h)
-        return True
     except ValueError:
-        pass
-    return bool(_HOSTNAME_RE.match(host))
+        return bool(_HOSTNAME_RE.match(host))
+    # Python accepts nearly anything as an IPv6 %scope-id - "@", spaces,
+    # newlines. "::%@10.1.2.3" parsed as an address, failed resolution
+    # (so the deny-list fell open), and ssh read it as user "::%" at
+    # host 10.1.2.3. A scope id is an interface name or index; allow
+    # exactly that.
+    if "%" in h:
+        return bool(_SCOPE_ID_RE.match(h.split("%", 1)[1]))
+    return True
 
 
 def _valid_username(username):
@@ -1216,19 +1230,34 @@ def _is_denied_host(host):
     if not host_set and not net_list:
         return False, None
     h = _normalize_host(host)
-    hl = h.strip().lower()
-    if hl in host_set:
+    if _host_key(h) in host_set:
         return True, "hostname on deny-list"
     if not net_list:
         return False, None
     # h already stripped of [...]; _resolve_host_ips re-normalises but is
     # idempotent so this is fine.
     for ip in _resolve_host_ips(h):
-        for net in net_list:
-            if ip in net:
-                return True, "{} resolves to {} which is in denied range {}".format(
-                    host, ip, net)
+        for probe in _deny_probes(ip):
+            for net in net_list:
+                if probe in net:
+                    return True, "{} resolves to {} which is in denied range {}".format(
+                        host, ip, net)
     return False, None
+
+
+_LOOPBACKS = (ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1"))
+
+
+def _deny_probes(ip):
+    """The addresses to test `ip` as. A connect to 0.0.0.0 / :: lands
+    on the local host, as does ::1 - but a deny-list that names only
+    127.0.0.0/8 (as the documented example does) matched none of them,
+    so "0", "0.0.0.0" or "::" reached loopback-only services on the
+    websh host. Unspecified and loopback addresses are therefore also
+    tested as the loopback of either family."""
+    if ip.is_unspecified or ip.is_loopback:
+        return (ip,) + _LOOPBACKS
+    return (ip,)
 
 
 def load_config():

@@ -727,6 +727,36 @@ class TestDeniedHosts(unittest.TestCase):
         self.assertFalse(server._valid_host("[]"))
         self.assertFalse(server._valid_host(""))
 
+    def test_ipv6_scope_id_cannot_smuggle_a_target(self):
+        """ipaddress accepts almost anything as a %scope-id. '::%@10.1.2.3'
+        was a valid 'IPv6 literal', failed DNS (deny-list fell open), and
+        ssh read it as user '::%' at host 10.1.2.3 (confirmed with ssh -G).
+        Real scope ids (interface names/indexes) stay allowed."""
+        for bad in ("::%@10.1.2.3", "::%@127.0.0.1", "[::%@10.1.2.3]",
+                    "fe80::1%eth0 x", "fe80::1%a\nb", "::%"):
+            self.assertFalse(server._valid_host(bad), repr(bad))
+        for good in ("fe80::1%eth0", "fe80::1%2", "[fe80::1%en0]"):
+            self.assertTrue(server._valid_host(good), repr(good))
+
+    def test_trailing_root_dot_cannot_bypass_hostname_entry(self):
+        self._write_config({"restrict_hosts": False,
+                            "denied_hosts": ["bastion.corp", "Other.Corp."]})
+        with self._patched_resolve("8.8.8.8"):
+            for h in ("bastion.corp.", "BASTION.CORP.", "other.corp", "other.corp."):
+                self.assertFalse(server.is_host_allowed(h, 22, "u"), h)
+
+    def test_unspecified_and_v6_loopback_count_as_loopback(self):
+        """A deny-list that names 127.0.0.0/8 (the documented example)
+        must also stop 0, 0.0.0.0, :: and ::1 - the kernel delivers all
+        of them to the websh host itself. Real resolver, no patching."""
+        self._write_config({"restrict_hosts": False,
+                            "denied_hosts": ["127.0.0.0/8"]})
+        for h in ("127.0.0.1", "0", "0.0.0.0", "::", "::1", "[::1]",
+                  "::ffff:127.0.0.1"):
+            self.assertFalse(server.is_host_allowed(h, 22, "u"), h)
+        # ...and an unrelated address is still fine.
+        self.assertTrue(server.is_host_allowed("192.0.2.10", 22, "u"))
+
     def test_dns_resolves_to_denied_range_blocked(self):
         """The whole point: hostname looks innocent, but A record points
         into a denied range → blocked."""
