@@ -39,9 +39,32 @@ function api(action, opts) {
   // A non-JSON reply (a reverse proxy's own HTML error page for a 5xx,
   // a captive portal) used to surface as "Unexpected token <" in the
   // toast. Turn it into an {error} the callers already handle.
+  // The status rides along as a non-enumerable `_status`, so callers
+  // that must tell "the session is gone" (404) from "the server or a
+  // proxy hiccuped" (503 busy, 502/504, 429) can - an {error} alone
+  // can't say which.
   return fetch(url, init).then(r => r.json().catch(() => ({
     error: 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
-           ' (unexpected reply from the server or a proxy)'})));
+           ' (unexpected reply from the server or a proxy)'}))
+    .then(j => {
+      if (j && typeof j === 'object') {
+        try { Object.defineProperty(j, '_status', {value: r.status}); } catch (e) {}
+      }
+      return j;
+    }));
+}
+
+// An /api/output reply that says nothing about the session itself: the
+// worker pool was full (503 busy), a proxy failed (502/504, often an
+// HTML page), a rate limit, a conflict with a stream still being torn
+// down (409). Retry those on the SAME session. Only a real answer about
+// the session (404 "session not found", or a normal frame) may end it -
+// treating a transient 503 as "gone" opened a fresh shell and orphaned
+// the old one with whatever was running in it.
+function isTransientOutputReply(r) {
+  let st = r && r._status;
+  if (!r || !r.error || !st) return false;
+  return st === 408 || st === 409 || st === 425 || st === 429 || st >= 500;
 }
 
 // Capacity/rate errors are identified by a machine-readable `code`
@@ -1869,8 +1892,14 @@ function streamOutput(p) {
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, new Error('SSE reconnect budget exhausted')); return; }
     setReconnecting(p, true);
-    // EventSource will retry on its own ~3s; we just enforce the
-    // total-elapsed budget. No need to schedule an explicit retry.
+    if (es.readyState === 2 /* EventSource.CLOSED */) {
+      // It will never retry on its own: previously the pane then showed
+      // "reconnecting… (0 s)" forever and dropped every keystroke.
+      closeStream(p);
+      setTimeout(() => recoverClosedStream(p, mySid), d);
+    }
+    // Otherwise EventSource retries by itself (~3 s); we only enforce
+    // the total-elapsed budget.
   };
 }
 
@@ -1878,14 +1907,40 @@ function pollOutput(p) {
   if(!p.sid || !p.polling) return;
   let mySid = p.sid;
   api('output',{query:'&session_id='+mySid+'&since='+(p.outCursor || 0)}).then(r => {
+    if (isTransientOutputReply(r)) throw new Error(r.error);
     clearRetryClock(p);
     if (handleOutputPayload(p, r, mySid)) return;
     if(p.polling) pollOutput(p);
   }).catch(e => {
+    if (p.sid !== mySid) return;        // replaced meanwhile: not our loop
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
     setReconnecting(p, true);
     setTimeout(() => { if(p.polling) pollOutput(p) }, d);
+  });
+}
+
+// EventSource gave up for good (readyState CLOSED): it does that on ANY
+// non-200 reconnect reply - 404 after a backend restart, 409 while the
+// old stream still holds the slot, 502 from a proxy, 503 busy - and
+// never retries again. Ask once over plain HTTP, which returns a status:
+// a real answer (a frame, or "session not found") goes through the
+// normal path - including resume/reconnect for a session that is gone -
+// and a transient failure waits and asks again, inside the same budget.
+function recoverClosedStream(p, mySid) {
+  if (!p.polling || p.sid !== mySid) return;
+  api('output', {query: '&session_id=' + mySid + '&since=' + (p.outCursor || 0)}).then(r => {
+    if (isTransientOutputReply(r)) throw new Error(r.error);
+    if (p.sid !== mySid) return;
+    clearRetryClock(p);
+    if (handleOutputPayload(p, r, mySid)) return;
+    if (p.polling) streamOutput(p);     // healthy again: back to SSE
+  }).catch(e => {
+    if (!p.polling || p.sid !== mySid) return;
+    let d = nextRetryDelay(p);
+    if (d < 0) { transportFatal(p, e); return; }
+    setReconnecting(p, true);
+    setTimeout(() => recoverClosedStream(p, mySid), d);
   });
 }
 
