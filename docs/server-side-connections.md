@@ -51,6 +51,14 @@ server log. If you need those, put them in the system `ssh_config` on
 the websh host instead of in `websh.json` (which has a broader trust
 profile — FTP'able on shared hosting, sometimes restored from backups).
 
+A session authenticates only with what the visitor (or the profile)
+supplied: websh passes `IdentityAgent=none` and `IdentitiesOnly=yes`,
+and `PubkeyAuthentication=no` when no key was given, so the websh host's
+own ssh-agent and default `~/.ssh/id_*` keys are never offered to a
+target. These apply to the destination only - a `ProxyJump` bastion is
+reached with the service account's normal ssh configuration (agent
+included), which is where operator credentials belong.
+
 A profile option takes precedence over websh's built-in default for the
 same key (OpenSSH keeps the first value, and websh emits its default only
 when the profile leaves the key unset). A few of those defaults back
