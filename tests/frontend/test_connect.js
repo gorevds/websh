@@ -830,6 +830,117 @@ test('disconnect: tail-drain data after alive=false still rendered', async () =>
 // flushes headers immediately and holds the body, which is exactly the
 // case the timer is meant to detect. Only body events ('data' / 'end')
 // prove the channel actually flushes.
+// A fetch that returns a given HTTP status for /api/output (the plan's
+// fake fetch has no status); everything else goes to the plan.
+function outputReplies(win, replies, log) {
+  const inner = win.fetch;
+  const st = inner.__state || {dead: false};      // die with the env
+  const fn = (url, init) => {
+    const u = new URL(url, 'http://x/');
+    const a = u.searchParams.get('action');
+    if (st.dead) return new Promise(() => {});
+    if (a === 'output' && replies.length) {
+      // The last reply repeats: the loop keeps polling after the test's
+      // scripted sequence and must not fall through to "session gone".
+      const [status, body] = replies.length > 1 ? replies.shift() : replies[0];
+      log.push('output:' + status);
+      // Through a timer, like a real network: an already-resolved reply
+      // turns the poll loop into an endless microtask chain that starves
+      // every timer (the test itself included).
+      return sleep(3).then(() => ({status, statusText: '',
+        json: () => typeof body === 'string' ? Promise.reject(new Error('html'))
+                                             : Promise.resolve(body)}));
+    }
+    if (a) log.push(a);
+    return inner(url, init);
+  };
+  fn.__state = st;
+  win.fetch = fn;
+}
+
+test('long-poll: a transient 503/502 is retried on the SAME session', async () => {
+  // handleOutputPayload treats any {error} as "session gone": one 503
+  // busy (or a proxy's HTML 502, which api() turns into {error}) used to
+  // end the session WITHOUT /api/disconnect and open a fresh shell,
+  // orphaning the old one and whatever ran in it.
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-lp', alive: true}},
+    {action: 'resize', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  win.nextRetryDelay = () => 1;            // no real backoff in tests
+  const log = [];
+  p.polling = false; await sleep(20);       // stop the running loop
+  outputReplies(win, [[503, {error: 'busy'}], [502, '<html>bad gateway</html>'],
+                      [200, {data: '', alive: true}]], log);
+  p.polling = true; p.sid = 'sid-lp';
+  win.pollOutput(p);
+  await sleep(120);
+  ok(p.sid === 'sid-lp', 'still the same session; got ' + p.sid);
+  ok(!log.includes('connect') && !log.includes('disconnect'),
+     'no new shell, nothing orphaned; got ' + log.join(','));
+  ok(log.filter(x => x.startsWith('output')).length >= 3,
+     'retried until a real frame; got ' + log.join(','));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('long-poll: a real 404 still ends the session and reconnects', async () => {
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-lp2', alive: true}},
+    {action: 'resize', response: {ok: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const p = await _onePane(win);
+  const log = [];
+  p.polling = false; await sleep(20);
+  outputReplies(win, [[404, {error: 'session not found'}],
+                      [200, {data: '', alive: true}]], log);
+  p.polling = true; p.sid = 'sid-lp2';
+  win.pollOutput(p);
+  await sleep(80);
+  ok(log.includes('connect'), 'the gone session is replaced; got ' + log.join(','));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('SSE closed for good (non-200 on reconnect) is recovered, not left spinning', async () => {
+  // EventSource never retries after a non-200 reply: the pane showed
+  // "reconnecting… (0 s)" forever and dropped keystrokes. It now asks
+  // once over HTTP: transient -> retry; frame -> back to SSE.
+  const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
+  const env = await mkEnv(plan); const win = env.win;
+  const sources = [];
+  win.EventSource = class {
+    constructor(url) { this.url = url; this.readyState = 0; this.l = {}; sources.push(this); }
+    addEventListener(ev, fn) { this.l[ev] = fn; }
+    set onerror(fn) { this._err = fn; }
+    close() { this.readyState = 2; this.closed = true; }
+  };
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sse1'; p.polling = true; p.host = 'h'; p.outCursor = 0;
+  win.nextRetryDelay = () => 1;
+  const log = [];
+  outputReplies(win, [[503, {error: 'busy'}], [200, {data: '', alive: true, cursor: 0}]], log);
+  win.streamOutput(p);
+  const es = sources[0];
+  es.l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});   // was healthy
+  es.readyState = 2;                                                     // then CLOSED
+  es._err();
+  await sleep(120);
+  ok(log.slice(0, 2).join(',') === 'output:503,output:200',
+     'asked, retried, got a frame; got ' + log.join(','));
+  ok(sources.length === 2 && !sources[1].closed, 'back on a fresh EventSource');
+  ok(p.sid === 'sse1', 'same session');
+  p.polling = false;
+  try { win.clearTimeout(p.sseFirstMsgTimer); } catch (e) {}
+  cleanup(env);
+});
+
 test("SSE 'open' event does not mark body as arrived", async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
   const env = await mkEnv(plan); const win = env.win;
