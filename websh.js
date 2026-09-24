@@ -3311,8 +3311,18 @@ function renderSaved() {
     let c = list[idx];
     if (c && c.conn_id && !_idbHasKeyCache) {
       // No-key state: the row's click target is delete, not connect.
-      _bulkDeleteVaultEntry(c).catch(() => {});
-      list.splice(idx, 1); saveSaved(list); renderSaved();
+      // Deleting is irreversible, so ask IndexedDB itself rather than
+      // trust the cached flag: a render from a stale cache (config fetch
+      // failed at boot, a missed broadcast) must never cost a user a
+      // credential whose key is in fact present.
+      _refreshIdbHasKey().catch(() => false).then(has => {
+        if (has) { renderSaved(); connectSaved(c); return; }
+        let cur = loadSaved();
+        let at = cur.findIndex(x => x && x.conn_id === c.conn_id);
+        if (at < 0) return;
+        _bulkDeleteVaultEntry(c).catch(() => {});
+        cur.splice(at, 1); saveSaved(cur); renderSaved();
+      });
       return;
     }
     connectSaved(c);
@@ -3722,8 +3732,13 @@ function loadServerConfig() {
     showOverlay();
     // Config unreachable: the prefix can't be known, so show what the
     // unscoped namespace holds (the pre-isolation behaviour) rather
-    // than an empty list.
-    try { renderSaved(); } catch (e) {}
+    // than an empty list. Ask IndexedDB whether the vault key is there
+    // FIRST: the cache still holds its declaration-time false, and
+    // painting with it marked every vault card "no key" - whose click
+    // is delete.
+    _refreshIdbHasKey().catch(() => {}).then(() => {
+      try { renderSaved(); } catch (e) {}
+    });
   });
 }
 

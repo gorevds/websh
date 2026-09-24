@@ -2228,6 +2228,42 @@ test('no-key state: rendered when IDB lacks K but localStorage row survives', as
   cleanup(env);
 });
 
+test('config fetch failing at boot never makes a live vault card deletable', async () => {
+  // The config-failure path rendered the saved list while the key cache
+  // still held its declaration-time false: every vault card showed
+  // "no key", and one click - meant to connect - deleted the credential
+  // locally and on the server, although K was intact in IndexedDB.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false,
+                                                        connections: [], vault_enabled: true}}]);
+  const win = env.win;
+  await win.eval('_idbPut("K", new Uint8Array(32))');      // the key IS there
+  win.localStorage.setItem('websh_connections', JSON.stringify([
+    {name: 'prod db', conn_id: 'P'.repeat(26), host: 'db', port: 22,
+     user: 'u', auth: 'pw', persistent: false}]));
+  // Boot again with /api/config unreachable.
+  const log = [];
+  win.fetch = (url) => {
+    const a = new URL(url, 'http://x/').searchParams.get('action');
+    log.push(a);
+    return a === 'config' ? Promise.reject(new TypeError('Failed to fetch'))
+                          : Promise.resolve({json: () => Promise.resolve({})});
+  };
+  win.eval('_idbHasKeyCache = false; loadServerConfig()');
+  await sleep(80);
+  const row = win.document.querySelector('.sv');
+  ok(row && !row.classList.contains('nokey'), 'card painted with its real state');
+  // Even if a stale render marks it, the click re-checks before deleting.
+  win.eval('_idbHasKeyCache = false; renderSaved()');
+  let connected = 0;
+  win.connectSaved = () => { connected++; };
+  win.document.querySelector('.sv').click();
+  await sleep(40);
+  ok(!log.includes('save_delete'), 'nothing deleted on the server; got ' + log);
+  ok(JSON.parse(win.localStorage.getItem('websh_connections')).length === 1, 'card kept');
+  ok(connected === 1, 'the click connects instead');
+  cleanup(env);
+});
+
 test('no-key state: click on no-key row deletes (no /api/connect)', async () => {
   let connectCalls = 0;
   const plan = [
