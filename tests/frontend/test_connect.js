@@ -2228,6 +2228,24 @@ test('no-key state: rendered when IDB lacks K but localStorage row survives', as
   cleanup(env);
 });
 
+test('two persistent panes to a long host never share a tmux slot', async () => {
+  // Truncating user_host_port_rand to 64 chars cut the random suffix off
+  // for a long hostname: every pane got the same slot, and the second
+  // one attached to (and detached) the first one's shell.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const host = 'build-server-01.eu-west.internal.corp.example-company.com';
+  const ids = new Set();
+  for (let i = 0; i < 50; i++) {
+    const id = win.slotIdFor('root', host, 22);
+    ok(/^[A-Za-z0-9_-]{1,64}$/.test(id), 'valid slot id: ' + id);
+    ids.add(id);
+  }
+  ok(ids.size === 50, '50 panes, 50 slots; got ' + ids.size);
+  ok(win.slotIdFor('u', 'h', 22).startsWith('u_h_22_'), 'short ones stay readable');
+  cleanup(env);
+});
+
 test('config fetch failing at boot never makes a live vault card deletable', async () => {
   // The config-failure path rendered the saved list while the key cache
   // still held its declaration-time false: every vault card showed

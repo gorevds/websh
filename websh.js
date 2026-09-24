@@ -1014,10 +1014,18 @@ const PANES_VERSION = 2;
 
 function slotIdFor(user, host, port) {
   // Human-readable + unique. Sanitize to backend's [A-Za-z0-9_-]{1,64}.
-  let base = (user || 'u') + '_' + (host || 'h') + '_' + (port || 22);
-  let rand = Math.random().toString(36).slice(2, 8);
-  let raw = base + '_' + rand;
-  return raw.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+  // The random suffix is what makes two panes to the same target two
+  // tmux sessions, so it is never the part that gets cut: truncating the
+  // whole string to 64 chars dropped the suffix (and the port) for a
+  // long user@host, every persistent pane for it got the same slot, and
+  // opening a second one attached to - and detached - the first one's
+  // shell. Shorten the readable part instead.
+  let base = ((user || 'u') + '_' + (host || 'h') + '_' + (port || 22))
+    .replace(/[^A-Za-z0-9_-]/g, '_');
+  let rand = '';
+  while (rand.length < 8) rand += Math.random().toString(36).slice(2);
+  rand = rand.slice(0, 8);
+  return base.slice(0, 64 - 1 - rand.length) + '_' + rand;
 }
 
 function paneRecord(p) {
