@@ -2044,7 +2044,21 @@ class SSHSession(object):
             # cleanly instead of looping on the PTY, giving us a
             # locale-proof primary auth-failure signal.
             ("NumberOfPasswordPrompts", "1"),
+            # The session authenticates with what the web user supplied
+            # and nothing else. Without these, ssh also offered whatever
+            # the websh host has - the service account's ssh-agent
+            # (SSH_AUTH_SOCK was inherited) and its default ~/.ssh/id_*
+            # keys - so an anonymous visitor who typed only a host and a
+            # username got a shell wherever the OPERATOR's keys are
+            # authorized. A profile may still set these explicitly.
+            ("IdentityAgent", "none"),
+            ("IdentitiesOnly", "yes"),
         ]
+        if not self._key_file:
+            # Password (or keyboard-interactive) session: no key was
+            # given, so no key may be tried - not even the default ones
+            # ssh loads when no -i is passed.
+            defaults.append(("PubkeyAuthentication", "no"))
         if strict_disabled:
             # With StrictHostKeyChecking=no, also keep host keys out of
             # the websh user's known_hosts by default. If a profile
@@ -2095,6 +2109,10 @@ class SSHSession(object):
     def _spawn(self, host, port, username, cols, rows):
         """Fork a PTY and exec ssh."""
         env = os.environ.copy()
+        # SSH_AUTH_SOCK stays: a ProxyJump bastion (operator-configured)
+        # may authenticate with the service account's agent. The
+        # DESTINATION never does - IdentityAgent=none in _build_ssh_cmd
+        # applies to it alone, not to the jump hop.
         env["TERM"] = "xterm-256color"
         env["LANG"] = "en_US.UTF-8"
         env["LC_ALL"] = "en_US.UTF-8"

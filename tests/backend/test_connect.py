@@ -1369,6 +1369,59 @@ class TestBuildSshCommand(unittest.TestCase):
         self.assertEqual(self._option_values(cmd, "ConnectTimeout"), ["30"])
 
 
+class TestSessionUsesOnlyTheWebUsersCredentials(unittest.TestCase):
+    """A manual /api/connect needs only a host and a username. ssh used
+    to add whatever the websh host had - the service account's agent
+    (SSH_AUTH_SOCK was inherited) and its default ~/.ssh/id_* keys - so
+    a visitor who typed no password got a shell wherever the OPERATOR's
+    keys are authorized. Checked through `ssh -G`, i.e. what ssh itself
+    would actually use."""
+
+    def _session(self, key_file=None, ssh_options=None):
+        s = server.SSHSession.__new__(server.SSHSession)
+        s._ssh_options, _ = server._filter_ssh_options(ssh_options or {})
+        s._key_file = key_file
+        s._control_path = "/tmp/websh-test.sock"
+        s.persistent = False
+        s.slot_id = None
+        s.tmux_cmd = "tmux"
+        s._tmux_options = []
+        return s
+
+    def _effective(self, cmd):
+        # Resolve the exact argv with `ssh -G` (no network).
+        argv = ["ssh", "-G"] + [a for a in cmd[1:] if a != "--"]
+        env = dict(os.environ, SSH_AUTH_SOCK="/tmp/operator-agent.sock")
+        out = subprocess.run(argv, capture_output=True, text=True,
+                             env=env, timeout=10).stdout
+        conf = {}
+        for line in out.splitlines():
+            k, _, v = line.partition(" ")
+            conf.setdefault(k, []).append(v)
+        return conf
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs OpenSSH")
+    def test_password_session_offers_no_key_and_no_agent(self):
+        conf = self._effective(self._session()._build_ssh_cmd("h.example", 22, "alice"))
+        self.assertEqual(conf["pubkeyauthentication"], ["false"])
+        self.assertEqual(conf["identityagent"], ["none"])
+        self.assertEqual(conf["identitiesonly"], ["yes"])
+
+    @unittest.skipUnless(shutil.which("ssh"), "needs OpenSSH")
+    def test_key_session_offers_only_the_supplied_key(self):
+        fd, key = tempfile.mkstemp(suffix=".pem")
+        os.close(fd)
+        try:
+            conf = self._effective(
+                self._session(key_file=key)._build_ssh_cmd("h.example", 22, "alice"))
+        finally:
+            os.unlink(key)
+        self.assertEqual(conf["pubkeyauthentication"], ["true"])
+        self.assertEqual(conf["identityagent"], ["none"])
+        self.assertEqual(conf["identitiesonly"], ["yes"])
+        self.assertEqual(conf["identityfile"], [key],
+                         "no default ~/.ssh/id_* next to the supplied key")
+
 class TestRestrictHostsDoesNotFeedScanPattern(LiveServerCase):
     """Integration: under restrict_hosts: true, a manual /api/connect
     is rejected because the policy disallows free-form connects (use a
