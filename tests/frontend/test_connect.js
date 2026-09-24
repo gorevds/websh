@@ -5560,6 +5560,34 @@ test('renderSaved coerces a non-numeric port to a number (no injection)', async 
 // OSC 52 clipboard handler: decode multibyte UTF-8 via TextDecoder (not the
 // deprecated escape()), and refuse a pathologically large payload from a
 // (possibly hostile) remote host.
+test('the X on a failed upload banner dismisses it and keeps the staged file', async () => {
+  // After a failed move the banner says the bytes are safe in $HOME; the
+  // X stayed visible for 6 s and clicking it POSTed upload_cancel for
+  // that exact tmp file - the only copy - which the server deleted.
+  const plan = FB_PLAN(FB_ENTRIES, '/home/alice').concat([
+    {action: 'upload_finalize', response: {error: 'Permission denied'}},
+    {action: 'upload_cancel', response: {ok: true}},
+  ]);
+  const env = await mkEnv(plan); const win = env.win;
+  okXhr(win);
+  const p = await _onePane(win);
+  win.showFileBrowser(p.id);
+  await sleep(40);
+  win.fbStartUpload([fakeFile('a.txt', 3)]);
+  await sleep(60);
+  const text = () => p.el.querySelector('[data-upload-progress] .upload-progress-text').textContent;
+  ok(/saved to your home folder/.test(text()), 'failure banner shown; got ' + text());
+  win.cancelTransfer(p.id);                       // the user clicks X
+  await sleep(20);
+  ok(!env.log.some(r => r.action === 'upload_cancel'), 'staged file NOT deleted');
+  ok(!p.upload, 'banner dismissed, slot free');
+  ok(!/Cancelled/.test(text()), 'not relabelled "Cancelled"');
+  // A new upload right away is not clobbered by the old banner's timer.
+  win.fbStartUpload([fakeFile('b.txt', 3)]);
+  ok(p.upload && p.upload.files[0].name === 'b.txt', 'new upload started');
+  cleanup(env);
+});
+
 test('OSC 52 from plain output cannot replace the clipboard', async () => {
   // The handler was always on: `tail -f` of a log carrying an injected
   // ESC]52 sequence silently put an attacker's command line on the
