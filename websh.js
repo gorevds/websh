@@ -4289,13 +4289,28 @@ function settleTransfer(p, slot, delay, paint) {
           el.querySelector('.upload-progress-text'));
     paintFbXfer(p);          // the outcome, not just the progress
   }
+  let mine = p[slot];
   return new Promise(resolve => setTimeout(() => {
-    p[slot] = null;
-    hideUploadProgress(p);
-    updatePaneBadge(p);
-    if (el) el.querySelector('.upload-progress-bar').style.background = '';
+    // Only release the transfer this call settled: if the banner was
+    // dismissed early and a new transfer has started since, this late
+    // timer must not null (and hide) the new one.
+    if (p[slot] === mine) {
+      p[slot] = null;
+      hideUploadProgress(p);
+      updatePaneBadge(p);
+      if (el) el.querySelector('.upload-progress-bar').style.background = '';
+    }
     resolve();
   }, delay));
+}
+
+// The X on a transfer that has already ENDED only dismisses its banner.
+function dismissTransfer(p, slot) {
+  p[slot] = null;
+  hideUploadProgress(p);
+  updatePaneBadge(p);
+  let el = p.el && p.el.querySelector('[data-upload-progress] .upload-progress-bar');
+  if (el) el.style.background = '';
 }
 
 function finishUpload(p, success, reason) {
@@ -4344,6 +4359,12 @@ function cancelUpload(id) {
   let p = panes[id];
   if (!p || !p.upload) return;
   let u = p.upload;
+  // Finished already (success or failure; finishUpload sets cancelled):
+  // the X is dismissing the result banner. Cancelling here used to POST
+  // upload_cancel for the staged file - after a failed move that is the
+  // ONLY copy, which the banner had just said was safe in $HOME - and
+  // relabel a "Saved to ..." banner as "Cancelled".
+  if (u.cancelled) { dismissTransfer(p, 'upload'); return; }
   let tmpName = u.currentTmp;
   u.cancelled = true;
   if (u.xhr) { try { u.xhr.abort(); } catch(e) {} u.xhr = null; }
@@ -4475,6 +4496,7 @@ function finishDownload(p, success, msg, settleDelay) {
 function cancelDownload(id) {
   let p = panes[id];
   if (!p || !p.download) return;
+  if (p.download.cancelled) { dismissTransfer(p, 'download'); return; }
   p.download.cancelled = true;
   if (p.download.abort) p.download.abort();
   settleTransfer(p, 'download', 2000, (bar, text) => {
