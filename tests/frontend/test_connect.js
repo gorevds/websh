@@ -3528,6 +3528,30 @@ test('a background reconnect does not hijack the split the user is connecting', 
   cleanup(env);
 });
 
+test('Enter in the login form connects; Enter in Options does not', async () => {
+  // The handler was bound with querySelector('.panel') - the FIRST
+  // .panel in the page is Options: Enter in the form did nothing, and
+  // Enter in an Options field fired a connect (and a spurious toast).
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}},
+                          {action: 'connect', response: {session_id: 'sid-enter', alive: true}},
+                          {action: 'resize', response: {ok: true}}]);
+  const win = env.win;
+  let calls = 0;
+  win.doConnect = () => { calls++; };
+  const enter = (el) => el.dispatchEvent(new win.KeyboardEvent('keydown',
+    {key: 'Enter', bubbles: true, cancelable: true}));
+  win.showOverlay && win.showOverlay();
+  enter($(win, 'iPw'));
+  ok(calls === 1, 'Enter in the password field connects; got ' + calls);
+  enter($(win, 'iH'));
+  ok(calls === 2, 'and in the host field');
+  enter($(win, 'iPersistent'));
+  ok(calls === 2, 'not on a checkbox');
+  enter($(win, 'optTmuxHistory'));
+  ok(calls === 2, 'Enter in Options does NOT connect; got ' + calls);
+  cleanup(env);
+});
+
 test('F5 after splits: every pane reconnects with ITS OWN password', async () => {
   // build() mints ids in layout order while the manifest is walked in
   // creation order, so after splits old->new ids are a permutation

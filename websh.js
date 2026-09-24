@@ -6209,8 +6209,19 @@ $('ov').addEventListener('click', e => {
 });
 
 // ── Enter to connect ────────────────────────────────────────────────
-document.querySelector('.panel').addEventListener('keydown', e => {
-  if(e.key==='Enter'&&e.target.matches('input:not([type=checkbox])')) doConnect();
+// Enter in the login form's fields connects. Bound to THE LOGIN panel:
+// `document.querySelector('.panel')` found the first .panel in the page,
+// which is the Options panel - so Enter in the form did nothing, and
+// Enter in an Options field (Scrollback) fired doConnect() and toasted
+// "Host and username are required". The form's own fields only: the
+// inline editor of a saved card handles its own Enter.
+document.querySelector('#ov .panel').addEventListener('keydown', e => {
+  if (e.key !== 'Enter' || e.isComposing) return;
+  let t = e.target;
+  if (!t.matches || !t.matches('input:not([type=checkbox]):not([type=hidden])')) return;
+  if (t.closest('.sv-edit, .sv, #savedList')) return;
+  e.preventDefault();
+  doConnect();
 });
 
 // ── Auto-connect logic ──────────────────────────────────────────────
