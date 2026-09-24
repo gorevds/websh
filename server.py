@@ -174,6 +174,12 @@ WEBSH_REQUIRE_VAULT = _bool_knob("WEBSH_REQUIRE_VAULT")
 # (unsupported schema version, etc) to refuse-to-write rather than
 # silently overwrite. Cleared only by process restart.
 _vault_disabled = False
+# Why the creds file on disk cannot be used right now, or None. Unlike
+# _vault_disabled (an unsupported schema: latched until restart) this is
+# re-evaluated on every load, so fixing the file needs no restart. While
+# it is set every WRITE is refused: rewriting "the store" from an empty
+# stand-in would permanently delete every other user's vault.
+_creds_unreadable = None
 
 __version__ = "0.2.0"
 # Wire-protocol version, shipped in /api/config and /api/ping and
@@ -1344,10 +1350,25 @@ def _load_creds():
     refuse-to-write and config_public flips vault_enabled off until
     process restart.
     """
-    global _creds_cache, _creds_cache_key, _vault_disabled
+    global _creds_cache, _creds_cache_key, _vault_disabled, _creds_unreadable
     path = _creds_path()
-    if not os.path.isfile(path):
+    if not os.path.lexists(path):
+        # Genuinely absent: a fresh install. Writing creates it.
+        _creds_unreadable = None
         return dict(_CREDS_EMPTY, vaults={})
+
+    def unusable(reason):
+        # Present but not usable (bad JSON, wrong shape, EACCES, EIO, a
+        # dangling symlink...). Readers get an empty store; writers are
+        # refused until the file is readable again - see _save_creds_atomic.
+        global _creds_unreadable
+        if _creds_unreadable != reason:
+            _log("ERROR", "creds file {} unusable ({}) - saving and deleting "
+                 "credentials is refused until it is fixed; nothing on "
+                 "disk was changed".format(path, reason))
+        _creds_unreadable = reason
+        return dict(_CREDS_EMPTY, vaults={})
+
     try:
         st = os.stat(path)
         key = (st.st_mtime, st.st_size)
@@ -1356,14 +1377,11 @@ def _load_creds():
         with open(path, "r") as f:
             data = json.load(f)
     except (OSError, ValueError) as e:
-        _log("WARN", "failed to load creds: {}".format(e))
-        return dict(_CREDS_EMPTY, vaults={})
+        return unusable(str(e) or type(e).__name__)
     if not isinstance(data, dict):
         # Operator typo or partial write from an external tool produced
-        # a JSON array/string/number at the root. Treat as empty store.
-        _log("WARN", "creds file {}: root is not an object; "
-             "treating as empty".format(path))
-        return dict(_CREDS_EMPTY, vaults={})
+        # a JSON array/string/number at the root.
+        return unusable("root is not an object")
     if data.get("version") != _CREDS_SCHEMA_VERSION:
         if not _vault_disabled:
             _log("WARN",
@@ -1374,9 +1392,10 @@ def _load_creds():
         _vault_disabled = True
         return dict(_CREDS_EMPTY, vaults={})
     if not isinstance(data.get("vaults"), dict):
-        _log("WARN", "creds file {}: missing or non-object 'vaults'; "
-             "treating as empty".format(path))
-        return dict(_CREDS_EMPTY, vaults={})
+        return unusable("missing or non-object 'vaults'")
+    if _creds_unreadable is not None:
+        _log("INFO", "creds file {} is readable again".format(path))
+    _creds_unreadable = None
     _creds_cache = data
     _creds_cache_key = key
     return _creds_cache
@@ -1396,6 +1415,9 @@ def _save_creds_atomic(data):
     """
     if _vault_disabled:
         raise RuntimeError("vault disabled — refusing to write")
+    if _creds_unreadable is not None:
+        # Backstop: the handlers answer 503 before getting here.
+        raise RuntimeError("creds file unusable — refusing to write")
     global _creds_cache, _creds_cache_key
     path = _creds_path()
     parent = os.path.dirname(path) or "."
@@ -3961,6 +3983,12 @@ class Handler(BaseHTTPRequestHandler):
 
     # ── Vault save / delete ─────────────────────────────────────────
 
+    def _reply_creds_unreadable(self, event):
+        _access_log_emit(event, self._client_ip(), result="error",
+                         error="creds_unreadable")
+        self._json({"error": "credential store temporarily unavailable",
+                    "code": "creds_unreadable"}, 503)
+
     def _reply_vault_unavailable(self):
         """The shared 501 for every vault-gated path; pairs with
         _vault_available()."""
@@ -4044,6 +4072,9 @@ class Handler(BaseHTTPRequestHandler):
             # to a different (vault_id, conn_id) slot could read the same
             # pre-state and clobber our update on its own save.
             data = _load_creds()
+            if _creds_unreadable is not None:
+                self._reply_creds_unreadable("save")
+                return
             new_vaults = dict(data.get("vaults", {}))
             slot = dict(new_vaults.get(vault_id, {}))
             slot[conn_id] = rec
@@ -4076,6 +4107,11 @@ class Handler(BaseHTTPRequestHandler):
             return
         with _creds_lock:
             data = _load_creds()
+            if _creds_unreadable is not None:
+                # Not "not found": the entry may well be in the file we
+                # cannot read, and a client would drop its card on a 404.
+                self._reply_creds_unreadable("save_delete")
+                return
             slot = dict(data.get("vaults", {}).get(vault_id, {}))
             if conn_id not in slot:
                 self._json({"error": "not found"}, 404)
@@ -4163,6 +4199,12 @@ class Handler(BaseHTTPRequestHandler):
                             "detail": "vault_key must be 32 bytes"}, 400)
                 return
             data = _load_creds()
+            if _creds_unreadable is not None:
+                # The entry may exist in the file we cannot read; "not
+                # found" would send the client down its vault_not_found
+                # path (a stale card) for what is an operator problem.
+                self._reply_creds_unreadable("connect")
+                return
             rec = data.get("vaults", {}).get(sv_vault, {}).get(sv_conn)
             if rec is None:
                 _access_log_emit("connect", ip, result="cred_not_found",
