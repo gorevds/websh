@@ -2669,6 +2669,27 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
                              capture_output=True)
         self.assertNotEqual(raw.returncode, 0)
 
+    def test_download_of_a_symlink_announces_the_target_size(self):
+        """`[ -f ]` follows the link but plain stat measured the LINK:
+        Content-Length was the length of the link text while cat streamed
+        the whole target - the browser saved a truncated file and said
+        "Download complete"."""
+        target = os.path.join(self.tmp, "big.bin")
+        with open(target, "wb") as f:
+            f.write(b"x" * 100000)
+        link = os.path.join(self.tmp, "l")
+        os.symlink(target, link)
+        for sh in self.SHELLS:
+            s = self._session(sh)
+            argv0 = ["busybox", "sh", "-c"] if sh == "busybox" else [sh, "-c"]
+            s._mux_argv = lambda cmd, a=argv0: a + [cmd]
+            proc, err = s.download_file(link)
+            self.assertIsNone(err, sh)
+            out, _ = proc.communicate(timeout=10)
+            header, _, body = out.partition(b"\n")
+            self.assertEqual(header, b"OK\t100000", (sh, header))
+            self.assertEqual(len(body), 100000, sh)
+
     def _finalize_in(self, sh, dest, tmp_name, final_name):
         """Run finalize_upload against a real directory. $HOME is the
         staging area (that is where /api/upload puts the bytes), so it is
