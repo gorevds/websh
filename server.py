@@ -59,6 +59,7 @@ import pty
 import re
 import select
 import selectors
+import shlex
 import signal
 import socket
 import struct
@@ -2930,12 +2931,21 @@ class SSHSession(object):
         return bool(self._control_path) and os.path.exists(self._control_path)
 
     def _mux_argv(self, remote_cmd):
-        """argv for a one-shot remote command over the ControlMaster."""
+        """argv for a one-shot remote command over the ControlMaster.
+
+        sshd hands the command string to the remote user's LOGIN shell,
+        which may be zsh, fish or csh. Every snippet here is POSIX sh, and
+        under zsh's default NOMATCH the listing's `for f in * .[!.]* ..?*`
+        aborted with "no matches found: ..?*" whenever one pattern matched
+        nothing - i.e. almost always - so the file browser could not list
+        any directory for a zsh user (the macOS default). Running it as
+        `exec sh -c '<snippet>'` makes the login shell parse one quoted
+        word and nothing else; the snippet itself always runs in sh."""
         return [
             "ssh", "-T",
             "-o", "BatchMode=yes",
             "-o", "ControlPath=" + self._control_path,
-            "--", self._host, remote_cmd,
+            "--", self._host, "exec sh -c " + shlex.quote(remote_cmd),
         ]
 
     def _mux_run(self, remote_cmd, timeout, timeout_msg,

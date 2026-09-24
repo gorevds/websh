@@ -10,6 +10,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import shutil
 import signal
 import socket
@@ -25,6 +26,19 @@ import uuid
 from tests.backend._base import (  # noqa: F401
     REPO_ROOT, LiveServerCase, _FakeNotifyMixin)
 import server
+
+
+def _unwrap(remote):
+    """The snippet inside `exec sh -c '<snippet>'` (see _mux_argv)."""
+    import shlex
+    parts = shlex.split(remote)
+    if parts[:3] == ["exec", "sh", "-c"] and len(parts) == 4:
+        return parts[3]
+    return remote
+
+
+def _remote(argv):
+    return _unwrap(argv[-1])
 
 
 def _pipe_stdout(*chunks):
@@ -541,7 +555,7 @@ class TestPushTmuxOptions(unittest.TestCase):
             # lines must end up chained into a *single* tmux invocation
             # via tmux's own `\;` separator — one ssh roundtrip, one
             # tmux server fork on the target, atomic application.
-            remote = cmd[-1]
+            remote = _remote(cmd)
             self.assertEqual(
                 remote,
                 "tmux set -g mouse on \\; set -g set-clipboard off "
@@ -607,7 +621,7 @@ class TestPushTmuxOptions(unittest.TestCase):
                 s.push_tmux_options([("mouse", "on")])
             # Single option case: no chaining, just one set-g.
             self.assertEqual(
-                calls[0][-1], "/usr/local/bin/tmux set -g mouse on")
+                _remote(calls[0]), "/usr/local/bin/tmux set -g mouse on")
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -1632,7 +1646,7 @@ class TestListDirPaneCwd(unittest.TestCase):
         self.assertIn('[ -n "$D" ] || D="$HOME"', cmd)
         # An inherited $D from the remote profile must not survive to
         # become the start directory.
-        self.assertTrue(cmd.startswith("D=; "), "cmd=" + cmd[:60])
+        self.assertTrue(_unwrap(cmd).startswith("D=; "), "cmd=" + cmd[:60])
 
     def test_default_still_resolves_the_requested_path(self):
         s = self._session()
@@ -2624,6 +2638,36 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
             self.assertIn("ermission denied", err, sh)
             self.assertEqual(server._side_channel_status(err), 403)
             shutil.rmtree(d)
+
+    def test_listing_survives_a_login_shell_that_fails_on_unmatched_globs(self):
+        """sshd runs the side-channel command in the user's LOGIN shell.
+        Under zsh's default NOMATCH, `for f in * .[!.]* ..?*` aborted with
+        "no matches found: ..?*" whenever a pattern matched nothing, so a
+        zsh user's browser could list nothing at all. bash's failglob is
+        the same rule; run the real argv's command string under it, the
+        way sshd would (no zsh needed on the test host)."""
+        if not shutil.which("bash"):
+            self.skipTest("needs bash")
+        d = os.path.join(self.tmp, "plain")
+        os.makedirs(d)
+        open(os.path.join(d, "a.txt"), "w").close()   # no dotfiles: ..?* can't match
+        s = self._session("dash" if "dash" in self.SHELLS else self.SHELLS[0])
+        login = ["bash", "-O", "failglob", "-c"]
+        # Replace the ssh transport: take the remote command exactly as
+        # _mux_argv builds it and hand it to the "login shell".
+        def run(remote_cmd, timeout, msg, err_prefix=None):
+            argv = s._mux_argv(remote_cmd)
+            return subprocess.run(login + [argv[-1]], capture_output=True,
+                                  timeout=timeout), None
+        s._mux_run = run
+        entries, path, err = s.list_dir(d)
+        self.assertIsNone(err)
+        self.assertEqual([e["name"] for e in entries], ["a.txt"])
+        # Proof the rule bites without the wrapper:
+        raw = subprocess.run(login + ["cd " + shlex.quote(d) +
+                                      " && for f in * .[!.]* ..?*; do :; done"],
+                             capture_output=True)
+        self.assertNotEqual(raw.returncode, 0)
 
     def _finalize_in(self, sh, dest, tmp_name, final_name):
         """Run finalize_upload against a real directory. $HOME is the
