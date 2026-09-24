@@ -366,6 +366,28 @@ PASSWORD_PROMPTS = ("password:", "password for", "passcode:", "passphrase")
 # history, in the recording.
 PASSWORD_ARM_MAX_BYTES = 16 * 1024
 PASSWORD_ARM_MAX_SECONDS = 60.0
+# How long after the auto-typed password a "permission denied" or a
+# second prompt still means "ssh rejected it". Past this - or as soon as
+# the user types anything - output belongs to the logged-in shell, where
+# `sudo -i` or `ls /root` saying the same words is ordinary life.
+AUTH_FAIL_WINDOW_SECONDS = 10.0
+# A real login prompt is the LAST thing on the terminal and then nothing
+# comes: ssh is waiting for input. This long a silence after a prompt-
+# shaped line is what makes it one (a banner line keeps printing).
+PASSWORD_PROMPT_QUIET_SECONDS = 0.15
+
+
+def _is_login_prompt(text):
+    """True when `text` (lowercased recent PTY output) ENDS in a
+    password prompt: its last non-blank line contains a prompt word and
+    ends with a colon. A match anywhere in the output is not enough - an
+    sshd banner saying "Forgot your password: call IT" used to get the
+    password typed into it, echoed on screen, before the real prompt."""
+    tail = text.rstrip(" \t\r\n")
+    if not tail.endswith(":"):
+        return False
+    last = tail.rsplit("\n", 1)[-1].rsplit("\r", 1)[-1]
+    return any(p.rstrip(":") in last for p in PASSWORD_PROMPTS)
 
 # Auth-failure patterns — if we see any of these AFTER we auto-typed the
 # password, ssh rejected our attempt and we should not keep the session
@@ -1886,6 +1908,9 @@ class SSHSession(object):
         # rejection, assume auth succeeded so later shell output can't
         # accidentally trip the detector.
         self._auth_bytes_seen = 0
+        # Deadline for reading "permission denied" as ssh rejecting the
+        # auto-typed password; 0 = not watching. See AUTH_FAIL_WINDOW_SECONDS.
+        self._auth_watch_until = 0
         # Raw waitpid() status of the ssh child — used after exit to
         # classify auth vs network failure via the 255 exit code.
         self._exit_status = None
@@ -2219,14 +2244,14 @@ class SSHSession(object):
                             self._pw_buf = self._pw_buf[-256:]
                         self._pw_bytes_seen += len(data)
                         text = self._pw_buf.decode("latin-1", errors="replace").lower()
-                        prompted = any(p in text for p in PASSWORD_PROMPTS)
-                        if not prompted and (
-                                self._pw_bytes_seen > PASSWORD_ARM_MAX_BYTES or
+                        # The window is checked BEFORE the prompt: an armed
+                        # session that sat idle past it must not answer a
+                        # later "[sudo] password for u:".
+                        if (self._pw_bytes_seen > PASSWORD_ARM_MAX_BYTES or
                                 time.time() - self._pw_armed_at
                                 > PASSWORD_ARM_MAX_SECONDS):
                             self._disarm_password("no prompt within the auth window")
-                        elif prompted:
-                            time.sleep(0.1)
+                        elif _is_login_prompt(text) and not self._more_output_soon():
                             try:
                                 os.write(self.master_fd,
                                          (self._password + "\n").encode())
@@ -2238,6 +2263,8 @@ class SSHSession(object):
                             self._password_sent = True
                             self._password = None
                             self._pw_buf = b""
+                            self._auth_watch_until = (
+                                time.time() + AUTH_FAIL_WINDOW_SECONDS)
 
                     # After we sent the password, watch for ssh's
                     # "Permission denied" so we don't loop on bad creds.
@@ -2248,7 +2275,8 @@ class SSHSession(object):
                     # rejection signal — some targets phrase the failure
                     # differently and the second prompt is unambiguous.
                     elif (self._password_sent and not self.auth_failed
-                          and self._auth_bytes_seen < 4096):
+                          and self._auth_bytes_seen < 4096
+                          and time.time() < getattr(self, "_auth_watch_until", 0)):
                         self._auth_bytes_seen += len(data)
                         self._auth_buf += data
                         if len(self._auth_buf) > 512:
@@ -2660,6 +2688,18 @@ class SSHSession(object):
         # to deliver also signals.
         self._signal()
 
+    def _more_output_soon(self):
+        """True if the PTY produces more output within
+        PASSWORD_PROMPT_QUIET_SECONDS. Used only while a prompt-shaped
+        line is on screen: a real prompt is followed by silence, a banner
+        by more banner. Nothing is read here - the loop picks it up."""
+        try:
+            r, _, _ = select.select([self.master_fd], [], [],
+                                    PASSWORD_PROMPT_QUIET_SECONDS)
+        except (ValueError, OSError):
+            return True
+        return bool(r)
+
     def _disarm_password(self, why):
         """Forget the stored password without ever typing it. See
         PASSWORD_ARM_MAX_BYTES."""
@@ -2680,6 +2720,11 @@ class SSHSession(object):
         if (getattr(self, "_password", None) and not self._password_sent
                 and data.strip(b"\r\n\t ")):
             self._disarm_password("user input")
+        # ...and once they type, what the remote prints is the answer to
+        # THEIR command: "Permission denied" from `ls /root` is not ssh
+        # rejecting the password we typed.
+        if getattr(self, "_auth_watch_until", 0) and data.strip(b"\r\n\t "):
+            self._auth_watch_until = 0
         if self.master_fd < 0:
             # No PTY ever attached (or already closed) — treat as dead.
             self.alive = False

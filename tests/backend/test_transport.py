@@ -1743,6 +1743,7 @@ class TestReapChild(unittest.TestCase):
         s.is_background = False
         s._password = None
         s._password_sent = True   # take the auth-watch branch, not pw-typing
+        s._auth_watch_until = time.time() + 30   # just typed it
         s.auth_failed = False
         s._auth_buf = b""
         s._auth_bytes_seen = 0
@@ -2344,7 +2345,9 @@ class TestPasswordAutoTypeWindow(unittest.TestCase):
         s = self._session(master, pid)
         t = threading.Thread(target=s._read_loop, daemon=True)
         t.start()
-        if user_input is not None:
+        if callable(user_input):
+            user_input(s)                 # the test drives the timing
+        elif user_input is not None:
             time.sleep(0.3)
             s.write(user_input)
         t.join(timeout)
@@ -2390,6 +2393,80 @@ class TestPasswordAutoTypeWindow(unittest.TestCase):
         self.assertFalse(s._password_sent)
         self.assertNotIn(b"S3cret", out)
         self.assertIn(b"GOT:sudo ls", out)
+
+    def test_banner_mentioning_a_password_is_not_answered(self):
+        # sshd banners are printed before the prompt. One saying
+        # "Forgot your password: call IT" used to get the password typed
+        # into it 0.1 s later - echoed onto the screen, into the replay
+        # buffer and any recording - and the REAL prompt then read as a
+        # rejection, so login to that host always failed.
+        def child(fd):
+            os.write(fd, b"*** Authorised use only ***\r\n"
+                         b"Forgot your password: call IT on 555-0100\r\n")
+            time.sleep(0.05)
+            os.write(fd, b"Password: reset at https://it/\r\n")  # prompt-shaped, then more
+            time.sleep(0.05)
+            os.write(fd, b"\r\nalice@host's password: ")
+            time.sleep(0.8)
+        s, out = self._run(child)
+        self.assertTrue(s._password_sent)
+        self.assertEqual(out.count(b"GOT:"), 1, out)       # typed exactly once
+        self.assertFalse(s.auth_failed)
+
+    def test_idle_armed_session_does_not_answer_a_late_prompt(self):
+        # No prompt and no output for longer than the window: the arm
+        # expires even though the byte budget was never reached.
+        def child(fd):
+            time.sleep(0.5)
+            os.write(fd, b"[sudo] password for alice: ")
+            time.sleep(0.5)
+        orig = server.PASSWORD_ARM_MAX_SECONDS
+        server.PASSWORD_ARM_MAX_SECONDS = 0.2
+        try:
+            s, out = self._run(child)
+        finally:
+            server.PASSWORD_ARM_MAX_SECONDS = orig
+        self.assertFalse(s._password_sent)
+        self.assertNotIn(b"S3cret", out)
+
+    def test_real_rejection_is_still_detected(self):
+        def child(fd):
+            import select as _sel
+            os.write(fd, b"alice@host's password: ")
+            _sel.select([fd], [], [], 2)
+            os.read(fd, 4096)                                # our password
+            os.write(fd, b"\r\nPermission denied, please try again.\r\n"
+                         b"alice@host's password: ")
+            time.sleep(2)
+        s, out = self._run(child)
+        self.assertTrue(s._password_sent)
+        self.assertTrue(s.auth_failed)
+
+    def test_the_logged_in_users_own_commands_are_not_a_failed_login(self):
+        # A successful login with a short MOTD, then `sudo -i`: the sudo
+        # prompt (or "Permission denied" from `ls /root`) used to fall in
+        # the 4 KB post-password window, so the session was killed as
+        # auth_failed and an auth_failed record fed fail2ban.
+        def child(fd):
+            import select as _sel
+            os.write(fd, b"alice@host's password: ")
+            _sel.select([fd], [], [], 2)
+            os.read(fd, 4096)                                # our password
+            os.write(fd, b"\r\nWelcome to host\r\nalice@host:~$ ")
+            _sel.select([fd], [], [], 3)
+            os.read(fd, 4096)                                # user's command
+            os.write(fd, b"ls: cannot open directory '/root': Permission denied\r\n"
+                         b"[sudo] password for alice: ")
+            time.sleep(0.8)
+        def user(s):
+            # Wait for the login to complete, then type a command.
+            end = time.time() + 3
+            while time.time() < end and b"$ " not in s.output_buf:
+                time.sleep(0.05)
+            s.write(b"ls /root; sudo -i\r")
+        s, out = self._run(child, user_input=user)
+        self.assertTrue(s._password_sent)
+        self.assertFalse(s.auth_failed, out)
 
     def test_bare_enter_does_not_disarm(self):
         # Pressing Enter while ssh is still connecting is common; it must
