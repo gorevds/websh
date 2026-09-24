@@ -6213,6 +6213,27 @@ function tryRestoreSessions() {
   if (!ids.length) return false;
   activatePane(restored[ids[0]].id);
 
+  // Re-key every pane's sessionStorage secret from its old id to the id
+  // build() just minted (ids restart at p1 on every page load, and the
+  // next saveSessions() writes the manifest under the new ids; secrets
+  // left under the old ones would be unreachable on the next F5). Do it
+  // eagerly, so it survives a failed connect, and in TWO passes. build() mints ids in layout
+  // order, the manifest is walked in creation order, so old->new is a
+  // permutation (after splits, old p3 can become new p2 and old p2 new
+  // p3). Moving in place overwrote a secret that a later step had not
+  // read yet, and a pane reconnected with ANOTHER host's password - and
+  // every later F5 repeated it. Read them all first, then write.
+  let secretsByOld = {};
+  Object.keys(m.panes).forEach(oldId => { secretsByOld[oldId] = _getPaneSecret(oldId); });
+  Object.keys(m.panes).forEach(oldId => {
+    let p = restored[oldId];
+    if (p && secretsByOld[oldId] && oldId !== p.id) _deletePaneSecret(oldId);
+  });
+  Object.keys(m.panes).forEach(oldId => {
+    let p = restored[oldId];
+    if (p && secretsByOld[oldId] && oldId !== p.id) _setPaneSecret(p.id, secretsByOld[oldId]);
+  });
+
   let missingCreds = 0;
   Object.keys(m.panes).forEach(oldId => {
     let rec = m.panes[oldId];
@@ -6227,21 +6248,7 @@ function tryRestoreSessions() {
     // prefer sessionStorage when present, fall back to legacy fields,
     // and finally surface a toast if both are empty for a non-vault
     // pane that needs creds at connect time.
-    let secrets = _getPaneSecret(oldId);
-    // Pane ids (`p' + ++paneCounter`) reset on every module load, so a
-    // manifest with gaps (e.g. {p1, p3} because p2 was closed earlier)
-    // remints panes as {p1, p2} on restore. If we don't re-key
-    // sessionStorage right now, the next saveSessions() (fired after
-    // the connect lands) will write a manifest with the new ids while
-    // the secrets stay under the OLD ids — and the next F5 cannot find
-    // them. Do the rewrite eagerly so it survives even if this connect
-    // itself fails. _setPaneSecret(p.id, null) is a no-op delete, so
-    // pass-through cases (vault panes, panes with no stored secrets)
-    // don't accidentally create empty rows.
-    if (secrets && oldId !== p.id) {
-      _setPaneSecret(p.id, secrets);
-      _deletePaneSecret(oldId);
-    }
+    let secrets = secretsByOld[oldId];
     let password = (secrets && secrets.password) || rec.password || '';
     let key      = (secrets && secrets.key)      || rec.key      || '';
     let keyPass  = (secrets && secrets.key_pass) || rec.key_pass || '';

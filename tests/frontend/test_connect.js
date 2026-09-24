@@ -3371,6 +3371,55 @@ test('manual pane F5 same-tab: secrets restored from sessionStorage', async () =
   cleanup(env);
 });
 
+test('F5 after splits: every pane reconnects with ITS OWN password', async () => {
+  // build() mints ids in layout order while the manifest is walked in
+  // creation order, so after splits old->new ids are a permutation
+  // (old p3 -> new p2, old p2 -> new p3). Re-keying secrets in place
+  // wrote h2's password over p3's before p3's was read: h3 got pw2.
+  const connects = [];
+  const plan = [
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: (body) => {
+      connects.push(body);
+      return {session_id: 'sid-' + body.host, alive: true};
+    }},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ];
+  const env = await mkEnv(plan); const win = env.win;
+  const rec = (h) => ({label: h, via: 'manual', host: h, port: 22, user: 'u',
+                       auth: 'pw', persistent: false, slot_id: null,
+                       tmux_cmd: 'tmux', cols: 80, rows: 24});
+  // Layout order p1, p3, p2 (p1 split right -> p2, then p1 split down -> p3).
+  win.localStorage.setItem('websh_panes', JSON.stringify({
+    version: 2,
+    layout: {type: 'split', dir: 'h',
+             a: {type: 'split', dir: 'v', a: {type: 'leaf', pane: 'p1'},
+                                          b: {type: 'leaf', pane: 'p3'}},
+             b: {type: 'leaf', pane: 'p2'}},
+    panes: {p1: rec('h1'), p2: rec('h2'), p3: rec('h3')},
+  }));
+  win.sessionStorage.setItem('websh_panes_session', JSON.stringify({
+    p1: {password: 'pw1'}, p2: {password: 'pw2'}, p3: {password: 'pw3'},
+  }));
+  win.eval('tryRestoreSessions()');
+  await sleep(150);
+  const byHost = {};
+  connects.forEach(b => { byHost[b.host] = b.password; });
+  ok(byHost.h1 === 'pw1' && byHost.h2 === 'pw2' && byHost.h3 === 'pw3',
+     'each host got its own password; got ' + JSON.stringify(byHost));
+  // And the store is keyed by the NEW ids, still one secret per host,
+  // so the next F5 is right too.
+  const store = JSON.parse(win.sessionStorage.getItem('websh_panes_session'));
+  const ps = paneList(win);
+  ps.forEach(p => {
+    ok(store[p.id] && store[p.id].password === 'pw' + p.host.slice(1),
+       p.id + ' (' + p.host + ') keyed to its own secret; got ' + JSON.stringify(store[p.id]));
+  });
+  ok(Object.keys(store).length === 3, 'no stale keys left; got ' + Object.keys(store));
+  cleanup(env);
+});
+
 test('manual pane F5 fresh-tab: sessionStorage empty → toast + body has no password', async () => {
   const connects = [];
   const plan = [
