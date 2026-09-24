@@ -477,6 +477,17 @@ function createPane(container) {
   // the sync execCommand runs inside the activation window left by
   // the recent mouseup. Format: "<kind>;<base64>"; "?" means a read
   // request, which we don't service.
+  // A clipboard write from the remote is honoured only when the user
+  // asked for copying (Auto-copy) AND just did something in this pane -
+  // a copy is always the tail of a mouse selection or a copy-mode key.
+  // Otherwise ANY output could replace the clipboard: `tail -f` of a log
+  // with an injected ESC]52 sequence silently put an attacker's command
+  // line there, to be pasted into a local terminal later.
+  const OSC52_GESTURE_MS = 3000;
+  let lastGesture = 0;
+  let markGesture = () => { lastGesture = Date.now(); };
+  termEl.addEventListener('mouseup', markGesture, true);
+  termEl.addEventListener('keydown', markGesture, true);
   if (term.parser && term.parser.registerOscHandler) {
     term.parser.registerOscHandler(52, data => {
       let semi = data.indexOf(';');
@@ -500,6 +511,10 @@ function createPane(container) {
         text = new TextDecoder('utf-8', {fatal: true, ignoreBOM: true}).decode(
           Uint8Array.from(text, c => c.charCodeAt(0)));
       } catch (e) {}
+      // Returning true consumes the sequence, so xterm's own handler
+      // doesn't write it either.
+      if (!settings.tmuxClipboard) return true;
+      if (Date.now() - lastGesture > OSC52_GESTURE_MS) return true;
       copyText(text);
       return true;
     });
