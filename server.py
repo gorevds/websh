@@ -3525,7 +3525,11 @@ class SSHSession(object):
               '*) F="$HOME/$P";; '
             'esac; '
             'if [ -f "$F" ]; then '
-              'SZ=$(stat -c%s "$F" 2>/dev/null || stat -f%z "$F" 2>/dev/null || printf -- -1); '
+              # -L: measure what cat will stream. `[ -f ]` follows a
+              # symlink but plain stat reports the LINK's size, so a 12-byte
+              # link to a 100 KB file sent Content-Length: 12 and the
+              # browser saved 12 bytes as "Download complete".
+              'SZ=$(stat -L -c%s "$F" 2>/dev/null || stat -L -f%z "$F" 2>/dev/null || printf -- -1); '
               'printf "OK\\t%s\\n" "$SZ"; '
               'cat -- "$F"; '
             'else printf "ERR\\tFile not found\\n"; fi'
