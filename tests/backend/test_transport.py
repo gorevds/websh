@@ -160,6 +160,24 @@ class TestHTTPApi(LiveServerCase):
                                         hdrs)
             self.assertNotEqual(code, 403, hdrs)
 
+    def test_proxy_that_drops_host_is_named_in_the_log_once(self):
+        """docs/deployment.md's nginx example used to omit
+        `proxy_set_header Host $host`: every browser request then arrived
+        as Host: 127.0.0.1:PORT with the public Origin and got 403, with
+        nothing saying why. The refusal stands (it IS indistinguishable
+        from CSRF), but the operator is told the fix - once."""
+        server._proxy_host_warned = False
+        with unittest.mock.patch.object(server, "_log") as log:
+            for _ in range(3):
+                _, code = self._post_hdr("/api/resize", {"session_id": "x"},
+                                         {"Origin": "https://ssh.example.com"})
+                self.assertEqual(code, 403)
+        warns = [c for c in log.call_args_list
+                 if "proxy_set_header Host" in str(c)]
+        self.assertEqual(len(warns), 1, log.call_args_list)
+        with open(os.path.join(REPO_ROOT, "docs", "deployment.md")) as f:
+            self.assertIn("proxy_set_header Host $host;", f.read())
+
     def test_forwarded_host_from_trusted_proxy_counts_as_origin(self):
         body, code = self._post_hdr(
             "/api/resize", {"session_id": "x"},

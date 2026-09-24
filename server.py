@@ -1063,6 +1063,25 @@ class _PlaintextCredsRejected(Exception):
     pass
 
 
+_proxy_host_warned = False
+
+
+def _warn_proxy_host_once(host_hdr, origin_host):
+    """The one misconfiguration that looks exactly like CSRF: a reverse
+    proxy that does not forward Host, so every browser request arrives as
+    "Host: 127.0.0.1:8765" with the public Origin. Say so once, with the
+    fix, instead of leaving the operator with a wall of 403s."""
+    global _proxy_host_warned
+    h = host_hdr.strip().lower().split(":")[0].strip("[]")
+    if _proxy_host_warned or h not in ("127.0.0.1", "localhost", "::1"):
+        return
+    _proxy_host_warned = True
+    _log("WARN", "browser requests from {} arrive with Host: {} - the "
+         "reverse proxy is not forwarding the Host header, so they are "
+         "refused as cross-site. nginx: add `proxy_set_header Host $host;` "
+         "(see docs/deployment.md).".format(origin_host, host_hdr))
+
+
 _CONFIG_EMPTY = {"connections": [], "restrict_hosts": False,
                  "isolate_storage": False,
                  "denied_host_set": frozenset(),
@@ -3829,6 +3848,7 @@ class Handler(BaseHTTPRequestHandler):
         allowed.discard("")
         if o_host in allowed:
             return False
+        _warn_proxy_host_once(self.headers.get("Host") or "", o_host)
         self._json({"error": "cross-site request refused"}, 403)
         return True
 
