@@ -2455,6 +2455,18 @@ class SSHSession(object):
             except (OSError, ValueError):
                 pass
 
+            # Reap the child if we broke out before the inline WNOHANG reap
+            # (the auth-fail branch SIGTERMs and breaks, and a fast exit
+            # often surfaces as EIO before the inline reap sees it).
+            # Otherwise the ssh child lingers as a zombie holding a counted
+            # session slot until /api/disconnect or SESSION_TIMEOUT calls
+            # close(). It must run BEFORE the exit-255 check below: that
+            # check needs the exit status, and when the reap came after
+            # it, a rejected key (ssh exits 255 at once, no prompt ever)
+            # was reported as "SSH process exited immediately" instead of
+            # an authentication failure the user can act on.
+            self._reap_child()
+
             # ssh exit status 255 = anything ssh itself rejected: auth
             # failure, connection refused, host key mismatch, etc. If the
             # output tail contains an auth-shaped phrase, classify as
@@ -2481,12 +2493,6 @@ class SSHSession(object):
             # Append terminal reset so the frontend restores normal screen
             with self.buf_lock:
                 self._append_output_locked(TERM_RESET)
-
-            # Reap the child if we broke out before the inline WNOHANG reap
-            # (the auth-fail branch SIGTERMs and breaks). Otherwise the ssh
-            # child lingers as a zombie holding a counted session slot until
-            # /api/disconnect or SESSION_TIMEOUT eventually calls close().
-            self._reap_child()
 
             self.alive = False
             # Wake any consumer parked in wait_for_data so it observes
