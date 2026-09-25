@@ -3549,6 +3549,11 @@ class SSHSession(object):
               # link to a 100 KB file sent Content-Length: 12 and the
               # browser saved 12 bytes as "Download complete".
               'SZ=$(stat -L -c%s "$F" 2>/dev/null || stat -L -f%z "$F" 2>/dev/null || printf -- -1); '
+              # procfs/sysfs files report size 0 but have content
+              # (/proc/cpuinfo): a declared length of 0 made the browser
+              # save an empty file. Stream those with no declared length;
+              # a truly empty file then simply ends at once.
+              '[ "$SZ" = 0 ] && SZ=-1; '
               'printf "OK\\t%s\\n" "$SZ"; '
               'cat -- "$F"; '
             'else printf "ERR\\tFile not found\\n"; fi'
@@ -5529,6 +5534,17 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 chunk = os.read(out_fd, BUF)
                 if not chunk:
+                    break
+                if content_length is not None and sent + len(chunk) > content_length:
+                    # The file grew after stat. Bytes past the declared
+                    # Content-Length would corrupt the HTTP stream (the
+                    # client reads them as the next response); send what
+                    # was announced and stop.
+                    chunk = chunk[:content_length - sent]
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+                    sent += len(chunk)
+                    proc.kill()
                     break
                 sent += len(chunk)
                 # Hard ceiling on bytes actually streamed. The upfront 413

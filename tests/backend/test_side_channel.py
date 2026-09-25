@@ -2147,6 +2147,41 @@ class TestDownloadHTTPDispatch(LiveServerCase):
         self.assertTrue(fake_proc.kill.called)
         self.assertTrue(fake_proc.wait.called)
 
+    def test_file_that_grows_after_stat_is_cut_at_the_declared_length(self):
+        # Bytes past Content-Length would be read by the client as the
+        # start of the NEXT response on a kept-alive connection.
+        import socket as _s
+        sid = str(uuid.uuid4())
+        fake_proc = unittest.mock.MagicMock()
+        fake_proc.stdout = _pipe_stdout(b"OK\t4\n", b"abcdEXTRA-BYTES")
+        fake_session = unittest.mock.MagicMock()
+        fake_session.download_file.return_value = (fake_proc, None)
+        with unittest.mock.patch.dict(server.sessions, {sid: fake_session}):
+            c = _s.create_connection(("127.0.0.1", self.port), timeout=5)
+            path = "/api/download?session_id={}&path=/tmp/log".format(sid)
+            c.sendall(("GET %s HTTP/1.1\r\nHost: x\r\n\r\n" % path).encode())
+            raw = b""
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                try:
+                    d = c.recv(65536)
+                except _s.timeout:
+                    break
+                if not d:
+                    break
+                raw += d
+                if b"\r\n\r\n" in raw and len(raw.split(b"\r\n\r\n", 1)[1]) >= 4:
+                    time.sleep(0.3)          # anything extra would arrive now
+                    c.setblocking(False)
+                    try:
+                        raw += c.recv(65536)
+                    except (BlockingIOError, OSError):
+                        pass
+                    break
+            c.close()
+        body = raw.split(b"\r\n\r\n", 1)[1]
+        self.assertEqual(body, b"abcd")
+
     def test_successful_download_streams_binary(self):
         from urllib.request import urlopen
         sid = str(uuid.uuid4())
@@ -2735,6 +2770,31 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
         ok, err = self._session(self.SHELLS[0]).remove_path(
             os.path.join(self.tmp, "never-was"))
         self.assertEqual((ok, err), (True, "already gone"))
+
+    def test_procfs_file_is_streamed_without_a_zero_length(self):
+        # /proc files stat as 0 bytes but have content: "OK\t0" made the
+        # browser save an empty /proc/cpuinfo as "Download complete".
+        if not os.path.exists("/proc/cpuinfo"):
+            self.skipTest("needs procfs")
+        for sh in self.SHELLS:
+            s = self._session(sh)
+            argv0 = ["busybox", "sh", "-c"] if sh == "busybox" else [sh, "-c"]
+            s._mux_argv = lambda cmd, a=argv0: a + [cmd]
+            proc, err = s.download_file("/proc/cpuinfo")
+            self.assertIsNone(err, sh)
+            out, _ = proc.communicate(timeout=10)
+            header, _, body = out.partition(b"\n")
+            self.assertEqual(header, b"OK\t-1", (sh, header))
+            self.assertGreater(len(body), 0, sh)
+        # A truly empty regular file still downloads as empty.
+        empty = os.path.join(self.tmp, "empty")
+        open(empty, "w").close()
+        s = self._session(self.SHELLS[0])
+        a = ["busybox", "sh", "-c"] if self.SHELLS[0] == "busybox" else [self.SHELLS[0], "-c"]
+        s._mux_argv = lambda cmd: a + [cmd]
+        proc, err = s.download_file(empty)
+        out, _ = proc.communicate(timeout=10)
+        self.assertEqual(out, b"OK\t-1\n")
 
     def _finalize_in(self, sh, dest, tmp_name, final_name):
         """Run finalize_upload against a real directory. $HOME is the
