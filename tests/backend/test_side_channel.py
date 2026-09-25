@@ -1095,6 +1095,29 @@ class TestUploadFinalizeHTTPDispatch(LiveServerCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_undecodable_names_are_refused_not_misreported(self):
+        # A non-UTF-8 name is listed with U+FFFD and can never name its
+        # file again: rm found nothing and answered "already gone".
+        sid = str(uuid.uuid4())
+        class FakeSession:
+            persistent = False
+            slot_id = None
+            last_activity = 0
+            _host = "h"
+            def remove_path(self, p): raise AssertionError("must not run")
+            def rename_entry(self, p, n): raise AssertionError("must not run")
+        with server.sessions_lock:
+            server.sessions[sid] = FakeSession()
+        try:
+            for path, body in (("/api/rm", {"path": "/srv/caf\ufffd.txt"}),
+                               ("/api/mv", {"path": "/srv/caf\ufffd.txt", "name": "x"})):
+                resp, code = self._post(path, dict(body, session_id=sid))
+                self.assertEqual(code, 400, path)
+                self.assertEqual(resp.get("code"), "undecodable_name", path)
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
     def test_finalize_accepts_the_root_directory(self):
         # rm/mkdir/mv refuse a bare "/" because there it can only be a
         # bug; for an upload it is where root's files go, and the browser
@@ -2689,6 +2712,29 @@ class TestSideChannelSnippetsExecuted(unittest.TestCase):
             header, _, body = out.partition(b"\n")
             self.assertEqual(header, b"OK\t100000", (sh, header))
             self.assertEqual(len(body), 100000, sh)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_delete_behind_an_unsearchable_directory_is_not_already_gone(self):
+        # `[ -e ]` and `[ -L ]` are both false when stat fails with
+        # EACCES too; that was reported as {ok, already_gone} - an
+        # "Already deleted" toast for a file still on disk.
+        for sh in self.SHELLS:
+            d = os.path.join(self.tmp, "locked")
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, "keep.txt"), "w").close()
+            os.chmod(d, 0o600)                    # readable, not searchable
+            try:
+                ok, err = self._session(sh).remove_path(os.path.join(d, "keep.txt"))
+            finally:
+                os.chmod(d, 0o755)
+            self.assertFalse(ok, sh)
+            self.assertIn("permission", err, sh)
+            self.assertTrue(os.path.exists(os.path.join(d, "keep.txt")), sh)
+            shutil.rmtree(d)
+        # A genuinely missing entry is still "already gone".
+        ok, err = self._session(self.SHELLS[0]).remove_path(
+            os.path.join(self.tmp, "never-was"))
+        self.assertEqual((ok, err), (True, "already gone"))
 
     def _finalize_in(self, sh, dest, tmp_name, final_name):
         """Run finalize_upload against a real directory. $HOME is the

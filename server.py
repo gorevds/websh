@@ -3438,7 +3438,15 @@ class SSHSession(object):
         # filename that begins with a dash.
         remote_cmd = (
             _sh_b64('P', b64) + '; '
-            '[ -e "$P" ] || [ -L "$P" ] || exit 3; '
+            # Exit 3 ("already gone") only when the entry's directory is
+            # there and searchable: `[ -e ]` and `[ -L ]` are also both
+            # false when stat fails with EACCES/ESTALE, and reporting that
+            # as a successful delete left the file in place under an
+            # "Already deleted" toast. Anything else is exit 6.
+            'if ! [ -e "$P" ] && ! [ -L "$P" ]; then '
+              'D="${P%/*}"; [ -n "$D" ] || D=/; '
+              '[ -d "$D" ] && [ -x "$D" ] && exit 3; exit 6; '
+            'fi; '
             'if [ -d "$P" ] && [ ! -L "$P" ]; then '
               'rmdir -- "$P" || exit 5; '
             'else '
@@ -3455,6 +3463,8 @@ class SSHSession(object):
             # a retry after a lost response say "Delete failed" about a
             # delete that had succeeded.
             return True, "already gone"
+        if proc.returncode == 6:
+            return False, "permission denied"
         return False, _remote_errno_text(
             proc.stderr, "delete failed (exit %d)" % proc.returncode)
 
@@ -5293,6 +5303,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._bad_abs_path(path):
             self._json({"error": "invalid path"}, 400)
             return
+        if self._refuse_undecodable(path):
+            return
         session = self._require_session(sid)
         if session is None:
             return
@@ -5313,6 +5325,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         session.last_activity = time.time()
         self._json({"ok": True, "already_gone": True} if gone else {"ok": True})
+
+    def _refuse_undecodable(self, path):
+        """list_dir decodes remote names that are not valid UTF-8 with
+        U+FFFD replacements, so such a row can never name its file again:
+        a delete used to find nothing and report "already deleted" with
+        the file still there, rename said 404, download "not found". Say
+        what is actually wrong instead. Returns True when refused."""
+        if isinstance(path, str) and "\ufffd" in path:
+            self._json({"error": "this name is not valid UTF-8 and cannot "
+                        "be handled here - use the terminal",
+                        "code": "undecodable_name"}, 400)
+            return True
+        return False
 
     @staticmethod
     def _bad_abs_path(path):
@@ -5384,6 +5409,8 @@ class Handler(BaseHTTPRequestHandler):
         if self._bad_abs_path(path):
             self._json({"error": "invalid path"}, 400)
             return
+        if self._refuse_undecodable(path):
+            return
         if self._bad_name(name):
             self._json({"error": "invalid name"}, 400)
             return
@@ -5414,6 +5441,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if not path or "\x00" in path:
             self._json({"error": "invalid path"}, 400)
+            return
+        if self._refuse_undecodable(path):
             return
         session = self._require_session(sid)
         if session is None:
