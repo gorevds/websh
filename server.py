@@ -514,17 +514,20 @@ def _build_remote_command(slot_id, tmux_cmd, ttl_seconds,
     # `\;` chains the options in the same tmux invocation, applying
     # them regardless of whether the session was newly created or
     # re-attached via -A.
-    attach = (tmux_cmd + " new-session -A -D -s " + tname
+    # Per-connect tmux options go BEFORE new-session. Tuples are
+    # pre-validated against an allow-list (see _validate_tmux_options) so
+    # direct interpolation is shell- and tmux-injection-safe. The order
+    # matters for history-limit: tmux reads it only when a pane is
+    # CREATED, so `new-session ... \; set -g history-limit N` left the new
+    # pane with the old limit and the Scrollback setting did nothing
+    # (verified on tmux 3.4). `start-server` first, because `set -g`
+    # needs a server and on first use there is none yet.
+    pre = ""
+    for opt, val in (tmux_options or ()):
+        pre += " \\; set -g " + opt + " " + val
+    attach = (tmux_cmd + " start-server" + pre + " \\; new-session -A -D -s " + tname
               + ' -- "$SHELL" -l \\; set -g mouse on'
               + ' \\; set -g status off')
-    # Per-connect tmux options. Tuples are pre-validated against an
-    # allow-list (see _validate_tmux_options) so direct interpolation
-    # below is shell- and tmux-injection-safe. `\;` chains commands in
-    # the same tmux invocation so options apply to the global server
-    # state regardless of whether the session was newly created or
-    # re-attached via -A.
-    for opt, val in (tmux_options or ()):
-        attach += " \\; set -g " + opt + " " + val
     if ttl_seconds <= 0:
         return "exec " + attach
 

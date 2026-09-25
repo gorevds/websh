@@ -1047,7 +1047,7 @@ class TestBuildRemoteCommand(unittest.TestCase):
         cmd = server._build_remote_command("alice", "tmux", 0)
         self.assertEqual(
             cmd,
-            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
+            'exec tmux start-server \\; new-session -A -D -s websh-alice -- "$SHELL" -l'
             ' \\; set -g mouse on'
             ' \\; set -g status off')
 
@@ -1067,7 +1067,7 @@ class TestBuildRemoteCommand(unittest.TestCase):
         self.assertIn("-ge 3600", cmd)  # the TTL comparison
         # Ends with the exec so the login shell doesn't linger.
         self.assertTrue(cmd.rstrip().endswith(
-            'exec tmux new-session -A -D -s websh-alice -- "$SHELL" -l'
+            'exec tmux start-server \\; new-session -A -D -s websh-alice -- "$SHELL" -l'
             ' \\; set -g mouse on'
             ' \\; set -g status off'))
 
@@ -1166,22 +1166,23 @@ class TestBuildRemoteCommand(unittest.TestCase):
         cmd = server._build_remote_command("ok", "tmux", 3600)
         self.assertIn("has-session -t websh-ok 2>/dev/null || exit", cmd)
 
-    def test_tmux_options_chained_after_new_session(self):
-        """Per-connect tmux options are tacked onto the same `tmux …`
-        invocation via `\\;`, so they apply to the global tmux server
-        whether the session was newly created or re-attached. `set -g
-        mouse on` is part of the baseline (hardcoded, not via the
-        options list) so the chain starts with it before user options."""
+    def test_tmux_options_chained_before_new_session(self):
+        """Per-connect tmux options ride in the same `tmux …` invocation
+        via `\\;` and come BEFORE new-session: history-limit is read only
+        when a pane is created, so set after new-session it never reached
+        the pane (TestScrollbackReachesTheNewPane runs this for real).
+        start-server first, because `set -g` needs a server."""
         cmd = server._build_remote_command(
             "ok", "tmux", 0,
             tmux_options=[("set-clipboard", "on"),
                           ("history-limit", "100000")])
         self.assertIn(
-            'new-session -A -D -s websh-ok -- "$SHELL" -l'
-            ' \\; set -g mouse on'
-            ' \\; set -g status off'
+            'tmux start-server'
             ' \\; set -g set-clipboard on'
-            ' \\; set -g history-limit 100000',
+            ' \\; set -g history-limit 100000'
+            ' \\; new-session -A -D -s websh-ok -- "$SHELL" -l'
+            ' \\; set -g mouse on'
+            ' \\; set -g status off',
             cmd)
 
     def test_mouse_on_baked_into_command(self):
@@ -1750,6 +1751,51 @@ class TestFailedSpawnLeavesNothingBehind(unittest.TestCase):
                 server.SSHSession("sid-leak2", "h.example", 22, "alice", "pw",
                                   80, 24)
         kill.assert_not_called()
+
+
+class TestScrollbackReachesTheNewPane(unittest.TestCase):
+    """tmux applies history-limit only when a pane is created. The remote
+    command used to run `new-session ... \\; set -g history-limit N`, so
+    the new pane kept the old limit and the Scrollback setting did
+    nothing. Run the real command against a real tmux - on a PRIVATE
+    socket (-L) with $TMUX cleared, never the user's server."""
+
+    @unittest.skipUnless(shutil.which("tmux"), "needs tmux")
+    def test_history_limit_is_in_effect_for_the_created_pane(self):
+        import pty
+        sock = "websh-test-%d" % os.getpid()
+        tmux = "tmux -L " + sock
+        env = {k: v for k, v in os.environ.items() if k != "TMUX"}
+        env["SHELL"] = "/bin/sh"
+        cmd = server._build_remote_command(
+            "slotx", tmux, 0, [("history-limit", "77777")])
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe("sh", ["sh", "-c", cmd], env)
+        try:
+            limit = ""
+            deadline = time.time() + 10
+            while time.time() < deadline and limit.strip() != "77777":
+                time.sleep(0.2)
+                limit = subprocess.run(
+                    ["tmux", "-L", sock, "display", "-p", "-t", "websh-slotx",
+                     "#{history_limit}"],
+                    capture_output=True, text=True, env=env).stdout
+            self.assertEqual(limit.strip(), "77777")
+        finally:
+            subprocess.run(["tmux", "-L", sock, "kill-server"],
+                           capture_output=True, env=env)
+            try:            # a killed server may leave its socket file
+                os.unlink(os.path.join(env.get("TMUX_TMPDIR", "/tmp"),
+                                       "tmux-%d" % os.getuid(), sock))
+            except OSError:
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (ProcessLookupError, ChildProcessError):
+                pass
+            os.close(fd)
 
 if __name__ == "__main__":
     unittest.main()
