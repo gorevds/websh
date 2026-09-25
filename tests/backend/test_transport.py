@@ -1089,6 +1089,10 @@ _FAKE_TMUX = r"""#!/bin/sh
 state=${TMUX_STATE:-/tmp/fake-tmux-state}
 sessions=$state/sessions
 mkdir -p "$state"; touch "$sessions"
+# `start-server \; set -g ... \; new-session ...`: act on the new-session.
+if [ "$1" = start-server ]; then
+  while [ $# -gt 0 ] && [ "$1" != new-session ]; do shift; done
+fi
 sub=$1; shift
 name=""
 while [ $# -gt 0 ]; do
