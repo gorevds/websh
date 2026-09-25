@@ -2490,6 +2490,32 @@ class TestPasswordAutoTypeWindow(unittest.TestCase):
         self.assertTrue(s._password_sent)
         self.assertFalse(s.auth_failed, out)
 
+    def test_rejected_key_is_an_auth_failure_not_an_early_exit(self):
+        # Key auth rejected: ssh prints "Permission denied (publickey)."
+        # and exits 255 at once - no prompt. The exit-255 classification
+        # ran before the reader reaped the child, found no exit status,
+        # and the client was told "SSH process exited immediately".
+        import pty
+        for _ in range(5):                      # timing-dependent: try a few
+            master, slave = pty.openpty()
+            pid = os.fork()
+            if pid == 0:
+                os.close(master)
+                os.write(slave, b"alice@host: Permission denied (publickey).\r\n")
+                os._exit(255)
+            os.close(slave)
+            s = self._session(master, pid)
+            s._password = None                  # key session: nothing to type
+            t = threading.Thread(target=s._read_loop, daemon=True)
+            t.start()
+            t.join(5)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            self.assertFalse(s.alive)
+            self.assertTrue(s.auth_failed, "rejected key must read as auth failure")
+
     def test_bare_enter_does_not_disarm(self):
         # Pressing Enter while ssh is still connecting is common; it must
         # not cost the user the auto-type when the prompt then appears.
