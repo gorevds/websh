@@ -3694,7 +3694,7 @@ function checkProtoVersion(cfg) {
 }
 
 function loadServerConfig() {
-  api('config').then(async cfg => {
+  return api('config').then(async cfg => {
     serverConfig=cfg;
     applyFormDefaults(cfg);
     checkProtoVersion(cfg);
@@ -6433,7 +6433,9 @@ _initVaultBroadcast();
 // No pane is created eagerly. loadServerConfig drives next step:
 // either tryRestoreSessions rebuilds the saved layout, or overlayMode is
 // set to 'initial' and the user sees the login form on an empty canvas.
-loadServerConfig();
+// Settles once boot has finished acting on /api/config (restore or the
+// login form) - the frontend tests wait on it instead of guessing a delay.
+const bootReady = loadServerConfig();
 // No renderSaved() here: under isolate_storage the storage prefix is
 // only known once /api/config answers, and a render now read the
 // SHARED namespace - the login screen showed another deployment's

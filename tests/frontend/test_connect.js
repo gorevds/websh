@@ -170,6 +170,7 @@ const EXPOSE = `
     get: () => currentConnectRun,
     set: v => { currentConnectRun = v; },
     configurable: true});
+  Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
   Object.defineProperty(window, '_idbHasKeyCache', {
     get: () => _idbHasKeyCache,
@@ -218,6 +219,12 @@ async function mkEnv(plan) {
   _injectVaultGlobals(win);
   win.localStorage.clear();
   win.eval(js + EXPOSE);
+  // Wait for boot to actually finish, not a fixed guess: a cold first
+  // run (JIT, IndexedDB open) could take longer than the old 30ms, and
+  // the first test then saw the form still hidden. Capped so a plan
+  // whose config never answers still moves on; the trailing settle
+  // keeps what the fixed sleep used to cover (restore's async tail).
+  await Promise.race([win.bootReady, sleep(2000)]);
   await sleep(30);
   return {dom, win, log, state};
 }
@@ -245,6 +252,16 @@ function cleanup(env) {
     try { if (env.win.fetch && env.win.fetch.__state) env.win.fetch.__state.dead = true; } catch(e) {}
     env.dom.window.close();
   } catch(e) {}
+}
+
+// Close a window a test built by hand only once its boot has settled.
+// fake-indexeddb runs on node's own setImmediate, which window.close()
+// does not stop: a window closed mid-boot (the tests that sleep a fixed
+// 30ms) later resumed loadServerConfig against a dead document, threw
+// inside its .catch, and the unhandled rejection killed the whole run.
+async function closeDom(dom) {
+  try { await Promise.race([dom.window.bootReady, sleep(2000)]); } catch (e) {}
+  dom.window.close();
 }
 
 const $ = (win, id) => win.document.getElementById(id);
@@ -1802,7 +1819,7 @@ test('vault primitives: isolate_storage scopes vault_id by path', async () => {
   ok(/^[A-Z2-7]{26}$/.test(idA), 'A vault_id well-formed');
   ok(/^[A-Z2-7]{26}$/.test(idB), 'B vault_id well-formed');
   ok(idA !== idB, 'path-scoped vault_ids differ (got both ' + idA + ')');
-  domA.window.close(); domB.window.close();
+  await closeDom(domA); await closeDom(domB);
 });
 
 // =====================================================================
@@ -2000,7 +2017,7 @@ test('multi-tab: BroadcastChannel signed_out clears cache and re-renders', async
   await sleep(20);
   ok(win.eval('_idbHasKeyCache') === false,
      'cache invalidated by signed_out broadcast');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 // =====================================================================
@@ -2132,7 +2149,7 @@ test('sign out: empty-vault path does NOT mint vault_id or broadcast', async () 
      '_vaultRecentlySignedOut NOT set on empty path');
   // Modal closed regardless — the user did click Sign Out.
   ok(hidden($(win, 'signOutModal')), 'sign-out modal closed');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('sign out: populated-vault path DOES broadcast to siblings', async () => {
@@ -2178,7 +2195,7 @@ test('sign out: populated-vault path DOES broadcast to siblings', async () => {
      'one broadcast on populated-vault sign-out; got ' + broadcasts);
   ok(win.eval('_vaultRecentlySignedOut') === true,
      '_vaultRecentlySignedOut SET on populated path');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('sign out: tolerates server-side failures (local wipe still happens)', async () => {
@@ -2634,7 +2651,7 @@ test('cross-tab signed_out tears down live vault panes in sibling tab', async ()
   // Cache invalidated — _idbHasKeyCache false (no minting in handler).
   ok(win.eval('_idbHasKeyCache') === false,
      '_idbHasKeyCache invalidated after cross-tab signed_out');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 // =====================================================================
@@ -4719,7 +4736,7 @@ test('bfcache: pagehide closes BroadcastChannel; pageshow(persisted=true) re-ope
   Object.defineProperty(ev2, 'persisted', {value: false});
   win.dispatchEvent(ev2);
   ok(constructed === 2, 'cold-load pageshow does NOT re-init; got ' + constructed);
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('vault BroadcastChannel name is path-scoped under isolate_storage', async () => {
@@ -4755,7 +4772,7 @@ test('vault BroadcastChannel name is path-scoped under isolate_storage', async (
   ok(names[names.length - 1] === '/team-a/websh_vault',
      'final open is path-scoped to /team-a/; got ' +
      JSON.stringify(names[names.length - 1]));
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('sibling tab on a different path does NOT trigger sign-out handler', async () => {
@@ -4814,7 +4831,7 @@ test('sibling tab on a different path does NOT trigger sign-out handler', async 
   await sleep(40);
   ok(win.eval('_vaultRecentlySignedOut') === true,
      'same-path sibling DOES set the sign-out flag');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('F1: post-encrypt vault_id race (sign-out between subtle.encrypt and POST) aborts save', async () => {
@@ -4998,7 +5015,7 @@ test('bfcache restore invalidates vault caches and re-renders saved list', async
   ok(rowsAfter.length === 1, 'saved card row still present after re-render');
   ok(rowsAfter[0].classList.contains('nokey'),
      'row greyed out after bfcache restore + IDB refresh');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('F6: "status code" mapping tests actually exercise error-string mapping', async () => {
@@ -6639,7 +6656,7 @@ test('isolate_storage: font link refreshes to the path-scoped family at boot (#1
      + link.getAttribute('href'));
   ok(!/JetBrains\+Mono/.test(link.getAttribute('href')),
      'default family must not stay active under isolate_storage');
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('transportFatal no-ops on a torn-down transport (stale reconnect guard, #134)', async () => {
@@ -7010,7 +7027,7 @@ test('isolate_storage: the login screen never paints another deployment\'s saved
   const after = win.document.getElementById('savedList').textContent;
   ok(/MINE/.test(after) && !/OTHER-DEPLOYMENT/.test(after),
      'path-scoped cards after config; got ' + JSON.stringify(after));
-  dom.window.close();
+  await closeDom(dom);
 });
 
 test('api(): a non-JSON reply becomes a readable error, not "Unexpected token <"', async () => {
@@ -7782,8 +7799,18 @@ test('saved connections can be edited in place', async () => {
 });
 
 // =====================================================================
+// A stray rejection used to take node down mid-run with no summary, so
+// a crash looked like "no result" rather than a failure. Count it as a
+// failure against the scenario that was running and keep going.
+let current = '(between scenarios)';
+process.on('unhandledRejection', e => {
+  failed++;
+  failures.push(current + ': unhandled rejection: ' + (e && e.message || e));
+  console.log('  UNHANDLED REJECTION: ' + (e && e.stack || e));
+});
 (async () => {
   for (const s of scenarios) {
+    current = s.name;
     console.log('\n=== ' + s.name + ' ===');
     try { await s.fn(); } catch (e) {
       failed++;
