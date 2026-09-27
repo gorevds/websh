@@ -2687,5 +2687,244 @@ class TestLosslessReconnectHTTP(LiveServerCase):
             self.assertEqual(s.output_buf, b"", "legacy read drained")
 
 
+class _Wfile(object):
+    """wfile stand-in: records writes; raises for any write carrying one
+    of `fail_on` (bytes) to mimic a peer that went away mid-response."""
+    def __init__(self, fail_on=()):
+        self.chunks = []
+        self.fail_on = fail_on
+    def write(self, b):
+        if any(m in b for m in self.fail_on):
+            raise BrokenPipeError("peer closed")
+        self.chunks.append(b)
+    def flush(self):
+        pass
+    def text(self):
+        return b"".join(self.chunks).decode("utf-8")
+
+
+class _DeliverySession(object):
+    """Scripted session for the /api/output and /api/stream loops.
+    `reads` is what successive read() calls return; `on_wait` runs on
+    each wait_for_data() (the moment the handler parks)."""
+    def __init__(self, reads=(), on_wait=None):
+        self.alive = True
+        self.auth_failed = False
+        self.last_activity = 0
+        self._reads = list(reads)
+        self.unread_calls = []
+        self.waits = 0
+        self._on_wait = on_wait
+    def read(self):
+        return self._reads.pop(0) if self._reads else b""
+    def unread(self, data):
+        self.unread_calls.append(data)
+    def read_since(self, cursor):
+        data = self.read()
+        return data, cursor + len(data), 0, False
+    def wait_for_data(self, client_socket, timeout, selector=None):
+        self.waits += 1
+        if self._on_wait:
+            self._on_wait(self)
+        else:
+            time.sleep(min(timeout, 0.05))
+
+
+def _delivery_handler(sess, path="/api/output?session_id=x", wfile=None):
+    h = server.Handler.__new__(server.Handler)
+    h.path = path
+    h.headers = {}
+    h.status = []
+    h.send_response = lambda code, *a: h.status.append(code)
+    h.send_header = lambda *a, **k: None
+    h.end_headers = lambda *a, **k: None
+    h.connection = None
+    h._require_session = lambda sid: sess
+    h._build_session_selector = lambda session: type(
+        "_Sel", (), {"close": lambda self: None})()
+    h._client_gone = lambda: False
+    h.wfile = wfile or _Wfile()
+    return h
+
+
+class TestOutputLongPollEdges(unittest.TestCase):
+    """The /api/output paths the happy-path tests never reach: a quiet
+    session (the poll must time out with an empty, still-alive reply),
+    a session that dies while the poll is parked (answer at once, not
+    after the full timeout), and a client that hangs up during the
+    reply (the drained bytes must go back, or they are lost for good)."""
+
+    def _body(self, h):
+        raw = b"".join(h.wfile.chunks)
+        return json.loads(raw.decode("utf-8"))
+
+    def test_quiet_session_times_out_empty_and_alive(self):
+        sess = _DeliverySession()
+        h = _delivery_handler(sess, "/api/output?session_id=x&since=7")
+        with unittest.mock.patch.object(server, "POLL_TIMEOUT", 0.2):
+            t0 = time.time()
+            h._output()
+            took = time.time() - t0
+        body = self._body(h)
+        self.assertEqual(body["data"], "")
+        self.assertTrue(body["alive"], "a quiet session is not a dead one")
+        self.assertEqual(body["cursor"], 7, "the cursor is echoed unchanged")
+        self.assertGreaterEqual(sess.waits, 1, "it parked instead of spinning")
+        self.assertLess(took, 3)
+
+    def test_session_dying_mid_wait_answers_at_once(self):
+        def die(s):
+            s.alive = False
+        sess = _DeliverySession(on_wait=die)
+        h = _delivery_handler(sess)
+        with unittest.mock.patch.object(server, "POLL_TIMEOUT", 30):
+            t0 = time.time()
+            h._output()
+            took = time.time() - t0
+        body = self._body(h)
+        self.assertFalse(body["alive"])
+        self.assertEqual(body["data"], "")
+        self.assertLess(took, 2, "waited out the poll timeout on a dead session")
+
+    def test_output_arriving_mid_wait_is_delivered(self):
+        def produce(s):
+            s._reads.append(b"late\r\n")
+        sess = _DeliverySession(on_wait=produce)
+        h = _delivery_handler(sess)
+        with unittest.mock.patch.object(server, "POLL_TIMEOUT", 30):
+            h._output()
+        body = self._body(h)
+        self.assertEqual(base64.b64decode(body["data"]), b"late\r\n")
+        self.assertTrue(body["alive"])
+
+    def test_hangup_during_reply_gives_the_bytes_back(self):
+        planted = b"do-not-lose-me"
+        sess = _DeliverySession(reads=[planted])
+        h = _delivery_handler(sess, wfile=_Wfile(
+            fail_on=[base64.b64encode(planted)]))
+        with self.assertRaises(BrokenPipeError):
+            h._output()
+        self.assertEqual(sess.unread_calls, [planted],
+                         "drained output lost when the reply failed")
+
+    def test_client_gone_before_read_drains_nothing(self):
+        sess = _DeliverySession(reads=[b"keep"])
+        h = _delivery_handler(sess)
+        h._client_gone = lambda: True
+        h._output()
+        self.assertEqual(sess._reads, [b"keep"], "read into a dead socket")
+        self.assertEqual(h.wfile.chunks, [])
+
+
+class TestStreamEdges(unittest.TestCase):
+    """/api/stream beyond the happy path: the heartbeat that keeps a quiet
+    stream open through proxies, and the final output of a session that
+    ends - delivered before 'end', and given back if that write fails."""
+
+    def test_quiet_stream_sends_keepalive(self):
+        clock = [1000.0]
+        fake_time = type("T", (), {"time": staticmethod(lambda: clock[0])})
+
+        def tick(s):
+            # Each park lasts the full keepalive interval; stop after
+            # two so the loop ends (the session then "dies").
+            clock[0] += 16
+            if s.waits >= 2:
+                s.alive = False
+        sess = _DeliverySession(on_wait=tick)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        with unittest.mock.patch.object(server, "time", fake_time):
+            h._stream_session(sess)
+        text = h.wfile.text()
+        self.assertEqual(text.count(": keepalive"), 1,
+                         "one heartbeat per silent interval; got " + repr(text))
+        self.assertLess(text.index(": keepalive"), text.index("event: end"))
+
+    def test_final_output_is_sent_before_end(self):
+        def die(s):
+            s._reads.append(b"logout\r\n")
+            s.alive = False
+        sess = _DeliverySession(on_wait=die)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        h._stream_session(sess)
+        text = h.wfile.text()
+        marker = base64.b64encode(b"logout\r\n").decode("ascii")
+        self.assertIn(marker, text, "the last words of the session were dropped")
+        self.assertLess(text.index(marker), text.index("event: end"))
+        self.assertEqual(sess.unread_calls, [])
+
+    def test_final_output_write_failure_gives_bytes_back(self):
+        tail = b"bye"
+        def die(s):
+            s._reads.append(tail)
+            s.alive = False
+        sess = _DeliverySession(on_wait=die)
+        h = _delivery_handler(sess, "/api/stream?session_id=x",
+                              wfile=_Wfile(fail_on=[base64.b64encode(tail)]))
+        h._stream_session(sess)
+        self.assertEqual(sess.unread_calls, [tail])
+        self.assertNotIn("event: end", h.wfile.text(),
+                         "'end' written after the tail failed to go out")
+
+
+class TestReadLoopDrainsOnStop(unittest.TestCase):
+    """What the remote printed just before the session stopped (a logout
+    message, a shell's exit sequences) is still in the PTY when the loop
+    exits; the drain in _read_loop's finally must deliver it."""
+
+    def test_pending_pty_output_is_drained_after_stop(self):
+        import pty
+        master, slave = pty.openpty()
+        pid = os.fork()
+        if pid == 0:
+            os.close(master)
+            try:
+                os.write(slave, b"last words\r\n")
+                time.sleep(30)
+            finally:
+                os._exit(0)
+        os.close(slave)
+        s = server.SSHSession.__new__(server.SSHSession)
+        s.master_fd = master
+        s.pid = pid
+        s.id = "test-drain"
+        s.alive = False          # stopped before the loop ever read
+        s.is_background = False
+        s.auth_failed = False
+        s.output_buf = b""
+        s.buf_lock = threading.Lock()
+        s._exit_status = None
+        s._reap_lock = threading.Lock()
+        s._child_reaped = False
+        s._signal = lambda: None
+        s._record = lambda *a: None
+        try:
+            # Let the child's write land in the PTY first.
+            deadline = time.time() + 5
+            import select as _select
+            while time.time() < deadline:
+                if _select.select([master], [], [], 0.05)[0]:
+                    break
+            t = threading.Thread(target=s._read_loop, daemon=True)
+            t.start()
+            t.join(15)
+            self.assertFalse(t.is_alive(), "_read_loop did not exit")
+            self.assertIn(b"last words", s.output_buf,
+                          "output pending at stop was not drained")
+            self.assertTrue(s.output_buf.endswith(server.TERM_RESET),
+                            "terminal reset must come after the drained tail")
+            self.assertIsNotNone(s._exit_status, "child not reaped")
+        finally:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+            except (OSError, ChildProcessError):
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()
