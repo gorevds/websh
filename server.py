@@ -4017,6 +4017,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             getattr(self, name)()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            # The client went away mid-request: a closed tab, a cancelled
+            # upload, a long-poll the browser dropped (_output re-raises
+            # after unread() on purpose). Routine, not a server fault -
+            # it was logged as "[ERROR] unhandled error", and a 500 was
+            # then written into the dead socket.
+            _log("INFO", "client went away during {} for {}: {}".format(
+                name, self._client_ip(), type(e).__name__))
         except Exception as e:
             # Last line of defence. An exception escaping a handler used
             # to reach the worker's handle_error: traceback on stderr,

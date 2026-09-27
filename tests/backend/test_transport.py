@@ -2926,5 +2926,42 @@ class TestReadLoopDrainsOnStop(unittest.TestCase):
                 pass
 
 
+class TestDispatchClientGone(unittest.TestCase):
+    """A client dropping mid-request is routine: it must not be logged as
+    an unhandled server error, and no 500 goes into the dead socket. A
+    genuine handler bug still is both."""
+
+    def _handler(self, exc):
+        h = server.Handler.__new__(server.Handler)
+        h.path = "/api/output?session_id=x"
+        h.headers = {}
+        h.client_address = ("203.0.113.5", 1)
+        h.replies = []
+        h._json = lambda obj, status=200: h.replies.append(status)
+        h._resolve_action = lambda: "output"
+        def boom():
+            raise exc
+        h._output = boom
+        return h
+
+    def _run(self, exc):
+        h = self._handler(exc)
+        with unittest.mock.patch.object(server, "_log") as log:
+            h._dispatch({"output": "_output"})
+        return h, [c.args[0] for c in log.call_args_list]
+
+    def test_client_gone_is_info_and_no_reply(self):
+        for exc in (BrokenPipeError(), ConnectionResetError(),
+                    ConnectionAbortedError()):
+            h, levels = self._run(exc)
+            self.assertNotIn("ERROR", levels, type(exc).__name__)
+            self.assertEqual(h.replies, [], "wrote a 500 into a dead socket")
+
+    def test_real_bug_still_logged_and_answered(self):
+        h, levels = self._run(KeyError("oops"))
+        self.assertIn("ERROR", levels)
+        self.assertEqual(h.replies, [500])
+
+
 if __name__ == "__main__":
     unittest.main()
