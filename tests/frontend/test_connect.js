@@ -959,6 +959,109 @@ test('SSE closed for good (non-200 on reconnect) is recovered, not left spinning
   cleanup(env);
 });
 
+// One stream refused before its first event (409 while the old stream
+// held the slot; a deploy restarting the backend) switched the pane to
+// long-poll for good: in production a pane polled for hours, a request
+// per output chunk. It now asks over HTTP and goes back to the stream.
+function sseHarness(win) {
+  const sources = [];
+  win.EventSource = class {
+    constructor(url) { this.url = url; this.readyState = 0; this.l = {}; sources.push(this); }
+    addEventListener(ev, fn) { this.l[ev] = fn; }
+    set onerror(fn) { this._err = fn; }
+    close() { this.readyState = 2; this.closed = true; }
+  };
+  return sources;
+}
+function ssePane(win, sid) {
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = sid; p.polling = true; p.host = 'h'; p.outCursor = 0;
+  return p;
+}
+function sseStop(win, p) {
+  p.polling = false;
+  try { win.clearTimeout(p.sseFirstMsgTimer); } catch (e) {}
+}
+
+test('SSE refused before its first event goes back to the stream, not to long-poll', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-early');
+  win.nextRetryDelay = () => 1;
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  win.streamOutput(p);
+  sources[0].readyState = 2;            // 409: EventSource gives up at once
+  sources[0]._err();
+  await sleep(60);
+  ok(!p.sseDisabled, 'SSE not disabled by one early error');
+  ok(sources.length === 2 && !sources[1].closed, 'back on a fresh EventSource; sources=' + sources.length);
+  ok(log.filter(x => x.startsWith('output')).length === 1,
+     'one HTTP check, not a poll loop; got ' + log.join(','));
+  // A body event on the new stream resets the early-failure count.
+  sources[1].l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});
+  ok(p.sseEarlyFails === 0, 'count reset by a real frame; got ' + p.sseEarlyFails);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('SSE failing before the first event 3 times in a row falls back to long-poll', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-3x');
+  win.nextRetryDelay = () => 1;
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  win.streamOutput(p);
+  for (let i = 0; i < 3; i++) {
+    const es = sources[sources.length - 1];
+    es.readyState = 2; es._err();
+    await sleep(40);
+  }
+  ok(p.sseDisabled === true && p.sseDisabledReason === 'errors',
+     'disabled after 3 early failures; got ' + p.sseDisabled + '/' + p.sseDisabledReason);
+  ok(sources.length === 3, 'no 4th stream; got ' + sources.length);
+  const before = log.length;
+  await sleep(40);
+  ok(log.length > before, 'long-poll is running');
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('a pane polling because SSE kept failing tries the stream again later', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-retry');
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  p.sseDisabled = true; p.sseDisabledReason = 'errors'; p.sseDisabledAt = Date.now() - 10 * 60000;
+  win.pollOutput(p);
+  await sleep(40);
+  ok(!p.sseDisabled && sources.length === 1, 'back on SSE after the retry interval; sources=' + sources.length);
+  ok(p.sseEarlyFails === 2, 'one more early failure sends it straight back; got ' + p.sseEarlyFails);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('a pane behind a buffering proxy stays on long-poll (no 5 s freezes)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'sse-buf');
+  const log = [];
+  outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
+  p.sseDisabled = true; p.sseDisabledReason = 'buffering'; p.sseDisabledAt = Date.now() - 60 * 60000;
+  win.pollOutput(p);
+  await sleep(40);
+  ok(p.sseDisabled && sources.length === 0, 'no stream re-probe; sources=' + sources.length);
+  sseStop(win, p);
+  cleanup(env);
+});
+
 test("SSE 'open' event does not mark body as arrived", async () => {
   const plan = [{action: 'config', response: {restrict_hosts: false, connections: []}}];
   const env = await mkEnv(plan); const win = env.win;
@@ -6010,6 +6113,52 @@ test('input: a network error is not retried (the write may have landed)', async 
   await sleep(50);
   ok(st.applied === 'y', 'no resend after a network error, later keys still flow; got ' + JSON.stringify(st.applied));
   ok(st.calls === 2, 'two requests; got ' + st.calls);
+  cleanup(env);
+});
+
+test('input: 404 (session gone) reconnects the pane instead of dropping keys silently', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-new', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-dead'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  inputServer(win, {delay: () => 3, reply: () => ({status: 404})});
+  win.queueInput(p, 'ls\r');
+  for (let i = 0; i < 50 && !env.log.some(e => e.action === 'connect'); i++) await sleep(10);
+  ok(env.log.some(e => e.action === 'connect'), 'reconnect started; log=' + env.log.map(e => e.action).join(','));
+  ok(p.sid !== 'sid-dead', 'dead sid dropped; got ' + p.sid);
+  p.polling = false;
+  cleanup(env);
+});
+
+test('keepalive: 404 (session gone) reconnects instead of pinging a dead session forever', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'connect', response: {session_id: 'sid-new2', alive: true}},
+    {action: 'resize', response: {ok: true}},
+    {action: 'output', response: {data: '', alive: true}},
+  ]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-dead2'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  inputServer(win, {delay: () => 3, reply: () => ({status: 404})});
+  const realSI = win.setInterval;
+  let tick = null;
+  win.setInterval = (fn, ms) => { if (ms === 30000) { tick = fn; return 1; } return realSI(fn, ms); };
+  win.startKeepalive(p);
+  win.setInterval = realSI;
+  ok(typeof tick === 'function', 'keepalive armed');
+  tick();
+  for (let i = 0; i < 50 && !env.log.some(e => e.action === 'connect'); i++) await sleep(10);
+  ok(env.log.some(e => e.action === 'connect'), 'reconnect started; log=' + env.log.map(e => e.action).join(','));
+  ok(p.sid !== 'sid-dead2', 'dead sid dropped; got ' + p.sid);
+  p.polling = false;
   cleanup(env);
 });
 

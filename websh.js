@@ -249,6 +249,21 @@ const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 10000, 15000];
 // assume an upstream proxy is buffering it and silently fall back to
 // /api/output long-polling for the rest of the session.
 const SSE_FIRST_MSG_TIMEOUT_MS = 5000;
+// A stream refused or dropped before its first event (409 while the old
+// stream still holds the slot, 503 busy, a backend restart, a network
+// blip) says nothing about whether SSE works here. Only this many in a
+// row turn it off for the pane, and even then a long-polling pane tries
+// the stream again after SSE_RETRY_MS. A proxy that BUFFERS the stream
+// (the first-message timer) is different: that is how the path is, and
+// re-probing it would freeze the output for 5 s each time.
+const SSE_EARLY_FAIL_LIMIT = 3;
+const SSE_RETRY_MS = 120000;
+
+function disableSse(p, reason) {
+  p.sseDisabled = true;
+  p.sseDisabledReason = reason;
+  p.sseDisabledAt = Date.now();
+}
 // Hard cap on a single download (bytes). Server enforces this too via
 // MAX_DOWNLOAD_SIZE, but the client also bails early so a misconfigured
 // or trusted-but-misbehaving server can't OOM the tab. 2 GB matches the
@@ -892,9 +907,24 @@ function startKeepalive(p) {
   // as long as any tab is open. When the tab closes the interval stops
   // and the server's idle timeout reaps the PTY normally.
   p.keepaliveTimer = setInterval(() => {
-    if (p.sid) api('input', {body: {session_id: p.sid, data: ''}}).catch(() => {});
+    let sid = p.sid;
+    if (sid) api('input', {body: {session_id: sid, data: ''}})
+      .then(r => inputSaysSessionGone(p, r, sid)).catch(() => {});
   }, 30000);
 }
+// /api/input answering 404 is the server saying this session is gone
+// (idle-expired, backend restarted). Act on it as the output loop would
+// - persistent panes re-attach, others reconnect: a background tab whose
+// stream had stalled kept pinging a dead session once a minute for hours,
+// and keys typed into it vanished without a word.
+function inputSaysSessionGone(p, r, sid) {
+  if (r && r._status === 404 && r.error && p.sid === sid) {
+    handleOutputPayload(p, r, sid);
+    return true;
+  }
+  return false;
+}
+
 function stopKeepalive(p) {
   if(p.keepaliveTimer){ clearInterval(p.keepaliveTimer); p.keepaliveTimer=null }
 }
@@ -1846,7 +1876,7 @@ function streamOutput(p) {
   try { es = new EventSource(url); }
   catch (e) {
     console.log('SSE: EventSource construction failed, using long-poll');
-    p.sseDisabled = true;
+    disableSse(p, 'unsupported');
     pollOutput(p);
     return;
   }
@@ -1861,7 +1891,7 @@ function streamOutput(p) {
     if (!p.sseGotAnyMessage && p.eventSource === es) {
       console.log('SSE: no event in', SSE_FIRST_MSG_TIMEOUT_MS,
                   'ms, falling back to long-poll');
-      p.sseDisabled = true;
+      disableSse(p, 'buffering');
       closeStream(p);
       if (p.polling) pollOutput(p);
     }
@@ -1882,6 +1912,7 @@ function streamOutput(p) {
   // retry clock should only reset once a real frame proves the channel.
   let onBodyEvent = () => {
     p.sseGotAnyMessage = true;
+    p.sseEarlyFails = 0;
     clearRetryClock(p);
   };
   // EventSource fires onmessage for unnamed events; the ': ok' comment
@@ -1906,10 +1937,23 @@ function streamOutput(p) {
     // a while, then escalate. If we never got a message at all, treat
     // it as "this transport doesn't work here" and switch to long-poll.
     if (!p.sseGotAnyMessage) {
-      console.log('SSE: error before first event, falling back to long-poll');
-      p.sseDisabled = true;
       closeStream(p);
-      if (p.polling) pollOutput(p);
+      p.sseEarlyFails = (p.sseEarlyFails || 0) + 1;
+      if (p.sseEarlyFails >= SSE_EARLY_FAIL_LIMIT) {
+        console.log('SSE: failed before the first event', p.sseEarlyFails,
+                    'times in a row, using long-poll');
+        disableSse(p, 'errors');
+        if (p.polling) pollOutput(p);
+        return;
+      }
+      // Used to switch the pane to long-poll for good on the first such
+      // error - one 409 during a reconnect, or a deploy restarting the
+      // backend, left panes polling (a request per output chunk) for
+      // hours. Ask over plain HTTP, then come back to the stream.
+      let d = nextRetryDelay(p);
+      if (d < 0) { transportFatal(p, new Error('SSE reconnect budget exhausted')); return; }
+      setReconnecting(p, true);
+      setTimeout(() => recoverClosedStream(p, mySid), d);
       return;
     }
     let d = nextRetryDelay(p);
@@ -1933,7 +1977,20 @@ function pollOutput(p) {
     if (isTransientOutputReply(r)) throw new Error(r.error);
     clearRetryClock(p);
     if (handleOutputPayload(p, r, mySid)) return;
-    if(p.polling) pollOutput(p);
+    if (!p.polling || p.sid !== mySid) return;
+    // Polling because the stream kept failing, not because the path
+    // buffers it: conditions change (a restart, another network), so
+    // try the stream again now and then. One more early failure puts
+    // the pane straight back here.
+    if (p.sseDisabled && p.sseDisabledReason === 'errors' &&
+        typeof EventSource !== 'undefined' &&
+        Date.now() - (p.sseDisabledAt || 0) >= SSE_RETRY_MS) {
+      p.sseDisabled = false;
+      p.sseEarlyFails = SSE_EARLY_FAIL_LIMIT - 1;
+      streamOutput(p);
+      return;
+    }
+    pollOutput(p);
   }).catch(e => {
     if (p.sid !== mySid) return;        // replaced meanwhile: not our loop
     let d = nextRetryDelay(p);
@@ -2013,6 +2070,7 @@ function sendInputBatch(p, sid, d, attempt) {
   // turns up later changes nothing.
   let stall = setTimeout(release, INPUT_STALL_MS);
   api('input',{body:{session_id:sid,data:d}}).then(r => {
+    if (!settled && inputSaysSessionGone(p, r, sid)) { release(); return; }
     // Replies that prove the bytes never reached the PTY (the worker
     // pool was full, a rate limit, the proxy could not reach the
     // backend): resend the same batch, ahead of anything typed since.
