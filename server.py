@@ -4750,6 +4750,14 @@ class Handler(BaseHTTPRequestHandler):
             while True:
                 if self._client_gone():
                     return
+                if _shutting_down:
+                    # Transient for the client (it retries the SAME
+                    # session); the restarted server then says 404 and
+                    # the pane re-attaches. Not {"alive": false}, which
+                    # means the remote shell itself ended.
+                    self._json({"error": "server restarting",
+                                "code": "restarting"}, 503)
+                    return
                 extra = {}
                 if cursor is None:
                     data = session.read()
@@ -4777,6 +4785,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise
                     return
                 if not session.alive:
+                    if _shutting_down:
+                        continue    # answered as 503 at the loop top
                     body = {"data": "", "alive": False,
                             "auth_failed": session.auth_failed}
                     body.update(extra)
@@ -4961,6 +4971,13 @@ class Handler(BaseHTTPRequestHandler):
                     if data and cursor is None:
                         session.unread(data)
                     return
+                if _shutting_down:
+                    # Drop the connection without 'end': the client sees
+                    # a broken stream, the restarted server answers 404,
+                    # and the pane re-attaches (tmux) or reconnects. Also
+                    # before any read - the PTY teardown's terminal reset
+                    # must not reach a screen that is about to resume.
+                    return
                 if gen is not None and getattr(session, "_stream_gen", 0) != gen:
                     # A newer stream for this session asked for the slot:
                     # this connection is the stale one. Nothing was read
@@ -5018,6 +5035,8 @@ class Handler(BaseHTTPRequestHandler):
                 session.wait_for_data(self.connection, timeout,
                                       selector=sel)
 
+            if _shutting_down:
+                return      # see the check at the top of the loop
             # Drain any remaining buffered output before sending 'end'.
             head = "event: data\n"
             tbody = {"alive": False, "auth_failed": session.auth_failed}
@@ -5866,6 +5885,14 @@ def _warn_max_threads_misconfig():
             MAX_THREADS))
 
 
+# Set when the server is going down (deploy, systemctl restart). Sessions
+# then die only because websh restarts, not because the remote shell
+# exited: stream and long-poll readers must not report that as the end of
+# the session, or every pane - persistent ones included, whose tmux lives
+# on - sits at "Disconnected" after each deploy. See _stream_session/_output.
+_shutting_down = False
+
+
 def _close_all_sessions():
     """Snapshot the session registry under the lock, clear it, then close
     each session OUTSIDE the lock — close() runs SIGTERM/WNOHANG/SIGKILL/
@@ -5984,6 +6011,8 @@ def main():
 
     stop_event.wait()
     _log("INFO", "shutting down")
+    global _shutting_down
+    _shutting_down = True
     _close_all_sessions()
     server.shutdown()
     server.server_close()

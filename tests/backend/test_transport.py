@@ -2935,6 +2935,69 @@ class TestStreamEdges(unittest.TestCase):
                          "'end' written after the tail failed to go out")
 
 
+class TestShutdownIsNotSessionEnd(unittest.TestCase):
+    """A websh restart (every deploy) closes all sessions. That must not
+    reach the client as "the remote shell ended" ('end' / alive:false):
+    it left every pane at Disconnected, persistent ones included, whose
+    tmux was still running. A dropped stream / a 503 instead lets the
+    client find the session gone on the new server and re-attach."""
+
+    def test_stream_drops_without_end_when_shutdown_starts_mid_wait(self):
+        def shutdown(s):
+            server._shutting_down = True     # main() sets it, then close()
+            s._reads.append(server.TERM_RESET)
+            s.alive = False
+        sess = _DeliverySession(on_wait=shutdown)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        try:
+            h._stream_session(sess)
+        finally:
+            server._shutting_down = False
+        text = h.wfile.text()
+        self.assertNotIn("event: end", text)
+        self.assertNotIn(base64.b64encode(server.TERM_RESET).decode(), text,
+                         "the PTY teardown's screen reset reached the client")
+
+    def test_stream_race_alive_false_seen_before_flag_check(self):
+        # The loop read and found the session dead in the same round the
+        # flag went up: the post-loop check still suppresses 'end'.
+        class _Sess(_DeliverySession):
+            def read(self):
+                server._shutting_down = True
+                self.alive = False
+                return b""
+        sess = _Sess()
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        try:
+            h._stream_session(sess)
+        finally:
+            server._shutting_down = False
+        self.assertNotIn("event: end", h.wfile.text())
+
+    def test_long_poll_answers_transient_503(self):
+        def shutdown(s):
+            server._shutting_down = True
+            s.alive = False
+        sess = _DeliverySession(on_wait=shutdown)
+        h = _delivery_handler(sess)
+        try:
+            with unittest.mock.patch.object(server, "POLL_TIMEOUT", 5):
+                h._output()
+        finally:
+            server._shutting_down = False
+        body = json.loads(b"".join(h.wfile.chunks).decode("utf-8"))
+        self.assertEqual(h.status, [503])
+        self.assertEqual(body.get("code"), "restarting")
+        self.assertNotIn("alive", body)
+
+    def test_a_real_exit_still_ends_the_stream(self):
+        def exited(s):
+            s.alive = False
+        sess = _DeliverySession(on_wait=exited)
+        h = _delivery_handler(sess, "/api/stream?session_id=x")
+        h._stream_session(sess)
+        self.assertIn("event: end", h.wfile.text())
+
 class TestReadLoopDrainsOnStop(unittest.TestCase):
     """What the remote printed just before the session stopped (a logout
     message, a shell's exit sequences) is still in the PTY when the loop
