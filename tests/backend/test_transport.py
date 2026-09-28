@@ -403,10 +403,78 @@ class TestHTTPApi(LiveServerCase):
             with server.sessions_lock:
                 server.sessions.pop(sid, None)
 
+    def test_stream_takeover_replaces_a_stale_holder(self):
+        """A second /api/stream for a session whose stream is parked (the
+        browser's old connection died without a FIN: laptop asleep,
+        network switched) takes the slot over at once instead of 409 -
+        the 409 made the client abandon SSE for long-polling. The old
+        connection is ended by the server."""
+        import http.client
+        import socket as _socket
+        sid = str(uuid.uuid4())
+
+        class Sess(_FakeNotifyMixin):
+            def __init__(self):
+                self.alive = True
+                self.auth_failed = False
+                self.last_activity = 0
+            def read(self):
+                return b""
+
+        with server.sessions_lock:
+            server.sessions[sid] = Sess()
+        try:
+            s1 = _socket.create_connection(("127.0.0.1", self.port), timeout=5)
+            s1.sendall(("GET /api/stream?session_id=" + sid + " HTTP/1.1\r\n"
+                        "Host: 127.0.0.1\r\n\r\n").encode("ascii"))
+            buf = b""
+            s1.settimeout(0.3)
+            deadline = time.time() + 3
+            while time.time() < deadline and b"event: data" not in buf:
+                try:
+                    chunk = s1.recv(256)
+                    if not chunk:
+                        break
+                    buf += chunk
+                except _socket.timeout:
+                    pass
+            self.assertIn(b"200", buf.split(b"\r\n", 1)[0])
+
+            t0 = time.time()
+            c2 = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+            c2.request("GET", "/api/stream?session_id=" + sid)
+            r2 = c2.getresponse()
+            took = time.time() - t0
+            self.assertEqual(r2.status, 200, "the newer stream takes over")
+            self.assertLess(took, 1.5, "takeover waited out the deadline")
+
+            # The stale connection is closed by the server.
+            s1.settimeout(3)
+            closed = False
+            end = time.time() + 3
+            try:
+                while time.time() < end:
+                    if not s1.recv(1024):
+                        closed = True
+                        break
+            except OSError:
+                closed = True
+            self.assertTrue(closed, "the superseded stream was not ended")
+            with server.sessions_lock:
+                server.sessions[sid].alive = False
+            r2.read()
+            c2.close()
+            s1.close()
+        finally:
+            with server.sessions_lock:
+                server.sessions.pop(sid, None)
+
     def test_stream_rejects_duplicate_with_409(self):
-        """A second /api/stream for an already-streaming session must
-        be rejected with 409 instead of silently racing two destructive
-        readers for the same buffer. The first stream is unaffected."""
+        """A holder that cannot step aside (blocked inside the session,
+        here a read() that waits on a gate) keeps the slot: after the
+        takeover deadline the second /api/stream is rejected with 409
+        instead of racing two readers or deadlocking the client. The
+        first stream is unaffected."""
         import http.client
         import socket as _socket
         import threading as _threading
@@ -454,7 +522,7 @@ class TestHTTPApi(LiveServerCase):
                 "first stream must respond 200; got: " + repr(buf[:80]))
             # First handler is now parked in read()/wait; _stream_active=True.
 
-            # Second stream: should be rejected immediately with 409.
+            # Second stream: rejected with 409 once the deadline passes.
             c2 = http.client.HTTPConnection("127.0.0.1", self.port,
                                             timeout=3)
             c2.request("GET", "/api/stream?session_id=" + sid)

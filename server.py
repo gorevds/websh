@@ -1935,6 +1935,9 @@ class SSHSession(object):
     # reads them and would AttributeError on a stripped instance.
     _data_event = None
     _stream_active = False
+    # Bumped by a new /api/stream that finds the slot held: the holder
+    # sees its generation is stale and steps aside (see _stream).
+    _stream_gen = 0
     # Invariant: master_fd ∈ {a valid open fd, -1}. The sentinel -1 (rather
     # than None) means "closed / never opened" and lets master_fd-touching
     # methods early-return via `if self.master_fd < 0: return` instead of
@@ -4824,16 +4827,22 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": "forbidden"}, 403)
                 return
         # Acquire the per-session stream slot under sessions_lock. A second
-        # /api/stream for the same session is mostly the *legitimate*
-        # client reconnecting (visibility resume, network blip, EventSource
-        # auto-retry); the previous holder may not have observed the FIN
-        # yet, especially through nginx. Wait briefly (~250 ms) for the
-        # previous holder's `finally` to release the slot — most races
-        # resolve in single-digit ms. After the deadline, fall back to a
-        # 409 so a truly stuck holder doesn't deadlock the client.
-        deadline = time.time() + 0.25
+        # /api/stream for the same session is the client reconnecting
+        # (visibility resume, network blip, EventSource auto-retry), and
+        # the NEWEST stream wins: the previous holder may be writing into
+        # a connection that died without a FIN (laptop asleep, network
+        # switched), which TCP only notices minutes later. It used to keep
+        # the slot all that time and every reconnect got a 409 - and the
+        # client then gave up on SSE for good. Bump the generation and wake
+        # the holder; it steps aside before its next read (output is read
+        # by cursor, so nothing is lost) and releases the slot in ms. A
+        # holder blocked inside a write can't look; after the deadline a
+        # 409 still keeps a truly stuck one from deadlocking the client.
+        deadline = time.time() + 2.0
         session = None
         duplicate = False
+        took_over = False
+        my_gen = 0
         while True:
             with sessions_lock:
                 session = sessions.get(sid)
@@ -4849,7 +4858,12 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 if not session._stream_active:
                     session._stream_active = True
+                    my_gen = getattr(session, "_stream_gen", 0)
                     break
+                if not took_over:
+                    session._stream_gen = getattr(session, "_stream_gen", 0) + 1
+                    took_over = True
+                    session._signal()
             if time.time() >= deadline:
                 duplicate = True
                 break
@@ -4862,7 +4876,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         try:
-            self._stream_session(session, self._output_cursor(params))
+            self._stream_session(session, self._output_cursor(params),
+                                 gen=my_gen)
         finally:
             # Release the per-session stream slot regardless of how the
             # body exited (clean end, BrokenPipe, exception). Done under
@@ -4871,7 +4886,7 @@ class Handler(BaseHTTPRequestHandler):
             with sessions_lock:
                 session._stream_active = False
 
-    def _stream_session(self, session, cursor=None):
+    def _stream_session(self, session, cursor=None, gen=None):
         """Body of /api/stream once the per-session slot is held.
 
         With a cursor (current clients) output is read with read_since():
@@ -4945,6 +4960,11 @@ class Handler(BaseHTTPRequestHandler):
                 if self._client_gone():
                     if data and cursor is None:
                         session.unread(data)
+                    return
+                if gen is not None and getattr(session, "_stream_gen", 0) != gen:
+                    # A newer stream for this session asked for the slot:
+                    # this connection is the stale one. Nothing was read
+                    # this round, so nothing is lost.
                     return
                 extra = {}
                 if cursor is None:
