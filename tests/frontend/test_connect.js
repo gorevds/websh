@@ -170,6 +170,7 @@ const EXPOSE = `
     get: () => currentConnectRun,
     set: v => { currentConnectRun = v; },
     configurable: true});
+  Object.defineProperty(window, 'INPUT_STALL_MS', {get: () => INPUT_STALL_MS, set: v => { INPUT_STALL_MS = v; }, configurable: true});
   Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
   Object.defineProperty(window, '_idbHasKeyCache', {
@@ -5931,6 +5932,101 @@ test('queueInput still sends a large-but-under-cap paste', async () => {
   await sleep(40);
   const sent = log.filter(e => e.action === 'input' && e.body && e.body.session_id === 'sid-ok');
   ok(sent.length === 1, '2 MB paste sent; got ' + sent.length);
+  cleanup(env);
+});
+
+// Typed text arrived scrambled in production ("ecoh" for "echo"): every
+// 10ms batch was its own /api/input, fired without waiting, and requests
+// in flight together reach the PTY in whatever order the network and the
+// backend's threads deliver them. The model below applies each request
+// after a random "network" delay; only strict one-at-a-time sending keeps
+// the order.
+function inputServer(win, opts) {
+  opts = opts || {};
+  const st = {applied: '', inflight: 0, maxInflight: 0, bodies: [], calls: 0};
+  const base = win.fetch;
+  win.fetch = function(url, init) {
+    const u = new URL(url, 'http://x/');
+    if (u.searchParams.get('action') !== 'input') return base(url, init);
+    const body = JSON.parse(init.body);
+    st.calls++; st.inflight++; st.maxInflight = Math.max(st.maxInflight, st.inflight);
+    const n = st.calls;
+    const delay = opts.delay ? opts.delay(n) : 1 + Math.floor(Math.random() * 25);
+    return new Promise((resolve, reject) => setTimeout(() => {
+      st.inflight--;
+      const r = opts.reply ? opts.reply(n, body) : null;
+      if (r === 'neterr') { reject(new TypeError('Failed to fetch')); return; }
+      if (r === 'hang') { st.inflight++; return; }
+      if (r && r.status) {
+        resolve({status: r.status, statusText: '', json: () => Promise.resolve({error: 'busy'})});
+        return;
+      }
+      st.applied += body.data; st.bodies.push(body.data);
+      resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true})});
+    }, delay));
+  };
+  return st;
+}
+
+test('input: keystrokes reach the PTY in the order typed, one request at a time', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-order';
+  const st = inputServer(win);
+  const text = 'echo the quick brown fox jumps over the lazy dog; ls -la /tmp\r';
+  for (const c of text) { win.queueInput(p, c); await sleep(Math.random() < 0.5 ? 0 : 12); }
+  for (let i = 0; i < 200 && st.applied.length < text.length; i++) await sleep(10);
+  ok(st.applied === text, 'order kept; got ' + JSON.stringify(st.applied));
+  ok(st.maxInflight === 1, 'never more than one input in flight; got ' + st.maxInflight);
+  ok(st.calls < text.length, 'keys typed during a request are batched; ' + st.calls + ' requests for ' + text.length + ' keys');
+  cleanup(env);
+});
+
+test('input: a busy (503) reply resends the same batch ahead of later keys', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-busy';
+  const st = inputServer(win, {delay: () => 5, reply: n => n === 1 ? {status: 503} : null});
+  win.queueInput(p, 'ab');
+  await sleep(20);
+  win.queueInput(p, 'cd');                 // typed while 'ab' waits to be resent
+  for (let i = 0; i < 100 && st.applied.length < 4; i++) await sleep(10);
+  ok(st.applied === 'abcd', 'resent batch first, nothing lost or doubled; got ' + JSON.stringify(st.applied));
+  cleanup(env);
+});
+
+test('input: a network error is not retried (the write may have landed)', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-neterr';
+  const st = inputServer(win, {delay: () => 5, reply: n => n === 1 ? 'neterr' : null});
+  win.queueInput(p, 'x');
+  await sleep(30);
+  win.queueInput(p, 'y');
+  for (let i = 0; i < 100 && st.applied.length < 1; i++) await sleep(10);
+  await sleep(50);
+  ok(st.applied === 'y', 'no resend after a network error, later keys still flow; got ' + JSON.stringify(st.applied));
+  ok(st.calls === 2, 'two requests; got ' + st.calls);
+  cleanup(env);
+});
+
+test('input: a request that never answers does not freeze typing', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.INPUT_STALL_MS = 80;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 'sid-hang';
+  const st = inputServer(win, {delay: () => 5, reply: n => n === 1 ? 'hang' : null});
+  win.queueInput(p, 'a');
+  await sleep(20);
+  win.queueInput(p, 'b');
+  await sleep(40);
+  ok(st.calls === 1, 'waits for the first while it is merely slow; got ' + st.calls);
+  for (let i = 0; i < 50 && st.applied !== 'b'; i++) await sleep(10);
+  ok(st.applied === 'b', 'typing resumes after the stall timeout; got ' + JSON.stringify(st.applied));
   cleanup(env);
 });
 

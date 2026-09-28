@@ -381,7 +381,7 @@ function createPane(container) {
   let p = {
     id:id, el:el, term:term, fitAddon:fit, searchAddon:search,
     sid:null, connecting:false, polling:false, pollRetries:0,
-    inputQueue:[], flushTimer:null, keepaliveTimer:null,
+    inputQueue:[], flushTimer:null, inputInFlight:null, keepaliveTimer:null,
     // Remote working directory, learned from OSC 7 when the shell emits
     // it. '' means unknown — the file browser then asks the server,
     // which can answer for tmux panes. See the OSC 7 handler below.
@@ -1967,23 +1967,66 @@ function recoverClosedStream(p, mySid) {
   });
 }
 
+// Keystrokes leave in order: at most ONE /api/input per pane is in
+// flight, and whatever is typed meanwhile goes out as the next batch.
+// Firing a request per 10ms batch without waiting let them overtake
+// each other - over HTTP/2 a burst reaches the proxy together, fans out
+// to the backend on separate connections, and its worker threads write
+// to the PTY in whatever order they are scheduled: typed text arrived
+// scrambled ("ecoh" for "echo") on any link with jitter.
+let INPUT_STALL_MS = 10000;     // a hung request must not freeze typing
+const INPUT_RETRIES = 3;
+
 function queueInput(p, data) {
   p.inputQueue.push(data);
-  if(!p.flushTimer) p.flushTimer = setTimeout(() => {
-    p.flushTimer=null;
-    if(!p.sid||!p.inputQueue.length) return;
-    let d=p.inputQueue.join(''); p.inputQueue=[];
-    // Only a large paste can approach the server body cap; for those, check
-    // the real UTF-8 body size and surface an error instead of a silent 400.
-    if(d.length > 1048576){
-      let body=JSON.stringify({session_id:p.sid,data:d});
-      if(new TextEncoder().encode(body).length > MAX_INPUT_BODY){
-        showErr('Paste too large to send (server limit ~8 MB) — not sent.');
-        return;
-      }
+  if(!p.flushTimer && !p.inputInFlight) p.flushTimer = setTimeout(() => flushInput(p), 10);
+}
+
+function flushInput(p) {
+  p.flushTimer = null;
+  if(p.inputInFlight || !p.sid || !p.inputQueue.length) return;
+  let d=p.inputQueue.join(''); p.inputQueue=[];
+  // Only a large paste can approach the server body cap; for those, check
+  // the real UTF-8 body size and surface an error instead of a silent 400.
+  if(d.length > 1048576){
+    let body=JSON.stringify({session_id:p.sid,data:d});
+    if(new TextEncoder().encode(body).length > MAX_INPUT_BODY){
+      showErr('Paste too large to send (server limit ~8 MB) — not sent.');
+      return;
     }
-    api('input',{body:{session_id:p.sid,data:d}}).catch(() => {});
-  }, 10);
+  }
+  sendInputBatch(p, p.sid, d, 0);
+}
+
+function sendInputBatch(p, sid, d, attempt) {
+  let token = {};
+  p.inputInFlight = token;
+  let settled = false;
+  let release = () => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(stall);
+    if (p.inputInFlight === token) p.inputInFlight = null;
+    if (p.inputQueue.length && !p.flushTimer) flushInput(p);
+  };
+  // Give up waiting (not on the request): typing resumes; a reply that
+  // turns up later changes nothing.
+  let stall = setTimeout(release, INPUT_STALL_MS);
+  api('input',{body:{session_id:sid,data:d}}).then(r => {
+    // Replies that prove the bytes never reached the PTY (the worker
+    // pool was full, a rate limit, the proxy could not reach the
+    // backend): resend the same batch, ahead of anything typed since.
+    // A network error is NOT retried - the write may have happened and
+    // only the reply was lost, and a doubled keystroke is worse.
+    let st = r && r.error && r._status;
+    if (!settled && (st === 503 || st === 429 || st === 502) &&
+        attempt < INPUT_RETRIES && p.sid === sid) {
+      settled = true; clearTimeout(stall);
+      setTimeout(() => sendInputBatch(p, sid, d, attempt + 1), 200 * (attempt + 1));
+      return;
+    }
+    release();
+  }, release);
 }
 
 // ── Unified connect ─────────────────────────────────────────────────
