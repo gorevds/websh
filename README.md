@@ -66,7 +66,11 @@ Tick **Persistent session** at connect — websh wraps the shell in a tmux sessi
 ### 🛡️ Resilience
 
 - **Nothing lost on reconnect.** Output is read by cursor from a replay window, so a dropped stream, a sleeping laptop or a proxy that cut the connection resumes exactly where it stopped — no gap, no duplicate.
-- **Transport self-heals.** A closed SSE stream is reopened on its own; a proxy that buffers SSE sends that pane to long-polling; brief network errors are retried rather than ending the session.
+- **Keys arrive in the order typed.** One input request per pane is in flight at a time; what is typed meanwhile goes as the next batch.
+- **Comes back by itself after a Wi-Fi switch or sleep.** A connection that died silently raises no error in the browser. websh notices within seconds — a server heartbeat, the output offset in every input reply, the browser's network and wake-up events — and restarts the output channel; no page reload.
+- **A long absence costs a few seconds.** When the server-side session has expired, a persistent pane re-attaches to the same tmux shell on its own, and keys typed meanwhile are delivered once tmux is ready. Keys are never replayed into a *new* shell.
+- **A websh restart or deploy does not disconnect anyone.** Panes find their sessions again on the restarted server.
+- **Transport self-heals.** A closed SSE stream is reopened on its own; a proxy that buffers SSE sends that pane to long-polling, which keeps probing the stream in the background and switches back when it works; brief network errors are retried rather than ending the session.
 - **Clean teardown.** The ssh child is always reaped (no zombies holding session slots), idle sessions time out, the last output of a session is delivered before it is marked ended, and a client hanging up mid-request is routine, not a server error.
 
 ### 📁 File transfer
@@ -201,7 +205,7 @@ LICENSE                   MIT license
 # Backend (Python, stdlib only — unittest): ~680 tests
 python3 -m unittest discover -s tests/backend -t .   # or: python3 test_server.py -v
 
-# Frontend (Node 20 + jsdom): ~1100 assertions
+# Frontend (Node 20 + jsdom): ~1170 assertions
 cd tests/frontend && npm install && npm test
 
 # PHP proxy (needs php-cli with curl) and lint
