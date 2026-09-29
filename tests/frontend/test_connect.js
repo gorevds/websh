@@ -171,6 +171,8 @@ const EXPOSE = `
     set: v => { currentConnectRun = v; },
     configurable: true});
   Object.defineProperty(window, 'INPUT_STALL_MS', {get: () => INPUT_STALL_MS, set: v => { INPUT_STALL_MS = v; }, configurable: true});
+  Object.defineProperty(window, 'OUTPUT_LAG_MS', {get: () => OUTPUT_LAG_MS, set: v => { OUTPUT_LAG_MS = v; }, configurable: true});
+  Object.defineProperty(window, 'watchdogLastTick', {get: () => _watchdogLastTick, set: v => { _watchdogLastTick = v; }, configurable: true});
   Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
   Object.defineProperty(window, '_idbHasKeyCache', {
@@ -1031,33 +1033,192 @@ test('SSE failing before the first event 3 times in a row falls back to long-pol
   cleanup(env);
 });
 
-test('a pane polling because SSE kept failing tries the stream again later', async () => {
+test('a long-polling pane tries the stream NEXT TO the poll loop and switches when it works', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
   const sources = sseHarness(win);
   const p = ssePane(win, 'sse-retry');
   const log = [];
   outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
-  p.sseDisabled = true; p.sseDisabledReason = 'errors'; p.sseDisabledAt = Date.now() - 10 * 60000;
+  // 'buffering' too: the first-message timer misfires on a slow link.
+  p.sseDisabled = true; p.sseDisabledReason = 'buffering'; p.sseDisabledAt = Date.now() - 10 * 60000;
   win.pollOutput(p);
   await sleep(40);
-  ok(!p.sseDisabled && sources.length === 1, 'back on SSE after the retry interval; sources=' + sources.length);
-  ok(p.sseEarlyFails === 2, 'one more early failure sends it straight back; got ' + p.sseEarlyFails);
+  ok(sources.length === 1 && p.sseProbe === sources[0], 'probe stream opened; sources=' + sources.length);
+  ok(p.sseDisabled === true, 'still long-polling while the probe is out');
+  const polled = log.length;
+  await sleep(40);
+  ok(log.length > polled, 'output keeps flowing during the probe (no freeze)');
+  sources[0].l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});
+  ok(!p.sseDisabled && sources.length === 2 && p.eventSource === sources[1],
+     'an event arrived: switched to the stream; sources=' + sources.length);
+  ok(sources[0].closed, 'probe closed');
+  const after = log.length;
+  await sleep(60);
+  ok(log.length - after <= 1, 'poll loop stopped; extra polls=' + (log.length - after));
   sseStop(win, p);
   cleanup(env);
 });
 
-test('a pane behind a buffering proxy stays on long-poll (no 5 s freezes)', async () => {
+test('a failed stream probe leaves the pane polling and doubles the wait', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
   const sources = sseHarness(win);
-  const p = ssePane(win, 'sse-buf');
+  const p = ssePane(win, 'sse-probe-fail');
   const log = [];
   outputReplies(win, [[200, {data: '', alive: true, cursor: 0}]], log);
-  p.sseDisabled = true; p.sseDisabledReason = 'buffering'; p.sseDisabledAt = Date.now() - 60 * 60000;
+  p.sseDisabled = true; p.sseDisabledReason = 'errors'; p.sseDisabledAt = Date.now() - 10 * 60000;
   win.pollOutput(p);
   await sleep(40);
-  ok(p.sseDisabled && sources.length === 0, 'no stream re-probe; sources=' + sources.length);
+  ok(sources.length === 1, 'probe opened');
+  sources[0]._err();
+  ok(p.sseDisabled && !p.sseProbe && sources[0].closed, 'probe failed: still long-poll');
+  ok(p.sseProbeWait === 240000, 'wait doubled; got ' + p.sseProbeWait);
+  const n = log.length;
+  await sleep(40);
+  ok(log.length > n && sources.length === 1, 'polling goes on, no immediate re-probe');
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('only one poll loop per pane: a second start supersedes the first', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = ssePane(win, 'one-loop');
+  let inflight = 0, max = 0;
+  const base = win.fetch;
+  win.fetch = (url, init) => {
+    if (!/action=output/.test(url)) return base(url, init);
+    inflight++; max = Math.max(max, inflight);
+    return new Promise((res, rej) => {
+      const t = setTimeout(() => { inflight--; res({status: 200, json: () => Promise.resolve({data: '', alive: true, cursor: 0})}); }, 15);
+      if (init && init.signal) init.signal.addEventListener('abort', () => { clearTimeout(t); inflight--; rej(new Error('aborted')); });
+    });
+  };
+  win.fetch.__state = base.__state;
+  win.pollOutput(p);
+  await sleep(5);
+  win.pollOutput(p);            // e.g. fallback and reconnect both starting one
+  win.startOutput(p);
+  await sleep(120);
+  ok(max === 1, 'never two polls in flight; got ' + max);
+  ok(inflight === 1, 'and the loop is alive; inflight=' + inflight);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+// "Keys go out, nothing comes back, until I reload": the connection died
+// without a FIN (Wi-Fi switched, laptop slept) and nothing told the browser.
+test('stalled stream: no ping for SSE_STALL_MS restarts it from the cursor', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'stall');
+  p.outCursor = 321;
+  win.streamOutput(p);
+  sources[0].l.ping({data: '{}'});
+  ok(p.serverPings === true, 'server heartbeat seen');
+  win.outputWatchdogTick();
+  ok(sources.length === 1, 'a fresh stream is left alone');
+  p.sseLastAt = Date.now() - 41000;
+  p.lastKickAt = 0;
+  win.outputWatchdogTick();
+  ok(sources.length === 2 && sources[0].closed, 'silent stream replaced; sources=' + sources.length);
+  ok(/since=321/.test(sources[1].url), 'resumes from the cursor; url=' + sources[1].url);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('stalled stream: a server without pings is never restarted on silence', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'noping');
+  win.streamOutput(p);
+  sources[0].l.data({data: JSON.stringify({data: '', alive: true, cursor: 0})});
+  p.sseLastAt = Date.now() - 10 * 60000;
+  win.outputWatchdogTick();
+  ok(sources.length === 1, 'quiet session on an older server left alone');
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('input reply ahead of the pane\'s cursor restarts a channel that is not delivering', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.OUTPUT_LAG_MS = 40;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'lag');
+  p.outCursor = 100;
+  win.streamOutput(p);
+  sources[0].l.data({data: JSON.stringify({data: '', alive: true, cursor: 100})});
+  const base = win.fetch;
+  win.fetch = (url, init) => /action=input/.test(url)
+    ? Promise.resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true, cursor: 164})})
+    : base(url, init);
+  win.fetch.__state = base.__state;
+  win.queueInput(p, 'ls\r');
+  await sleep(120);
+  ok(sources.length === 2 && sources[0].closed, 'dead stream replaced; sources=' + sources.length);
+  ok(/since=100/.test(sources[1].url), 'from the cursor; url=' + sources[1].url);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('input reply: a pane that caught up is left alone', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.OUTPUT_LAG_MS = 40;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'nolag');
+  p.outCursor = 100;
+  win.streamOutput(p);
+  const base = win.fetch;
+  win.fetch = (url, init) => /action=input/.test(url)
+    ? Promise.resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true, cursor: 103})})
+    : base(url, init);
+  win.fetch.__state = base.__state;
+  win.queueInput(p, 'x');
+  await sleep(20);
+  sources[0].l.data({data: JSON.stringify({data: Buffer.from('abc').toString('base64'), alive: true, cursor: 103})});
+  await sleep(100);
+  ok(sources.length === 1 && !sources[0].closed, 'healthy stream untouched; sources=' + sources.length);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('network back (online event) and a clock jump restart every pane\'s channel', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'online');
+  win.streamOutput(p);
+  win.dispatchEvent(new win.Event('online'));
+  ok(sources.length === 2 && sources[0].closed, 'online: stream restarted; sources=' + sources.length);
+  win.watchdogLastTick = Date.now() - 10 * 60000;            // the laptop slept
+  win.outputWatchdogTick();
+  ok(sources.length === 3 && sources[1].closed, 'after sleep: stream restarted; sources=' + sources.length);
+  sseStop(win, p);
+  cleanup(env);
+});
+
+test('first-message timer firing late (page was asleep) restarts the stream, keeps SSE', async () => {
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'late-timer');
+  const realST = win.setTimeout; let fire = null;
+  win.setTimeout = (fn, ms) => { if (ms === 5000 && !fire) { fire = fn; return 0; } return realST(fn, ms); };
+  const realNow = win.Date.now;
+  win.streamOutput(p);
+  win.setTimeout = realST;
+  ok(typeof fire === 'function', 'timer captured');
+  win.Date.now = () => realNow() + 60000;      // woke up a minute later
+  fire();
+  win.Date.now = realNow;
+  ok(!p.sseDisabled, 'SSE not written off as buffered');
+  ok(sources.length === 2, 'stream started over; sources=' + sources.length);
   sseStop(win, p);
   cleanup(env);
 });

@@ -36,6 +36,7 @@ function api(action, opts) {
   let url = `${API}?action=${action}${opts.query || ''}`;
   let init = {};
   if (opts.body) { init.method='POST'; init.body=JSON.stringify(opts.body); init.headers={'Content-Type':'application/json'} }
+  if (opts.signal) init.signal = opts.signal;
   // A non-JSON reply (a reverse proxy's own HTML error page for a 5xx,
   // a captive portal) used to surface as "Unexpected token <" in the
   // toast. Turn it into an {error} the callers already handle.
@@ -257,7 +258,24 @@ const SSE_FIRST_MSG_TIMEOUT_MS = 5000;
 // (the first-message timer) is different: that is how the path is, and
 // re-probing it would freeze the output for 5 s each time.
 const SSE_EARLY_FAIL_LIMIT = 3;
-const SSE_RETRY_MS = 120000;
+let SSE_RETRY_MS = 120000;
+const SSE_RETRY_MAX_MS = 1800000;
+// A connection that died without a FIN (Wi-Fi switched, laptop slept, a
+// NAT forgot it) raises no error in the browser: the stream stays "open"
+// and silent, a long-poll never answers - keys went out, nothing came
+// back, until the page was reloaded. Three independent detectors restart
+// the output channel (from the pane's cursor, so nothing is lost or
+// doubled):
+//  - the server sends a `ping` event every 15 s; a stream silent for
+//    SSE_STALL_MS is dead;
+//  - every /api/input reply says where the session's output stands; a
+//    pane still behind it OUTPUT_LAG_MS later is not receiving;
+//  - the browser says the network came back (`online`), or the page's
+//    own clock jumped (it was asleep or frozen).
+let SSE_STALL_MS = 40000;
+let POLL_STALL_MS = 25000;      // server answers a long-poll within 10 s
+let OUTPUT_LAG_MS = 2000;
+let KICK_MIN_GAP_MS = 3000;
 
 function disableSse(p, reason) {
   p.sseDisabled = true;
@@ -909,7 +927,8 @@ function startKeepalive(p) {
   p.keepaliveTimer = setInterval(() => {
     let sid = p.sid;
     if (sid) api('input', {body: {session_id: sid, data: ''}})
-      .then(r => inputSaysSessionGone(p, r, sid)).catch(() => {});
+      .then(r => { if (!inputSaysSessionGone(p, r, sid)) noteServerCursor(p, r, sid); })
+      .catch(() => {});
   }, 30000);
 }
 // /api/input answering 404 is the server saying this session is gone
@@ -1523,10 +1542,21 @@ async function commitVaultSave(entry) {
 // pane that has fallen back stays on long-poll for the rest of the
 // session — no flapping.
 
+function abortPoll(p) {
+  if (p.pollAbort) {
+    try { p.pollAbort.abort(); } catch (e) {}
+    p.pollAbort = null;
+  }
+}
+
 function closeStream(p) {
   if (p.eventSource) {
     try { p.eventSource.close(); } catch (e) {}
     p.eventSource = null;
+  }
+  if (p.sseProbe) {
+    try { p.sseProbe.close(); } catch (e) {}
+    p.sseProbe = null;
   }
   if (p.sseFirstMsgTimer) {
     clearTimeout(p.sseFirstMsgTimer);
@@ -1546,6 +1576,8 @@ function endSession(p, o) {
   o = o || {};
   let sid = p.sid;
   closeStream(p);
+  abortPoll(p);
+  p.outGen = (p.outGen || 0) + 1;      // any loop still in flight is stale
   stopKeepalive(p);
   p.polling = false;
   p.connecting = false;
@@ -1604,10 +1636,9 @@ function kickPanesAfterAbsence() {
     // server-side ordering guarantee: PTY is resized before the
     // shell next prints into the new stream.
     fitPaneWhenStable(p, { onSettled: (p) => {
-      if (p.sseDisabled) return;
-      closeStream(p);
-      clearRetryClock(p);
-      startOutput(p);
+      // Long-polling panes too: their request may be parked on a
+      // connection that no longer exists.
+      kickOutput(p, true);
     }});
   });
 }
@@ -1862,9 +1893,110 @@ function startOutput(p) {
   }
 }
 
+// Restart the pane's output channel from its cursor. Cheap and safe to
+// call on suspicion: output is read by cursor, so a restart of a
+// healthy channel costs one request and shows nothing twice.
+function kickOutput(p, force) {
+  if (!p || !p.sid || !p.polling) return false;
+  let now = Date.now();
+  if (!force && now - (p.lastKickAt || 0) < KICK_MIN_GAP_MS) return false;
+  p.lastKickAt = now;
+  closeStream(p);
+  abortPoll(p);
+  clearRetryClock(p);
+  startOutput(p);
+  return true;
+}
+
+function kickAllOutputs(force) {
+  Object.values(panes).forEach(p => kickOutput(p, force));
+}
+
+// The server's view of how much output the session has produced, from an
+// /api/input reply. If this pane has not caught up shortly after, its
+// output channel is not delivering.
+function noteServerCursor(p, r, sid) {
+  if (!r || typeof r.cursor !== 'number' || p.sid !== sid) return;
+  let want = r.cursor;
+  if (want <= (p.outCursor || 0) || p.lagTimer) return;
+  p.lagTimer = setTimeout(() => {
+    p.lagTimer = null;
+    if (p.sid !== sid || !p.polling) return;
+    if ((p.outCursor || 0) < want) {
+      console.log('output: behind the server by', want - (p.outCursor || 0),
+                  'bytes, restarting the channel');
+      kickOutput(p);
+    }
+  }, OUTPUT_LAG_MS);
+}
+
+let _watchdogLastTick = Date.now();
+function outputWatchdogTick() {
+  let now = Date.now();
+  let gap = now - _watchdogLastTick;
+  _watchdogLastTick = now;
+  // The timer runs every 5 s (a hidden tab: about once a minute). A much
+  // longer gap means the machine slept or the page was frozen; every
+  // connection from before is suspect.
+  if (gap > 90000) { kickAllOutputs(true); return; }
+  Object.values(panes).forEach(p => {
+    if (!p || !p.sid || !p.polling || !p.eventSource || !p.serverPings) return;
+    if (now - (p.sseLastAt || now) > SSE_STALL_MS) {
+      console.log('SSE: silent for', now - p.sseLastAt, 'ms, restarting the stream');
+      kickOutput(p);
+    }
+  });
+}
+setInterval(outputWatchdogTick, 5000);
+window.addEventListener('online', () => kickAllOutputs(true));
+
+// Long-polling, but the stream may work again (another network, a
+// restarted proxy; or it was never broken - the first-message timer can
+// misfire on a slow link). Try it NEXT TO the poll loop, so the output
+// never pauses for the attempt; switch only once an event has actually
+// arrived. Each failure doubles the wait.
+function maybeProbeSse(p, sid) {
+  if (!p.sseDisabled || p.sseDisabledReason === 'unsupported' || p.sseProbe ||
+      typeof EventSource === 'undefined') return;
+  let wait = p.sseProbeWait || SSE_RETRY_MS;
+  if (Date.now() - (p.sseDisabledAt || 0) < wait) return;
+  let es;
+  try {
+    es = new EventSource(`${API}?action=stream&session_id=${encodeURIComponent(sid)}` +
+                         `&since=${p.outCursor || 0}`);
+  } catch (e) { return; }
+  p.sseProbe = es;
+  let timer = null;
+  let finish = ok => {
+    if (p.sseProbe !== es) return;
+    clearTimeout(timer);
+    try { es.close(); } catch (e) {}
+    p.sseProbe = null;
+    if (p.sid !== sid || !p.polling) return;
+    if (ok) {
+      console.log('SSE: works again, leaving long-poll');
+      p.sseDisabled = false;
+      p.sseProbeWait = 0;
+      p.sseEarlyFails = 0;
+      abortPoll(p);
+      streamOutput(p);
+    } else {
+      p.sseDisabledAt = Date.now();
+      p.sseProbeWait = Math.min(wait * 2, SSE_RETRY_MAX_MS);
+    }
+  };
+  timer = setTimeout(() => finish(false), SSE_FIRST_MSG_TIMEOUT_MS);
+  es.addEventListener('data', () => finish(true));
+  es.addEventListener('ping', () => finish(true));
+  es.addEventListener('end', () => finish(false));
+  es.onerror = () => finish(false);
+}
+
 function streamOutput(p) {
   if (!p.sid || !p.polling) return;
   closeStream(p);
+  abortPoll(p);
+  let gen = p.outGen = (p.outGen || 0) + 1;   // supersedes any poll loop
   let mySid = p.sid;
   // since= our output cursor: a reconnect resumes exactly where this
   // pane's terminal stopped, instead of losing whatever the server had
@@ -1882,6 +2014,8 @@ function streamOutput(p) {
   }
   p.eventSource = es;
   p.sseGotAnyMessage = false;
+  p.sseLastAt = Date.now();
+  let armedAt = Date.now();
   // First-message timer: a buffering proxy will hold the response
   // until N bytes accumulate, so no event reaches us. The backend
   // sends ': ok\n\n' on connect specifically to defeat this — if we
@@ -1889,6 +2023,14 @@ function streamOutput(p) {
   if (p.sseFirstMsgTimer) clearTimeout(p.sseFirstMsgTimer);
   p.sseFirstMsgTimer = setTimeout(() => {
     if (!p.sseGotAnyMessage && p.eventSource === es) {
+      // Fired late (the page was frozen or the machine asleep while the
+      // timer ran), or the browser knows it is offline: that says
+      // nothing about a buffering proxy. Start the stream over.
+      if (Date.now() - armedAt > SSE_FIRST_MSG_TIMEOUT_MS + 3000 ||
+          (typeof navigator !== 'undefined' && navigator.onLine === false)) {
+        kickOutput(p, true);
+        return;
+      }
       console.log('SSE: no event in', SSE_FIRST_MSG_TIMEOUT_MS,
                   'ms, falling back to long-poll');
       disableSse(p, 'buffering');
@@ -1913,8 +2055,16 @@ function streamOutput(p) {
   let onBodyEvent = () => {
     p.sseGotAnyMessage = true;
     p.sseEarlyFails = 0;
+    p.sseLastAt = Date.now();
     clearRetryClock(p);
   };
+  // Heartbeat (servers that send it): proves the stream is alive while
+  // the session is quiet. See outputWatchdogTick.
+  es.addEventListener('ping', () => {
+    if (p.eventSource !== es) return;
+    p.serverPings = true;
+    onBodyEvent();
+  });
   // EventSource fires onmessage for unnamed events; the ': ok' comment
   // doesn't trigger it but still arrives on the wire. We rely on the
   // 'data' / 'end' named events here.
@@ -1953,7 +2103,7 @@ function streamOutput(p) {
       let d = nextRetryDelay(p);
       if (d < 0) { transportFatal(p, new Error('SSE reconnect budget exhausted')); return; }
       setReconnecting(p, true);
-      setTimeout(() => recoverClosedStream(p, mySid), d);
+      setTimeout(() => recoverClosedStream(p, mySid, gen), d);
       return;
     }
     let d = nextRetryDelay(p);
@@ -1963,40 +2113,42 @@ function streamOutput(p) {
       // It will never retry on its own: previously the pane then showed
       // "reconnecting… (0 s)" forever and dropped every keystroke.
       closeStream(p);
-      setTimeout(() => recoverClosedStream(p, mySid), d);
+      setTimeout(() => recoverClosedStream(p, mySid, gen), d);
     }
     // Otherwise EventSource retries by itself (~3 s); we only enforce
     // the total-elapsed budget.
   };
 }
 
-function pollOutput(p) {
+// One loop per pane: `gen` is the loop's ticket, and starting any output
+// channel (a new loop, a stream) takes a new one. Two loops used to run
+// side by side after a reconnect - every request doubled.
+function pollOutput(p, gen) {
   if(!p.sid || !p.polling) return;
+  if (gen === undefined) { abortPoll(p); gen = p.outGen = (p.outGen || 0) + 1; }
+  else if (gen !== p.outGen) return;
   let mySid = p.sid;
-  api('output',{query:'&session_id='+mySid+'&since='+(p.outCursor || 0)}).then(r => {
+  // A request parked on a dead connection never answers by itself.
+  let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  p.pollAbort = ctl;
+  let stall = setTimeout(() => { if (ctl) { try { ctl.abort(); } catch (e) {} } }, POLL_STALL_MS);
+  api('output',{query:'&session_id='+mySid+'&since='+(p.outCursor || 0),
+                signal: ctl ? ctl.signal : undefined}).then(r => {
+    clearTimeout(stall);
     if (isTransientOutputReply(r)) throw new Error(r.error);
-    clearRetryClock(p);
+    if (gen !== p.outGen && r && r.error) return;   // stale loop: not its call
+    if (gen === p.outGen) clearRetryClock(p);
     if (handleOutputPayload(p, r, mySid)) return;
-    if (!p.polling || p.sid !== mySid) return;
-    // Polling because the stream kept failing, not because the path
-    // buffers it: conditions change (a restart, another network), so
-    // try the stream again now and then. One more early failure puts
-    // the pane straight back here.
-    if (p.sseDisabled && p.sseDisabledReason === 'errors' &&
-        typeof EventSource !== 'undefined' &&
-        Date.now() - (p.sseDisabledAt || 0) >= SSE_RETRY_MS) {
-      p.sseDisabled = false;
-      p.sseEarlyFails = SSE_EARLY_FAIL_LIMIT - 1;
-      streamOutput(p);
-      return;
-    }
-    pollOutput(p);
+    if (!p.polling || p.sid !== mySid || gen !== p.outGen) return;
+    maybeProbeSse(p, mySid);
+    pollOutput(p, gen);
   }).catch(e => {
-    if (p.sid !== mySid) return;        // replaced meanwhile: not our loop
+    clearTimeout(stall);
+    if (p.sid !== mySid || gen !== p.outGen) return;   // replaced meanwhile
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
     setReconnecting(p, true);
-    setTimeout(() => { if(p.polling) pollOutput(p) }, d);
+    setTimeout(() => { if(p.polling) pollOutput(p, gen) }, d);
   });
 }
 
@@ -2007,20 +2159,23 @@ function pollOutput(p) {
 // a real answer (a frame, or "session not found") goes through the
 // normal path - including resume/reconnect for a session that is gone -
 // and a transient failure waits and asks again, inside the same budget.
-function recoverClosedStream(p, mySid) {
+function recoverClosedStream(p, mySid, gen) {
   if (!p.polling || p.sid !== mySid) return;
+  if (gen !== undefined && gen !== p.outGen) return;
   api('output', {query: '&session_id=' + mySid + '&since=' + (p.outCursor || 0)}).then(r => {
     if (isTransientOutputReply(r)) throw new Error(r.error);
     if (p.sid !== mySid) return;
+    if (gen !== undefined && gen !== p.outGen) return;
     clearRetryClock(p);
     if (handleOutputPayload(p, r, mySid)) return;
     if (p.polling) streamOutput(p);     // healthy again: back to SSE
   }).catch(e => {
     if (!p.polling || p.sid !== mySid) return;
+    if (gen !== undefined && gen !== p.outGen) return;
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
     setReconnecting(p, true);
-    setTimeout(() => recoverClosedStream(p, mySid), d);
+    setTimeout(() => recoverClosedStream(p, mySid, gen), d);
   });
 }
 
@@ -2068,9 +2223,18 @@ function sendInputBatch(p, sid, d, attempt) {
   };
   // Give up waiting (not on the request): typing resumes; a reply that
   // turns up later changes nothing.
-  let stall = setTimeout(release, INPUT_STALL_MS);
-  api('input',{body:{session_id:sid,data:d}}).then(r => {
+  let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  let stall = setTimeout(() => {
+    // Not answered in time: the connection it went out on is probably
+    // dead, and so is the output channel's. Cancel it, so it cannot
+    // land later, after keys typed since.
+    if (ctl) { try { ctl.abort(); } catch (e) {} }
+    release();
+    kickOutput(p);
+  }, INPUT_STALL_MS);
+  api('input',{body:{session_id:sid,data:d}, signal: ctl ? ctl.signal : undefined}).then(r => {
     if (!settled && inputSaysSessionGone(p, r, sid)) { release(); return; }
+    noteServerCursor(p, r, sid);
     // Replies that prove the bytes never reached the PTY (the worker
     // pool was full, a rate limit, the proxy could not reach the
     // backend): resend the same batch, ahead of anything typed since.

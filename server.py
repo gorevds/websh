@@ -4720,7 +4720,15 @@ class Handler(BaseHTTPRequestHandler):
                 # is the "this IP is a person" signal the scan-pattern
                 # detector forgives on (see _forgive_scan_for_ip).
                 _forgive_scan_for_ip(self._client_ip())
-            self._json({"ok": ok, "alive": session.alive})
+            reply = {"ok": ok, "alive": session.alive}
+            # Where the session's output stands. A client whose output
+            # channel died quietly (Wi-Fi switched, laptop slept: no FIN,
+            # no error) sees its own cursor fall behind this and restarts
+            # the channel, instead of showing nothing until a reload.
+            end = getattr(session, "_replay_end", None)
+            if isinstance(end, int):
+                reply["cursor"] = end
+            self._json(reply)
         except Exception as e:
             self._json({"error": "input error: " + str(e)}, 500)
 
@@ -5027,7 +5035,13 @@ class Handler(BaseHTTPRequestHandler):
                 # time.sleep(POLL_INTERVAL) busy-poll.
                 now = time.time()
                 if now - last_send > KEEPALIVE:
-                    self.wfile.write(b": keepalive\n\n")
+                    # The comment keeps proxies from idling the stream
+                    # out; the named event is what the CLIENT can see
+                    # (EventSource hides comments) - its watchdog restarts
+                    # a stream that has gone silent. Older clients have
+                    # no listener for it and ignore it.
+                    self.wfile.write(
+                        b": keepalive\n\nevent: ping\ndata: {}\n\n")
                     self.wfile.flush()
                     last_send = now
                 next_keepalive = last_send + KEEPALIVE

@@ -2906,6 +2906,9 @@ class TestStreamEdges(unittest.TestCase):
         text = h.wfile.text()
         self.assertEqual(text.count(": keepalive"), 1,
                          "one heartbeat per silent interval; got " + repr(text))
+        # ...and one the client can actually see (EventSource hides
+        # comments): its watchdog tells a quiet stream from a dead one.
+        self.assertEqual(text.count("event: ping\ndata: {}\n\n"), 1, repr(text))
         self.assertLess(text.index(": keepalive"), text.index("event: end"))
 
     def test_final_output_is_sent_before_end(self):
@@ -2997,6 +3000,40 @@ class TestShutdownIsNotSessionEnd(unittest.TestCase):
         h = _delivery_handler(sess, "/api/stream?session_id=x")
         h._stream_session(sess)
         self.assertIn("event: end", h.wfile.text())
+
+class TestInputReplyCarriesCursor(unittest.TestCase):
+    """/api/input says where the session's output stands, so a client
+    whose output channel died quietly can notice it is behind."""
+
+    def _reply(self, sess):
+        h = server.Handler.__new__(server.Handler)
+        h.replies = []
+        h._json = lambda obj, status=200: h.replies.append((status, obj))
+        h._json_body = lambda: {"session_id": "x", "data": ""}
+        h._require_session = lambda sid: sess
+        h._client_ip = lambda: "203.0.113.5"
+        h._input()
+        return h.replies[0]
+
+    def test_cursor_is_the_output_end(self):
+        class S(object):
+            alive = True
+            auth_failed = False
+            _replay_end = 4711
+            def write(self, data):
+                return True
+        status, body = self._reply(S())
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True, "alive": True, "cursor": 4711})
+
+    def test_session_without_a_cursor_omits_it(self):
+        class S(object):
+            alive = True
+            auth_failed = False
+            def write(self, data):
+                return True
+        _, body = self._reply(S())
+        self.assertNotIn("cursor", body)
 
 class TestReadLoopDrainsOnStop(unittest.TestCase):
     """What the remote printed just before the session stopped (a logout
