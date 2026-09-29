@@ -470,11 +470,10 @@ function createPane(container) {
   });
 
   // Terminal events
-  term.onData(d => {
-    if (!p.sid) return;
-    queueInput(p, d);
-  });
-  term.onBinary(d => { if(p.sid) queueInput(p,d) });
+  // queueInput decides what a pane without a session does with keys:
+  // dropped, unless it is a persistent pane re-attaching right now.
+  term.onData(d => queueInput(p, d));
+  term.onBinary(d => queueInput(p, d));
   term.onResize(size => {
     if(!p.sid) return;
     if(p.resizeTimer) clearTimeout(p.resizeTimer);
@@ -1578,6 +1577,11 @@ function endSession(p, o) {
   closeStream(p);
   abortPoll(p);
   p.outGen = (p.outGen || 0) + 1;      // any loop still in flight is stale
+  // The input queue is left alone: keys typed a moment ago may be for
+  // the tmux shell this pane is about to re-attach to. Whoever starts
+  // the next session decides (beginSessionIO / openInputGate: never
+  // into a new shell, never older than INPUT_HOLD_MS).
+  closeInputGate(p);
   stopKeepalive(p);
   p.polling = false;
   p.connecting = false;
@@ -1731,6 +1735,7 @@ function handleOutputPayload(p, r, sid) {
     p.outCursor = r.reset ? r.cursor : Math.max(have, r.cursor);
   }
   if(chunk.length){
+    if (p.inputGate) noteGateOutput(p, chunk);
     // Always render incoming bytes — even on a tail-drain frame that
     // arrives after the disconnect banner, the bytes may be the last
     // thing the shell wrote (final command output, exit message). We
@@ -1949,6 +1954,8 @@ function outputWatchdogTick() {
 }
 setInterval(outputWatchdogTick, 5000);
 window.addEventListener('online', () => kickAllOutputs(true));
+// Page Lifecycle: the browser unfroze a background tab.
+document.addEventListener('resume', () => kickAllOutputs(true));
 
 // Long-polling, but the stream may work again (another network, a
 // restarted proxy; or it was never broken - the first-message timer can
@@ -2189,14 +2196,72 @@ function recoverClosedStream(p, mySid, gen) {
 let INPUT_STALL_MS = 10000;     // a hung request must not freeze typing
 const INPUT_RETRIES = 3;
 
+// Keys typed while a persistent pane re-attaches (its server session
+// expired during an absence; the tmux shell is the same one) are held
+// and sent once it is back - they used to vanish, or sit in the queue
+// and go out with whatever was typed after a reconnect hours later.
+// Never into a NEW shell (non-persistent reconnect), and never stale.
+const INPUT_HOLD_MS = 20000;
+
+// A persistent pane that has just (re)connected is not ready for keys
+// the moment /api/connect answers: ssh is still logging in and tmux has
+// not attached, and what is written to the PTY then is eaten by the
+// login. Keys wait behind a gate until tmux has drawn its screen (it
+// switches to the alternate screen on attach) and gone quiet; never
+// longer than INPUT_GATE_MAX_MS.
+const INPUT_GATE_MAX_MS = 6000;
+
+function armInputGate(p) {
+  closeInputGate(p);
+  p.inputGate = true;
+  p.inputGateMax = setTimeout(() => openInputGate(p), INPUT_GATE_MAX_MS);
+}
+
+function closeInputGate(p) {
+  p.inputGate = false;
+  clearTimeout(p.inputGateMax); clearTimeout(p.inputGateSoon);
+  p.inputGateMax = p.inputGateSoon = null;
+}
+
+function noteGateOutput(p, chunk) {
+  if (chunk.indexOf('\x1b[?1049h') !== -1) p.inputGateAttached = true;
+  // Quiet for a while AFTER the last frame: tmux flushes what arrives
+  // while its client is still starting (keys sent 200 ms after the
+  // first frame were lost one run in three).
+  clearTimeout(p.inputGateSoon);
+  let attached = p.inputGateAttached;
+  p.inputGateSoon = setTimeout(() => openInputGate(p, attached ? 'tmux attached' : 'output quiet'),
+                               attached ? 500 : 1500);
+}
+
+function openInputGate(p, why) {
+  if (!p.inputGate) return;
+  console.log('input gate: open (' + (why || 'timeout') + '), held keys:', p.inputQueue.join('').length);
+  closeInputGate(p);
+  p.inputGateAttached = false;
+  if (!p.inputQueue.length) return;
+  if (Date.now() - (p.inputQueuedAt || 0) < INPUT_HOLD_MS) flushInput(p);
+  else p.inputQueue = [];
+}
+
+function holdInput(p, d) {
+  p.inputQueue.unshift(d);
+  p.inputQueuedAt = Date.now();
+}
+
 function queueInput(p, data) {
+  if (!p.sid) {
+    // Disconnected and nobody is reconnecting: nothing will read this.
+    if (!p.connecting || !p.persistent) return;
+  }
+  if (!p.inputQueue.length) p.inputQueuedAt = Date.now();
   p.inputQueue.push(data);
   if(!p.flushTimer && !p.inputInFlight) p.flushTimer = setTimeout(() => flushInput(p), 10);
 }
 
 function flushInput(p) {
   p.flushTimer = null;
-  if(p.inputInFlight || !p.sid || !p.inputQueue.length) return;
+  if(p.inputInFlight || !p.sid || p.inputGate || !p.inputQueue.length) return;
   let d=p.inputQueue.join(''); p.inputQueue=[];
   // Only a large paste can approach the server body cap; for those, check
   // the real UTF-8 body size and surface an error instead of a silent 400.
@@ -2233,7 +2298,17 @@ function sendInputBatch(p, sid, d, attempt) {
     kickOutput(p);
   }, INPUT_STALL_MS);
   api('input',{body:{session_id:sid,data:d}, signal: ctl ? ctl.signal : undefined}).then(r => {
-    if (!settled && inputSaysSessionGone(p, r, sid)) { release(); return; }
+    if (!settled && r && r._status === 404 && r.error) {
+      // The session is gone. Someone else may have noticed first (the
+      // keepalive's 404 landing a few ms earlier, the output loop) and
+      // the pane is already re-attaching, or is back: the keys are held
+      // either way. After inputSaysSessionGone, so that endSession's
+      // reset cannot touch them; before release().
+      if (p.sid === sid) inputSaysSessionGone(p, r, sid);
+      if (p.persistent && (p.connecting || p.sid)) holdInput(p, d);
+      release();
+      return;
+    }
     noteServerCursor(p, r, sid);
     // Replies that prove the bytes never reached the PTY (the worker
     // pool was full, a rate limit, the proxy could not reach the
@@ -2293,6 +2368,9 @@ function beginSessionIO(p, o) {
   startKeepalive(p);
   saveSessions();
   startOutput(p);
+  p.inputGateAttached = false;
+  if (p.persistent) armInputGate(p);      // held keys go out when it opens
+  else p.inputQueue = [];                 // a new shell gets none of the old keys
 }
 
 async function connectPane(p, opts) {

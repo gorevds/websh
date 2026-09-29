@@ -6323,6 +6323,187 @@ test('keepalive: 404 (session gone) reconnects instead of pinging a dead session
   cleanup(env);
 });
 
+function goneThenOk(win, newSid) {
+  // /api/input: 404 for the dead sid, 200 (recorded) for any other.
+  const st = {sent: []};
+  const base = win.fetch;
+  win.fetch = (url, init) => {
+    if (!/action=input/.test(url)) return base(url, init);
+    const b = JSON.parse(init.body);
+    return sleep(3).then(() => {
+      if (b.session_id !== newSid) return {status: 404, statusText: '', json: () => Promise.resolve({error: 'session not found'})};
+      if (b.data) st.sent.push(b.data);
+      return {status: 200, json: () => Promise.resolve({ok: true, alive: true})};
+    });
+  };
+  win.fetch.__state = base.__state;
+  return st;
+}
+const RECONNECT_PLAN = sid => [
+  {action: 'config', response: {restrict_hosts: false, connections: []}},
+  {action: 'connect', response: {session_id: sid, alive: true}, delay: 30},
+  {action: 'resize', response: {ok: true}},
+  {action: 'output', response: {data: '', alive: true}, delay: 20},
+];
+
+test('input: keys typed into an expired PERSISTENT session arrive after the re-attach', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-back'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back');
+  win.queueInput(p, 'ls -la');
+  await sleep(25);
+  win.queueInput(p, '\r');               // typed while it re-attaches
+  for (let i = 0; i < 80 && p.sid !== 'sid-back'; i++) await sleep(10);
+  ok(p.sid === 'sid-back', 're-attached; sid=' + p.sid);
+  await sleep(60);
+  // /api/connect answered, but ssh is still logging in: keys written
+  // now are eaten by the login (seen in a real browser run).
+  ok(st.sent.length === 0 && p.inputGate === true, 'held until tmux is up; sent=' + JSON.stringify(st.sent));
+  const frame = t => win.handleOutputPayload(p, {data: Buffer.from(t, 'latin1').toString('base64'), alive: true}, 'sid-back');
+  frame('gorevds@host password: ');
+  await sleep(60);
+  ok(st.sent.length === 0, 'the password prompt does not open the gate');
+  frame('\x1b[?1049h\x1b[H\x1b[2Jtmux screen');
+  for (let i = 0; i < 80 && st.sent.join('') !== 'ls -la\r'; i++) await sleep(10);
+  ok(st.sent.join('') === 'ls -la\r', 'nothing lost, in order; got ' + JSON.stringify(st.sent));
+  ok(!p.inputGate, 'gate open');
+  win.queueInput(p, 'x');
+  for (let i = 0; i < 40 && st.sent.length < 2; i++) await sleep(10);
+  ok(st.sent.join('') === 'ls -la\rx', 'typing flows normally afterwards; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys are kept when the keepalive noticed the dead session first', async () => {
+  // Seen in a real browser: the keepalive ping and the typed batch were
+  // in flight together; the ping's 404 started the re-attach, and the
+  // batch's own 404, a few ms later, found "not my session any more"
+  // and the keys were dropped.
+  const env = await mkEnv(RECONNECT_PLAN('sid-back2'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back2');
+  win.queueInput(p, 'make test\r');
+  await sleep(11);                                   // the batch is in flight
+  win.handleOutputPayload(p, {error: 'session not found'}, 'sid-expired');   // someone else got the 404 first
+  for (let i = 0; i < 80 && p.sid !== 'sid-back2'; i++) await sleep(10);
+  win.handleOutputPayload(p, {data: Buffer.from('\x1b[?1049htmux', 'latin1').toString('base64'), alive: true}, 'sid-back2');
+  for (let i = 0; i < 100 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'make test\r', 'keys arrived after the re-attach; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys typed in the terminal WHILE a persistent pane re-attaches are kept', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-back3'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back3');
+  win.handleOutputPayload(p, {error: 'session not found'}, 'sid-expired');
+  ok(!p.sid && p.connecting, 're-attaching');
+  p.term._onDataCb('git status\r');          // through the terminal, as a keypress does
+  for (let i = 0; i < 80 && p.sid !== 'sid-back3'; i++) await sleep(10);
+  win.handleOutputPayload(p, {data: Buffer.from('\x1b[?1049htmux', 'latin1').toString('base64'), alive: true}, 'sid-back3');
+  for (let i = 0; i < 100 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'git status\r', 'kept and delivered; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys typed in the terminal of a disconnected pane go nowhere', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-x'));
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.persistent = true;
+  p.term._onDataCb('typed at a dead pane');
+  ok(p.inputQueue.length === 0 && !p.flushTimer, 'nothing queued');
+  ok(!env.log.some(e => e.action === 'input'), 'nothing sent');
+  cleanup(env);
+});
+
+test('input: keys still waiting to be sent survive the moment the session is found gone', async () => {
+  // Real browser, run 5 of 8: typed, and within the 10 ms before the
+  // batch leaves, the keepalive's 404 ended the session and wiped them.
+  const env = await mkEnv(RECONNECT_PLAN('sid-back4'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true;
+  p.persistent = true; p.slotId = 'slot1';
+  const st = goneThenOk(win, 'sid-back4');
+  p.term._onDataCb('docker ps\r');
+  win.handleOutputPayload(p, {error: 'session not found'}, 'sid-expired');   // same tick
+  for (let i = 0; i < 80 && p.sid !== 'sid-back4'; i++) await sleep(10);
+  win.handleOutputPayload(p, {data: Buffer.from('\x1b[?1049htmux', 'latin1').toString('base64'), alive: true}, 'sid-back4');
+  for (let i = 0; i < 100 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'docker ps\r', 'delivered after the re-attach; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: keys for an expired NON-persistent session never reach the new shell', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-fresh'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.sid = 'sid-expired'; p.host = 'h'; p.user = 'u'; p.polling = true; p.persistent = false;
+  const st = goneThenOk(win, 'sid-fresh');
+  win.queueInput(p, 'rm -rf build');
+  await sleep(20);
+  win.queueInput(p, '\r');
+  for (let i = 0; i < 60 && p.sid !== 'sid-fresh'; i++) await sleep(10);
+  await sleep(60);
+  ok(p.sid === 'sid-fresh', 'reconnected; sid=' + p.sid);
+  ok(st.sent.length === 0, 'a different shell gets none of it; got ' + JSON.stringify(st.sent));
+  win.queueInput(p, 'x');
+  for (let i = 0; i < 40 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === 'x', 'new keys flow, old ones are gone; got ' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
+test('input: typing on a disconnected pane is dropped, not sent after a later reconnect', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-later'));
+  const win = env.win;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.persistent = true;
+  win.queueInput(p, 'typed at a dead pane');
+  ok(p.inputQueue.length === 0, 'not queued; got ' + JSON.stringify(p.inputQueue));
+  cleanup(env);
+});
+
+test('input: held keys older than INPUT_HOLD_MS are dropped at re-attach', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-slow'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.host = 'h'; p.user = 'u'; p.persistent = true; p.sid = 'sid-slow';
+  const st = goneThenOk(win, 'sid-slow');
+  p.inputQueue = ['stale']; p.inputQueuedAt = Date.now() - 60000;
+  win.beginSessionIO(p);
+  win.openInputGate(p);
+  await sleep(60);
+  ok(st.sent.length === 0 && p.inputQueue.length === 0, 'stale keys dropped; sent=' + JSON.stringify(st.sent));
+  p.polling = false;
+  cleanup(env);
+});
+
 test('input: a request that never answers does not freeze typing', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
