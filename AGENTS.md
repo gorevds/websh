@@ -77,8 +77,13 @@ keep them true when you change the code under them.
    `scripts/e2e.sh`.
 5. Update the docs the change makes untrue, and `docs/invariants.md`
    when a new "must never happen again" appears.
-6. Commit. Deploying is a separate, deliberate step
-   (`scripts/deploy.sh`, which deploys `origin/main`, not your tree).
+6. Commit and push, then **look at CI** - it runs what your machine
+   cannot (Python 3.9, no `cryptography`, no terminal):
+   `gh run list -R <owner>/websh -L 3`. In a checkout with an `upstream`
+   remote `gh` may be looking at the wrong repository; pin it once with
+   `gh repo set-default`.
+7. Deploying is a separate, deliberate step (`scripts/deploy.sh`, which
+   deploys `origin/main`, not your tree).
 
 ## Rules learned the hard way
 

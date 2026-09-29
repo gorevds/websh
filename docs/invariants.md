@@ -132,3 +132,8 @@ the old code back and watch the test go red.
 **T4. What depends on timing is proven in a real browser, repeatedly.**
 Unit tests passed while four input races were live; `tests/e2e/run.mjs
 --repeat 10 away` found them.
+
+**T5. CI is part of "green".** The backend failed on every push for
+days - one test needed the developer's `TERM` - and nobody looked,
+because the local run passed. `scripts/check.sh` now runs the backend
+without a terminal, as a runner does; after a push, read the result.

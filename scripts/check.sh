@@ -23,8 +23,10 @@ if command -v ruff >/dev/null; then
   if ruff check . >"$LOG/ruff" 2>&1; then ok; else bad; tail -20 "$LOG/ruff"; fi
 else skip "ruff not installed (pip install 'ruff==0.15.*')"; fi
 
+# As a CI runner sees it: no terminal, not inside tmux. A test that
+# leaned on the developer's TERM passed here and failed on every push.
 step "backend"
-if python3 -m unittest discover -s tests/backend -t . >"$LOG/be" 2>&1; then
+if env -u TERM -u TMUX -u TMUX_PANE python3 -m unittest discover -s tests/backend -t . >"$LOG/be" 2>&1; then
   ok "$(grep '^Ran' "$LOG/be") $(tail -1 "$LOG/be")"
 else bad "$(tail -1 "$LOG/be")"; grep -E '^(FAIL|ERROR):' "$LOG/be" | head -20; fi
 
