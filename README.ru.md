@@ -189,6 +189,9 @@ test_server.py            Совместимый запускатель тест
 tests/backend/            Тесты бэкенда — unit + integration (unittest)
 tests/frontend/           Тесты фронтенда на jsdom
 tests/php/                Smoke-тест PHP-прокси
+tests/e2e/                Сценарии в браузере: настоящий Chromium, настоящий ssh, сбои сети
+scripts/                  check.sh (все тесты), e2e.sh, deploy.sh, codemap.py
+AGENTS.md                 Руководство для контрибьюторов и код-агентов
 .github/workflows/        CI: матрица бэкенда, фронтенд, PHP, ruff, Docker
 docs/                     Заметки по архитектуре и справочная документация
 Dockerfile                Развёртывание в контейнере
@@ -208,6 +211,12 @@ cd tests/frontend && npm install && npm test
 # PHP-прокси (нужен php-cli с curl) и линтер
 php -l api.php && bash tests/php/smoke.sh
 ruff check .
+
+# Всё перечисленное, с одним вердиктом
+scripts/check.sh
+
+# Сценарии в браузере: смена Wi-Fi, сон, перезапуск, порядок ввода (tests/e2e/README.md)
+scripts/e2e.sh
 ```
 
 CI прогоняет всё это на каждый push и PR: бэкенд на Python 3.9 и 3.12, каждый с `cryptography` и без (опциональная зависимость хранилища), плюс фронтенд, smoke-тест PHP, ruff и сборку Docker-образа с проверкой `/api/ping`, `/api/config` и страницы.

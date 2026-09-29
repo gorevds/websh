@@ -178,6 +178,9 @@ plaintext caveat see [`docs/encryption.md`](docs/encryption.md).
 | Deployment recipes | [`docs/deployment.md`](docs/deployment.md) |
 | SSE transport design | [`docs/sse-transport.md`](docs/sse-transport.md) |
 | Auth-failure detection | [`docs/auth-fail-detection.md`](docs/auth-fail-detection.md) |
+| HTTP API | [`docs/protocol.md`](docs/protocol.md) |
+| Invariants: what must never break | [`docs/invariants.md`](docs/invariants.md) |
+| Working on the code | [`AGENTS.md`](AGENTS.md) |
 
 ## Project structure
 
@@ -192,6 +195,9 @@ test_server.py            Back-compat runner for the backend suite
 tests/backend/            Backend tests — unit + integration (unittest)
 tests/frontend/           Frontend tests on jsdom
 tests/php/                PHP proxy smoke test
+tests/e2e/                Browser scenarios: real Chromium, real ssh, network faults
+scripts/                  check.sh (all tests), e2e.sh, deploy.sh, codemap.py
+AGENTS.md                 Guide for contributors and coding agents
 .github/workflows/        CI: backend matrix, frontend, PHP, ruff, Docker
 docs/                     Design notes & reference docs
 Dockerfile                Container deployment
@@ -211,6 +217,12 @@ cd tests/frontend && npm install && npm test
 # PHP proxy (needs php-cli with curl) and lint
 php -l api.php && bash tests/php/smoke.sh
 ruff check .
+
+# All of the above, with one verdict
+scripts/check.sh
+
+# Browser scenarios: Wi-Fi switch, sleep, restart, typing order (tests/e2e/README.md)
+scripts/e2e.sh
 ```
 
 CI runs all of it on every push and PR: the backend on Python 3.9 and 3.12, each with and without `cryptography` (the vault's optional dependency), plus the frontend suite, the PHP smoke test, ruff, and a Docker build that boots the image and checks `/api/ping`, `/api/config` and the page.
