@@ -192,6 +192,7 @@ tests/php/                Smoke-тест PHP-прокси
 tests/e2e/                Сценарии в браузере: настоящий Chromium, настоящий ssh, сбои сети
 scripts/                  check.sh (все тесты), e2e.sh, deploy.sh, codemap.py
 AGENTS.md                 Руководство для контрибьюторов и код-агентов
+agents/                   Две роли (implementer, tester) и как они работают вместе
 .github/workflows/        CI: матрица бэкенда, фронтенд, PHP, ruff, Docker
 docs/                     Заметки по архитектуре и справочная документация
 Dockerfile                Развёртывание в контейнере
