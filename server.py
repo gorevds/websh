@@ -338,6 +338,7 @@ MIN_ROWS = 2
 # Timing
 CONNECT_SETTLE_TIME = 0.5     # seconds to wait after spawning SSH
 POLL_TIMEOUT = 10             # seconds to long-poll for output
+STREAM_TAKEOVER_MIN_GAP = 15  # seconds between takeovers of one session's stream
 POLL_INTERVAL = 0.01          # seconds between buffer checks
 PTY_DRAIN_ROUNDS = 50         # max iterations to drain PTY on exit
 PTY_DRAIN_INTERVAL = 0.01    # seconds per drain round
@@ -1942,6 +1943,7 @@ class SSHSession(object):
     # Bumped by a new /api/stream that finds the slot held: the holder
     # sees its generation is stale and steps aside (see _stream).
     _stream_gen = 0
+    _stream_taken_at = 0.0
     # Invariant: master_fd ∈ {a valid open fd, -1}. The sentinel -1 (rather
     # than None) means "closed / never opened" and lets master_fd-touching
     # methods early-return via `if self.master_fd < 0: return` instead of
@@ -3102,50 +3104,47 @@ class SSHSession(object):
         # stops reading our stdin, and proc.stdin.write() below deadlocks.
         # We keep at most 64 KB of the text for the error message but keep
         # reading to EOF so the pipe never backs up.
-        _err_buf = []
-        _err_len = [0]
-
-        def _drain_stderr():
+        def _drain_pipe(pipe, buf, cap):
+            # Read to EOF, keeping at most `cap` bytes.
+            kept = 0
             try:
                 while True:
-                    chunk = proc.stderr.read(4096)
+                    chunk = pipe.read(4096)
                     if not chunk:
                         break
-                    if _err_len[0] < 65536:
-                        _err_buf.append(chunk)
-                        _err_len[0] += len(chunk)
+                    if kept < cap:
+                        buf.append(chunk)
+                        kept += len(chunk)
             except Exception:
                 pass
             finally:
                 try:
-                    proc.stderr.close()
+                    pipe.close()
                 except Exception:
                     pass
 
-        _drain = Thread(target=_drain_stderr, daemon=True)
+        _err_buf = []
+        _drain = Thread(target=_drain_pipe, args=(proc.stderr, _err_buf, 65536),
+                        daemon=True)
         _drain.start()
         _out_buf = []
-
-        def _drain_stdout():
-            try:
-                while True:
-                    chunk = proc.stdout.read(4096)
-                    if not chunk:
-                        break
-                    if sum(len(c) for c in _out_buf) < 4096:
-                        _out_buf.append(chunk)
-            except Exception:
-                pass
-            finally:
-                try:
-                    proc.stdout.close()
-                except Exception:
-                    pass
-
         _drain_out = None
         if proc.stdout is not None:
-            _drain_out = Thread(target=_drain_stdout, daemon=True)
+            _drain_out = Thread(target=_drain_pipe, args=(proc.stdout, _out_buf, 4096),
+                                daemon=True)
             _drain_out.start()
+
+        def _refused():
+            # The size the remote printed before refusing the piece.
+            _drain.join(timeout=5)
+            if _drain_out is not None:
+                _drain_out.join(timeout=5)
+            out = b"".join(_out_buf).decode("ascii", "replace").strip()
+            try:
+                size = int(out.split()[0])
+            except (ValueError, IndexError):
+                size = -1
+            return False, "offset mismatch size=%d" % size
 
         BUF = 256 * 1024
         remaining = length
@@ -3211,15 +3210,7 @@ class SSHSession(object):
                         if not piece:
                             break
                         left -= len(piece)
-                    _drain.join(timeout=5)
-                    if _drain_out is not None:
-                        _drain_out.join(timeout=5)
-                    out = b"".join(_out_buf).decode("ascii", "replace").strip()
-                    try:
-                        size = int(out.split()[0])
-                    except (ValueError, IndexError):
-                        size = -1
-                    return False, "offset mismatch size=%d" % size
+                    return _refused()
             _kill_reap(proc)
             _drain.join(timeout=5)
             # A torn-down stdin pipe (BrokenPipe/ConnectionReset) means the
@@ -3249,12 +3240,7 @@ class SSHSession(object):
         if _drain_out is not None:
             _drain_out.join(timeout=5)
         if proc.returncode == self.UPLOAD_EXIT_OFFSET and offset:
-            out = b"".join(_out_buf).decode("ascii", "replace").strip()
-            try:
-                size = int(out.split()[0])
-            except (ValueError, IndexError):
-                size = -1
-            return False, "offset mismatch size=%d" % size
+            return _refused()
         if proc.returncode != 0:
             msg = b"".join(_err_buf).decode("utf-8", "replace").strip()[:300]
             return False, "ssh exit %d: %s" % (proc.returncode, msg)
@@ -4941,7 +4927,8 @@ class Handler(BaseHTTPRequestHandler):
         deadline = time.time() + 2.0
         session = None
         duplicate = False
-        took_over = False
+        bumped_to = None
+        bumped_at = 0.0
         my_gen = 0
         while True:
             with sessions_lock:
@@ -4959,10 +4946,28 @@ class Handler(BaseHTTPRequestHandler):
                 if not session._stream_active:
                     session._stream_active = True
                     my_gen = getattr(session, "_stream_gen", 0)
+                    if bumped_to is not None:
+                        session._stream_taken_at = time.time()
                     break
-                if not took_over:
-                    session._stream_gen = getattr(session, "_stream_gen", 0) + 1
-                    took_over = True
+                gen = getattr(session, "_stream_gen", 0)
+                # A takeover only once in a while per session: two live
+                # tabs on the same session (both restored it from
+                # localStorage) would otherwise evict each other every
+                # few seconds for ever. The second one gets the 409 and
+                # settles on long-poll, as before; a holder that is
+                # really dead is taken over on the first try.
+                may_take = (time.time() - getattr(session, "_stream_taken_at", 0.0)
+                            >= STREAM_TAKEOVER_MIN_GAP)
+                if may_take and (bumped_to is None or
+                                 # The slot changed hands to someone who
+                                 # acquired with our generation (an entrant
+                                 # racing us) - ask again, once they have
+                                 # had time to step aside.
+                                 (gen == bumped_to and
+                                  time.time() - bumped_at > 0.3)):
+                    session._stream_gen = gen + 1
+                    bumped_to = gen + 1
+                    bumped_at = time.time()
                     session._signal()
             if time.time() >= deadline:
                 duplicate = True

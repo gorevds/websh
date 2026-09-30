@@ -1168,6 +1168,30 @@ test('input reply ahead of the pane\'s cursor restarts a channel that is not del
   cleanup(env);
 });
 
+test('input reply: a pane that is behind but still receiving is left alone', async () => {
+  // A slow link catching up on a burst: the cursor moves, the channel
+  // is alive - restarting it would only resend what is in flight.
+  const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
+  const win = env.win;
+  win.OUTPUT_LAG_MS = 40;
+  const sources = sseHarness(win);
+  const p = ssePane(win, 'slowlink');
+  p.outCursor = 100;
+  win.streamOutput(p);
+  const base = win.fetch;
+  win.fetch = (url, init) => /action=input/.test(url)
+    ? Promise.resolve({status: 200, json: () => Promise.resolve({ok: true, alive: true, cursor: 5000000})})
+    : base(url, init);
+  win.fetch.__state = base.__state;
+  win.queueInput(p, 'x');
+  await sleep(20);
+  sources[0].l.data({data: JSON.stringify({data: Buffer.from('abc').toString('base64'), alive: true, cursor: 103})});   // far behind, but moving
+  await sleep(100);
+  ok(sources.length === 1 && !sources[0].closed, 'stream kept; sources=' + sources.length);
+  sseStop(win, p);
+  cleanup(env);
+});
+
 test('input reply: a pane that caught up is left alone', async () => {
   const env = await mkEnv([{action: 'config', response: {restrict_hosts: false, connections: []}}]);
   const win = env.win;
@@ -5818,6 +5842,42 @@ test('upload in pieces: 409 with the real size resumes from there, nothing doubl
   cleanup(env);
 });
 
+test('upload in pieces: 429 (rate limit) waits and keeps the piece size', async () => {
+  const {env, win, p} = await pieceEnv();
+  const realST = win.setTimeout;
+  const waits = [];
+  win.setTimeout = (fn, ms) => realST(fn, ms >= 3000 ? (waits.push(ms), 5) : ms);
+  let limited = 0;
+  const st = pieceServer(win, (offset, len) => {
+    if (offset === 4194304 && limited < 2) { limited++; return {status: 429, body: {error: 'rate_limited', code: 'rate_limited'}}; }
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  win.setTimeout = realST;
+  ok(waits.filter(x => x === 3000).length === 2, 'waited 3 s twice; got ' + JSON.stringify(waits));
+  const sizes = st.calls.filter(c => c.offset === 4194304).map(c => c.len);
+  ok(sizes.every(x => x === 4194304), 'piece size unchanged; got ' + sizes.join(','));
+  ok(assembled(st) === 10 * 1024 * 1024 && /Saved to/.test(bannerOf(p)), 'complete');
+  cleanup(env);
+});
+
+test('upload in pieces: the last piece landed but its reply was lost - finalized, not failed', async () => {
+  const {env, win, p} = await pieceEnv();
+  let lost = false;
+  const st = pieceServer(win, (offset, len) => {
+    if (offset === 8388608 && !lost) { lost = true; st.file.push([offset, len]); return 'neterr'; }   // landed, reply lost
+    if (offset === 8388608) return {status: 409, body: {error: 'offset mismatch', size: 10 * 1024 * 1024}};
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(/Saved to/.test(bannerOf(p)), 'finalized; got ' + JSON.stringify(bannerOf(p)));
+  ok(!st.calls.some(c => c.offset === 10 * 1024 * 1024), 'no empty piece at the end; offsets=' + st.calls.map(c => c.offset).join(','));
+  ok(assembled(st) === 10 * 1024 * 1024, 'complete');
+  cleanup(env);
+});
+
 test('upload in pieces: a final answer (413) stops the upload, no retries', async () => {
   const {env, win, p} = await pieceEnv();
   const st = pieceServer(win, () => ({status: 413, body: {error: 'file too large'}}));
@@ -6625,6 +6685,26 @@ test('input: typing on a disconnected pane is dropped, not sent after a later re
   p.persistent = true;
   win.queueInput(p, 'typed at a dead pane');
   ok(p.inputQueue.length === 0, 'not queued; got ' + JSON.stringify(p.inputQueue));
+  cleanup(env);
+});
+
+test('input: a recent key keeps the held queue alive even if an older one is stale', async () => {
+  const env = await mkEnv(RECONNECT_PLAN('sid-mix'));
+  const win = env.win;
+  win.EventSource = undefined;
+  const p = win.createPane(win.document.getElementById('panes'));
+  win.activatePane(p.id);
+  p.host = 'h'; p.user = 'u'; p.persistent = true; p.sid = null; p.connecting = true;
+  const st = goneThenOk(win, 'sid-mix');
+  win.queueInput(p, '\r');
+  p.inputQueuedAt = Date.now() - 25000;        // pressed 25 s ago
+  win.queueInput(p, 'ls');                      // typed just now
+  p.sid = 'sid-mix'; p.connecting = false;
+  win.beginSessionIO(p);
+  win.openInputGate(p);
+  for (let i = 0; i < 50 && !st.sent.length; i++) await sleep(10);
+  ok(st.sent.join('') === '\rls', 'nothing recent was thrown away; got ' + JSON.stringify(st.sent));
+  p.polling = false;
   cleanup(env);
 });
 

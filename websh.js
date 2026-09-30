@@ -246,17 +246,19 @@ function saveSettings() {
 const RECONNECT_BUDGET_MS = 60000;
 // Backoff steps used for both SSE retry-after and long-poll retry.
 const RECONNECT_BACKOFF_MS = [1000, 2000, 5000, 10000, 15000];
-// If SSE doesn't deliver any event (data or comment) within this window,
-// assume an upstream proxy is buffering it and silently fall back to
-// /api/output long-polling for the rest of the session.
+// If SSE doesn't deliver any event within this window, assume an
+// upstream proxy is buffering it and fall back to /api/output
+// long-polling (unless the timer fired late or offline: then it proved
+// nothing and the stream is simply restarted).
 const SSE_FIRST_MSG_TIMEOUT_MS = 5000;
 // A stream refused or dropped before its first event (409 while the old
 // stream still holds the slot, 503 busy, a backend restart, a network
 // blip) says nothing about whether SSE works here. Only this many in a
-// row turn it off for the pane, and even then a long-polling pane tries
-// the stream again after SSE_RETRY_MS. A proxy that BUFFERS the stream
-// (the first-message timer) is different: that is how the path is, and
-// re-probing it would freeze the output for 5 s each time.
+// row turn it off for the pane. Long-poll is never for good: the pane
+// keeps probing the stream NEXT TO its poll loop (maybeProbeSse) - after
+// SSE_RETRY_MS, doubling to SSE_RETRY_MAX_MS on each failed probe - and
+// switches back once an event has actually arrived. A probe costs no
+// output, so a path that buffers SSE is probed too.
 const SSE_EARLY_FAIL_LIMIT = 3;
 let SSE_RETRY_MS = 120000;
 const SSE_RETRY_MAX_MS = 1800000;
@@ -1537,9 +1539,9 @@ async function commitVaultSave(entry) {
 // Primary: SSE via /api/stream, opened with EventSource. Falls back to
 // long-poll automatically if (a) EventSource is missing, (b) the first
 // SSE event doesn't arrive within SSE_FIRST_MSG_TIMEOUT_MS (a buffering
-// proxy), or (c) the SSE connection errors before any event landed. A
-// pane that has fallen back stays on long-poll for the rest of the
-// session — no flapping.
+// proxy), or (c) the SSE connection errors before any event landed three
+// times in a row. A pane that has fallen back probes the stream again
+// in the background (maybeProbeSse) and returns to it when it works.
 
 function abortPoll(p) {
   if (p.pollAbort) {
@@ -1925,11 +1927,14 @@ function kickAllOutputs(force) {
 function noteServerCursor(p, r, sid) {
   if (!r || typeof r.cursor !== 'number' || p.sid !== sid) return;
   let want = r.cursor;
-  if (want <= (p.outCursor || 0) || p.lagTimer) return;
+  let seen = p.outCursor || 0;
+  if (want <= seen || p.lagTimer) return;
   p.lagTimer = setTimeout(() => {
     p.lagTimer = null;
     if (p.sid !== sid || !p.polling) return;
-    if ((p.outCursor || 0) < want) {
+    // Still behind AND nothing arrived meanwhile: dead, not slow. A
+    // slow link catching up on a burst keeps moving and is left alone.
+    if ((p.outCursor || 0) === seen && seen < want) {
       console.log('output: behind the server by', want - (p.outCursor || 0),
                   'bytes, restarting the channel');
       kickOutput(p);
@@ -2171,7 +2176,12 @@ function pollOutput(p, gen) {
 function recoverClosedStream(p, mySid, gen) {
   if (!p.polling || p.sid !== mySid) return;
   if (gen !== undefined && gen !== p.outGen) return;
-  api('output', {query: '&session_id=' + mySid + '&since=' + (p.outCursor || 0)}).then(r => {
+  let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  p.pollAbort = ctl;      // kickOutput/abortPoll can cancel it, like a poll
+  let stall = setTimeout(() => { if (ctl) { try { ctl.abort(); } catch (e) {} } }, POLL_STALL_MS);
+  api('output', {query: '&session_id=' + mySid + '&since=' + (p.outCursor || 0),
+                 signal: ctl ? ctl.signal : undefined}).then(r => {
+    clearTimeout(stall);
     if (isTransientOutputReply(r)) throw new Error(r.error);
     if (p.sid !== mySid) return;
     if (gen !== undefined && gen !== p.outGen) return;
@@ -2179,6 +2189,7 @@ function recoverClosedStream(p, mySid, gen) {
     if (handleOutputPayload(p, r, mySid)) return;
     if (p.polling) streamOutput(p);     // healthy again: back to SSE
   }).catch(e => {
+    clearTimeout(stall);
     if (!p.polling || p.sid !== mySid) return;
     if (gen !== undefined && gen !== p.outGen) return;
     let d = nextRetryDelay(p);
@@ -2203,7 +2214,8 @@ const INPUT_RETRIES = 3;
 // expired during an absence; the tmux shell is the same one) are held
 // and sent once it is back - they used to vanish, or sit in the queue
 // and go out with whatever was typed after a reconnect hours later.
-// Never into a NEW shell (non-persistent reconnect), and never stale.
+// Never into a NEW shell (non-persistent reconnect), and never stale:
+// the queue is dropped when nothing has been typed for INPUT_HOLD_MS.
 const INPUT_HOLD_MS = 20000;
 
 // A persistent pane that has just (re)connected is not ready for keys
@@ -2257,7 +2269,7 @@ function queueInput(p, data) {
     // Disconnected and nobody is reconnecting: nothing will read this.
     if (!p.connecting || !p.persistent) return;
   }
-  if (!p.inputQueue.length) p.inputQueuedAt = Date.now();
+  p.inputQueuedAt = Date.now();     // freshness of the NEWEST key
   p.inputQueue.push(data);
   if(!p.flushTimer && !p.inputInFlight) p.flushTimer = setTimeout(() => flushInput(p), 10);
 }
@@ -2292,14 +2304,18 @@ function sendInputBatch(p, sid, d, attempt) {
   // Give up waiting (not on the request): typing resumes; a reply that
   // turns up later changes nothing.
   let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  // A big paste on a slow uplink legitimately takes long: allow a
+  // second per 20 KB on top of the base.
+  let stallMs = INPUT_STALL_MS + Math.floor(d.length / 20);
   let stall = setTimeout(() => {
     // Not answered in time: the connection it went out on is probably
     // dead, and so is the output channel's. Cancel it, so it cannot
     // land later, after keys typed since.
     if (ctl) { try { ctl.abort(); } catch (e) {} }
+    if (d.length > 1024) showErr('A paste of ' + Math.round(d.length / 1024) + ' KB was not delivered (no answer from the server) - paste it again.');
     release();
     kickOutput(p);
-  }, INPUT_STALL_MS);
+  }, stallMs);
   api('input',{body:{session_id:sid,data:d}, signal: ctl ? ctl.signal : undefined}).then(r => {
     if (!settled && r && r._status === 404 && r.error) {
       // The session is gone. Someone else may have noticed first (the
@@ -4613,24 +4629,37 @@ function sendUploadPiece(p, u, file, offset) {
     if (!u || u.cancelled) return;
     let resp = null;
     try { resp = JSON.parse(xhr.responseText); } catch (e) {}
-    if (xhr.status === 409 && resp && typeof resp.size === 'number' &&
-        resp.size >= 0 && resp.size <= file.size) {
+    if (xhr.status === 409 && resp && typeof resp.size === 'number' && resp.size >= 0) {
       // The remote file is not where we thought (a piece died after
-      // part of it landed): continue from where it really ends.
+      // part of it landed): continue from where it really ends. If it
+      // is already complete - the last piece landed and only its reply
+      // was lost - there is nothing left to send. Longer than the file
+      // cannot be ours: start over.
       u.chunkFails++;
       if (u.chunkFails >= UPLOAD_CHUNK_TRIES) { finishUpload(p, false, 'the upload could not be resumed'); return; }
-      sendUploadPiece(p, u, file, resp.size);
+      if (resp.size === file.size) { u.fileOffset = file.size; updateUploadProgress(p); uploadFileDone(p, u, file); return; }
+      sendUploadPiece(p, u, file, resp.size > file.size ? 0 : resp.size);
+      return;
+    }
+    if (xhr.status === 429) {
+      // The server's side-channel rate limit (240 calls a minute per
+      // address): a fast link sends 4 MB pieces faster than that. Not a
+      // failure - wait, keep the piece size, do not count it as a try.
+      u.throttled = (u.throttled || 0) + 1;     // in a row; a delivered piece resets it
+      if (u.throttled > 30) { finishUpload(p, false, 'the server kept asking to slow down'); return; }
+      setTimeout(() => sendUploadPiece(p, u, file, offset), 3000);
       return;
     }
     if (xhr.status !== 200 || !resp || !resp.ok) {
-      // A session or file problem is final; a proxy's 5xx / 408 / 429
-      // is worth another try.
-      let transient = xhr.status === 408 || xhr.status === 429 || xhr.status >= 500;
+      // A session or file problem is final; a proxy's 5xx / 408 is
+      // worth another try.
+      let transient = xhr.status === 408 || xhr.status >= 500;
       if (!transient) { finishUpload(p, false, describeUploadError(xhr, resp, u)); return; }
       retry(describeUploadError(xhr, resp, u));
       return;
     }
     u.chunkFails = 0;
+    u.throttled = 0;
     u.fileOffset = end;
     updateUploadProgress(p);
     if (end < file.size) sendUploadPiece(p, u, file, end);
