@@ -1,8 +1,27 @@
 # Working on websh
 
-For anyone changing this code - a person or a coding agent. Short on
-purpose: it says where things are and what not to break; the details
-live in `docs/`.
+For anyone changing this code - a person or a coding agent of any
+kind. Short on purpose: it says where things are and what not to break;
+the details live in `docs/`. This file is the only agent instruction
+file; `CLAUDE.md`, `GEMINI.md` and `.github/copilot-instructions.md`
+just point here.
+
+## Starting a session
+
+1. Read this file. If `AGENTS.local.md` exists, read it next: it holds
+   what is specific to that machine and its owner (where a deployment
+   lives, how tests get credentials, what must not be touched there).
+   It is git-ignored; create it on a new machine from the section list
+   in `docs/local-notes.md`.
+2. `git status`, `git log --oneline -10`, and whether anything is
+   unpushed: `git rev-list --left-right --count origin/main...main`.
+3. Before touching transport, input, reconnect or session code:
+   `docs/invariants.md`.
+4. Navigate with `scripts/codemap.py`, not by reading the big files whole.
+5. Whatever you learn that the code and docs do not record goes into
+   the repository (a comment at the code, `docs/invariants.md`, a doc)
+   or, if it is machine-specific, into `AGENTS.local.md` - not into a
+   tool's private memory, where the next tool cannot see it.
 
 ## What it is
 
