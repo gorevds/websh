@@ -4516,6 +4516,19 @@ function describeUploadError(xhr, resp, u) {
   return 'server error (HTTP ' + xhr.status + ')';
 }
 
+// A file goes up in pieces (UPLOAD_CHUNK_BYTES each, its own short POST
+// with ?offset=) when the server appends them (config.upload_chunks).
+// One long POST of the whole file was cut mid-body by corporate proxies
+// and VPNs - the owner had to switch networks to upload anything. A
+// piece that fails is retried, after two failures with smaller pieces;
+// the server refuses a piece that does not start where the file ends
+// (409 + the real size) so a retry can never duplicate or skip bytes.
+let UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
+const UPLOAD_CHUNK_MIN = 256 * 1024;
+const UPLOAD_CHUNK_TRIES = 8;
+let UPLOAD_CHUNK_TIMEOUT_MS = 120000;
+let UPLOAD_RETRY_BASE_MS = 500;
+
 function uploadNextFile(p) {
   let u = p.upload;
   if (!u || u.cancelled) return;
@@ -4528,13 +4541,111 @@ function uploadNextFile(p) {
   u.currentTmp = '.websh-tmp-' +
     Math.random().toString(36).slice(2, 12) + '-' +
     Date.now().toString(36);
+  u.chunkSize = UPLOAD_CHUNK_BYTES;
+  u.chunkFails = 0;
+  if (serverConfig && serverConfig.upload_chunks && file.size > 0) {
+    sendUploadPiece(p, u, file, 0);
+  } else {
+    sendUploadWhole(p, u, file);
+  }
+}
 
+function uploadUrl(p, u, offset) {
+  return `${API}?action=upload` +
+    `&session_id=${encodeURIComponent(p.sid)}` +
+    `&path=${encodeURIComponent(u.currentTmp)}` +
+    (offset === undefined ? '' : `&offset=${offset}`);
+}
+
+function uploadFileDone(p, u, file) {
+  finalizeUploadedFile(p, file).then(() => {
+    if (!u || u.cancelled) return;
+    u.sentBytes += file.size;
+    u.fileOffset = 0;
+    u.fileIndex++;
+    u.currentFile = null;
+    u.currentTmp = null;
+    u.xhr = null;
+    updateUploadProgress(p);
+    uploadNextFile(p);
+  })
+  // Bytes already landed at $HOME/<tmp>; only the move into the cwd
+  // failed. Lead with the reassuring plain-language fact and drop the
+  // raw server string + the "$HOME" jargon from the banner (the detail
+  // is still logged below). Guard on u.cancelled like the .then() above,
+  // so a finalize rejection that lands during the cancel window doesn't
+  // clobber the "Cancelled" banner.
+  .catch((err) => {
+    if (!u || u.cancelled) return;
+    if (err) console.warn('websh: upload finalize failed:', err);
+    finishUpload(p, false, describeFinalizeError(err, u));
+  });
+}
+
+function sendUploadPiece(p, u, file, offset) {
+  if (!u || u.cancelled || p.upload !== u) return;
+  let end = Math.min(file.size, offset + u.chunkSize);
   let xhr = new XMLHttpRequest();
   u.xhr = xhr;
-  let url = `${API}?action=upload` +
-    `&session_id=${encodeURIComponent(p.sid)}` +
-    `&path=${encodeURIComponent(u.currentTmp)}`;
-  xhr.open('POST', url, true);
+  xhr.open('POST', uploadUrl(p, u, offset), true);
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.timeout = UPLOAD_CHUNK_TIMEOUT_MS;
+  xhr.upload.onprogress = e => {
+    if (!u || u.cancelled) return;
+    u.fileOffset = offset + e.loaded;
+    updateUploadProgress(p);
+  };
+  let retry = why => {
+    if (!u || u.cancelled || p.upload !== u) return;
+    u.chunkFails++;
+    if (u.chunkFails >= UPLOAD_CHUNK_TRIES) {
+      finishUpload(p, false, why); return;
+    }
+    // Smaller pieces after the second failure: what a proxy cuts is
+    // usually a size or a duration.
+    if (u.chunkFails >= 2) u.chunkSize = Math.max(UPLOAD_CHUNK_MIN, u.chunkSize >> 1);
+    let delay = Math.min(16 * UPLOAD_RETRY_BASE_MS, UPLOAD_RETRY_BASE_MS * Math.pow(2, u.chunkFails - 1));
+    console.log('upload: piece at', offset, 'failed (' + why + '), retry', u.chunkFails,
+                'in', delay, 'ms, piece size', u.chunkSize);
+    setTimeout(() => sendUploadPiece(p, u, file, offset), delay);
+  };
+  xhr.onload = () => {
+    if (!u || u.cancelled) return;
+    let resp = null;
+    try { resp = JSON.parse(xhr.responseText); } catch (e) {}
+    if (xhr.status === 409 && resp && typeof resp.size === 'number' &&
+        resp.size >= 0 && resp.size <= file.size) {
+      // The remote file is not where we thought (a piece died after
+      // part of it landed): continue from where it really ends.
+      u.chunkFails++;
+      if (u.chunkFails >= UPLOAD_CHUNK_TRIES) { finishUpload(p, false, 'the upload could not be resumed'); return; }
+      sendUploadPiece(p, u, file, resp.size);
+      return;
+    }
+    if (xhr.status !== 200 || !resp || !resp.ok) {
+      // A session or file problem is final; a proxy's 5xx / 408 / 429
+      // is worth another try.
+      let transient = xhr.status === 408 || xhr.status === 429 || xhr.status >= 500;
+      if (!transient) { finishUpload(p, false, describeUploadError(xhr, resp, u)); return; }
+      retry(describeUploadError(xhr, resp, u));
+      return;
+    }
+    u.chunkFails = 0;
+    u.fileOffset = end;
+    updateUploadProgress(p);
+    if (end < file.size) sendUploadPiece(p, u, file, end);
+    else uploadFileDone(p, u, file);
+  };
+  xhr.onerror = () => retry(describeUploadError(xhr, null, u));
+  xhr.ontimeout = () => retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s');
+  xhr.send(file.slice(offset, end));
+}
+
+// Older servers (no config.upload_chunks) and empty files: one request.
+function sendUploadWhole(p, u, file) {
+  let xhr = new XMLHttpRequest();
+  u.xhr = xhr;
+  xhr.open('POST', uploadUrl(p, u), true);
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.upload.onprogress = e => {
     if (!u || u.cancelled) return;
@@ -4548,28 +4659,7 @@ function uploadNextFile(p) {
     if (xhr.status !== 200 || !resp || !resp.ok) {
       finishUpload(p, false, describeUploadError(xhr, resp, u)); return;
     }
-    finalizeUploadedFile(p, file).then(() => {
-      if (!u || u.cancelled) return;
-      u.sentBytes += file.size;
-      u.fileOffset = 0;
-      u.fileIndex++;
-      u.currentFile = null;
-      u.currentTmp = null;
-      u.xhr = null;
-      updateUploadProgress(p);
-      uploadNextFile(p);
-    })
-    // Bytes already landed at $HOME/<tmp>; only the move into the cwd
-    // failed. Lead with the reassuring plain-language fact and drop the
-    // raw server string + the "$HOME" jargon from the banner (the detail
-    // is still logged below). Guard on u.cancelled like the .then() above,
-    // so a finalize rejection that lands during the cancel window doesn't
-    // clobber the "Cancelled" banner.
-    .catch((err) => {
-      if (!u || u.cancelled) return;
-      if (err) console.warn('websh: upload finalize failed:', err);
-      finishUpload(p, false, describeFinalizeError(err, u));
-    });
+    uploadFileDone(p, u, file);
   };
   xhr.onerror = () => {
     if (u && !u.cancelled) finishUpload(p, false, describeUploadError(xhr, null, u));

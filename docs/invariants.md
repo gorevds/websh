@@ -74,6 +74,16 @@ firing late…`.
 be writing into a dead connection for minutes; it steps aside.
 Guard: backend `test_stream_takeover_replaces_a_stale_holder`.
 
+**O6. A file goes up in pieces, and a piece can never land twice or
+skip bytes.** One long POST was cut mid-body by corporate proxies and
+VPNs every time; the owner switched networks to upload anything. The
+server appends a piece only at the exact size the file has and reports
+the real size otherwise (409), so retries are safe.
+Guard: backend `test_upload_in_pieces_appends_at_the_right_offset`,
+`test_upload_piece_at_the_wrong_offset_is_refused_with_the_real_size`;
+frontend `upload in pieces: …`; e2e `upload` (two connection resets
+under a 12 MB upload, sha256 compared on disk).
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

@@ -173,6 +173,8 @@ const EXPOSE = `
   Object.defineProperty(window, 'INPUT_STALL_MS', {get: () => INPUT_STALL_MS, set: v => { INPUT_STALL_MS = v; }, configurable: true});
   Object.defineProperty(window, 'OUTPUT_LAG_MS', {get: () => OUTPUT_LAG_MS, set: v => { OUTPUT_LAG_MS = v; }, configurable: true});
   Object.defineProperty(window, 'watchdogLastTick', {get: () => _watchdogLastTick, set: v => { _watchdogLastTick = v; }, configurable: true});
+  for (const k of ['UPLOAD_CHUNK_BYTES', 'UPLOAD_CHUNK_TIMEOUT_MS', 'UPLOAD_RETRY_BASE_MS'])
+    Object.defineProperty(window, k, {get: () => eval(k), set: v => { eval(k + ' = v'); }, configurable: true});
   Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
   Object.defineProperty(window, 'serverConfig', {get: () => serverConfig, configurable: true});
   Object.defineProperty(window, '_idbHasKeyCache', {
@@ -5713,6 +5715,145 @@ test('upload mid-stream drop reports the percentage reached (onprogress chain)',
 // finalize succeeded the upload (200) but the move into cwd failed — the
 // banner must say bytes landed, not bare "Upload failed", and must not
 // leak "$HOME" or the raw server string.
+// ── Upload in pieces ─────────────────────────────────────────────────
+// A corporate proxy / VPN cut one long POST mid-body every time; the
+// file now goes up in pieces, each retried on its own, resumed from the
+// size the server reports.
+function pieceServer(win, script) {
+  // script(offset, len, n) -> {status, body} | 'neterr' | 'timeout'
+  const st = {calls: [], file: [], finalized: 0};
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; }
+    open(m, url) { this.url = url; }
+    setRequestHeader() {}
+    abort() { this.aborted = true; }
+    send(blob) {
+      const m = this.url.match(/offset=(\d+)/);
+      const offset = m ? +m[1] : null;
+      const len = blob.size;
+      const n = st.calls.length;
+      st.calls.push({offset, len});
+      const r = script(offset, len, n);
+      setTimeout(() => {
+        if (this.aborted) return;
+        if (r === 'neterr') { if (this.onerror) this.onerror(); return; }
+        if (r === 'timeout') { if (this.ontimeout) this.ontimeout(); return; }
+        if (r.status === 200) {
+          if (offset === null) st.file = [[0, len]];
+          else { if (offset === 0) st.file = []; st.file.push([offset, len]); }
+        }
+        this.status = r.status; this.responseText = JSON.stringify(r.body);
+        if (this.onload) this.onload();
+      }, 2);
+    }
+  };
+  return st;
+}
+const bigFile = (name, size) => ({name, size, slice: (a, b) => ({size: b - a, start: a})});
+const assembled = st => {   // contiguous, no gaps, no overlaps -> total
+  let pos = 0;
+  for (const [o, l] of st.file) { if (o !== pos) return -1; pos += l; }
+  return pos;
+};
+async function pieceEnv(extraPlan) {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: [], upload_chunks: true}},
+    {action: 'upload_finalize', response: {ok: true, path: '/home/u/big.bin'}},
+  ].concat(extraPlan || []));
+  const win = env.win;
+  win.UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024; win.UPLOAD_CHUNK_TIMEOUT_MS = 50; win.UPLOAD_RETRY_BASE_MS = 2;
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 's1'; p.host = 'h'; p.persistent = true; p.cwd = '/home/u';
+  return {env, win, p};
+}
+const bannerOf = p => (p.el.querySelector('[data-upload-progress] .upload-progress-text') || {}).textContent || '';
+async function uploadSettles(p, log) {
+  for (let i = 0; i < 800; i++) { await sleep(10); if (/Upload (complete|failed|cancelled)|Uploaded|Saved to/i.test(bannerOf(p))) return; }
+}
+
+test('upload in pieces: a 10 MB file goes up as three offsets, once each', async () => {
+  const {env, win, p} = await pieceEnv();
+  const st = pieceServer(win, (offset, len) => ({status: 200, body: {ok: true, size: offset + len}}));
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.map(c => c.offset).join(',') === '0,4194304,8388608', 'offsets 0, 4M, 8M; got ' + st.calls.map(c => c.offset).join(','));
+  ok(assembled(st) === 10 * 1024 * 1024, 'every byte once, in order');
+  ok(env.log.filter(e => e.action === 'upload_finalize').length === 1, 'finalized once');
+  ok(/Saved to \/home\/u\/big.bin/.test(bannerOf(p)), 'banner says done; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+test('upload in pieces: a piece cut by the network is retried, then in smaller pieces', async () => {
+  const {env, win, p} = await pieceEnv();
+  let fails = 0;
+  const st = pieceServer(win, (offset, len, n) => {
+    if (offset === 4194304 && fails < 3) { fails++; return 'neterr'; }   // the 2nd piece dies three times
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(assembled(st) === 10 * 1024 * 1024, 'file complete despite three failures; pieces=' + JSON.stringify(st.file));
+  const sizes = st.calls.filter(c => c.offset === 4194304).map(c => c.len);
+  ok(sizes[0] === 4194304 && sizes[sizes.length - 1] < 4194304, 'retries shrink the piece; sizes at 4M: ' + sizes.join(','));
+  ok(/Saved to/.test(bannerOf(p)), 'done; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+test('upload in pieces: 409 with the real size resumes from there, nothing doubled', async () => {
+  const {env, win, p} = await pieceEnv();
+  let refused = false;
+  const st = pieceServer(win, (offset, len) => {
+    if (offset === 4194304 && !refused) {
+      refused = true;
+      // The previous attempt landed 1000 bytes of this piece before dying.
+      st.file.push([4194304, 1000]);
+      return {status: 409, body: {error: 'offset mismatch', size: 4194304 + 1000}};
+    }
+    return {status: 200, body: {ok: true, size: offset + len}};
+  });
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.some(c => c.offset === 4194304 + 1000), 'resumed at the reported size; offsets=' + st.calls.map(c => c.offset).join(','));
+  ok(assembled(st) === 10 * 1024 * 1024, 'contiguous, complete');
+  cleanup(env);
+});
+
+test('upload in pieces: a final answer (413) stops the upload, no retries', async () => {
+  const {env, win, p} = await pieceEnv();
+  const st = pieceServer(win, () => ({status: 413, body: {error: 'file too large'}}));
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.length === 1, 'one request; got ' + st.calls.length);
+  ok(/larger than the server allows/.test(bannerOf(p)), 'reason shown; got ' + JSON.stringify(bannerOf(p)));
+  cleanup(env);
+});
+
+test('upload in pieces: eight failures in a row give up with the reason', async () => {
+  const {env, win, p} = await pieceEnv();
+  const st = pieceServer(win, () => 'timeout');
+  win.UPLOAD_CHUNK_TIMEOUT_MS = 5;
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  for (let i = 0; i < 2000 && !/failed/i.test(bannerOf(p)); i++) await sleep(10);
+  ok(/Upload failed: no answer from the server/.test(bannerOf(p)), 'gave up with the reason; got ' + JSON.stringify(bannerOf(p)));
+  ok(st.calls.length === 8, 'eight tries; got ' + st.calls.length);
+  cleanup(env);
+});
+
+test('upload: an older server (no upload_chunks) still gets the whole file in one request', async () => {
+  const env = await mkEnv([
+    {action: 'config', response: {restrict_hosts: false, connections: []}},
+    {action: 'upload_finalize', response: {ok: true, path: '/home/u/big.bin'}},
+  ]);
+  const win = env.win;
+  const st = pieceServer(win, (offset, len) => ({status: 200, body: {ok: true}}));
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = 's1'; p.host = 'h'; p.persistent = true; p.cwd = '/home/u';
+  win.handleUpload(p.id, {files: [bigFile('big.bin', 10 * 1024 * 1024)], value: ''});
+  await uploadSettles(p, env.log);
+  ok(st.calls.length === 1 && st.calls[0].offset === null, 'one request, no offset; got ' + JSON.stringify(st.calls));
+  cleanup(env);
+});
+
 test('upload finalize failure reports bytes-landed without jargon', async () => {
   const env = await mkEnv([
     {action: 'config', response: {restrict_hosts: false, connections: []}},

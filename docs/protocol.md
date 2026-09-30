@@ -144,6 +144,16 @@ Raw request body = file bytes (`Content-Length` required, capped by
 Streams into `$HOME/<path>` over the ControlMaster. Reply
 `{"ok": true, "bytes": n, "path": "$HOME/<path>"}` / `{"error": ...}`.
 
+With `&offset=N` the body is one piece of the file: `offset=0`
+truncates and writes, `offset>0` appends - but only if the remote file
+is exactly N bytes long; otherwise `409 {"error": "offset mismatch",
+"size": <actual>}` and the client resumes from `size`. `size` in the
+`ok` reply is the file's length after the piece. The client sends
+pieces (4 MB, smaller after failures, each retried on its own) only
+when `/api/config` says `upload_chunks: true`, because an older server
+would overwrite the file with every piece. Pieces are what let an
+upload cross a proxy or VPN that cuts long or large requests.
+
 ### POST /api/upload_finalize
 Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`
 to its destination with collision auto-increment (`a.txt` → `a(1).txt`).
