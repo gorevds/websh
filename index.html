@@ -30,18 +30,28 @@
     .logo{font-family:'JetBrains Mono',ui-monospace,monospace;font-size:16px;font-weight:700;letter-spacing:-0.01em;color:var(--tx)}
     .top-slogan{font-size:11px;color:var(--dim)}
     /* ── Tabs ── The strip takes the room between the logo and the
-       right-hand buttons. Tabs shrink to a minimum width (label
-       ellipsised), then the strip scrolls sideways; the page itself
-       never does (every flex item here may shrink: min-width:0). */
+       right-hand group: the free space sits after "+" (its auto right
+       margin), so #paneTools and .top-r stay at the right end and the
+       tabs grow into the rest, each up to 260px before its label is
+       cut. Tabs shrink to a minimum width (label ellipsised), then the
+       strip scrolls sideways; the page itself never does (every flex
+       item here may shrink: min-width:0). Below 900px the wordmark and
+       slogan go (the icon stays) so the tabs get that room too.
+       The strip's 1px end padding: its width is rarely a whole pixel
+       and the scroll range is rounded, so without it the last tab can
+       stay half a pixel short of fully scrolled into view. */
     .top{gap:10px;min-width:0}
     .top-l,.top-r{flex-shrink:0}
-    .top-r{margin-left:auto}
     body.has-tabs .top-slogan{display:none}
-    @media (max-width:600px){body.has-tabs .top .logo{display:none}}
-    #tabs{display:flex;align-items:center;gap:2px;flex:0 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;position:relative;scrollbar-width:none;align-self:stretch}
+    @media (max-width:900px){.top .logo,.top .top-slogan{display:none}}
+    /* Phone width: the pane actions and the global buttons leave the
+       strip too little for one tab at its minimum; tighter spacing gives
+       it back (~40px at 560px). */
+    @media (max-width:640px){.top{padding:6px 8px;gap:4px}}
+    #tabs{display:flex;align-items:center;gap:2px;padding-right:1px;flex:0 1 auto;min-width:0;overflow-x:auto;overflow-y:hidden;position:relative;scrollbar-width:none;align-self:stretch}
     #tabs::-webkit-scrollbar{display:none}
-    #tabNew{flex-shrink:0}
-    .tab{display:flex;align-items:center;gap:6px;flex:0 1 180px;min-width:96px;max-width:220px;height:28px;padding:0 4px 0 10px;border-radius:6px;border:1px solid transparent;color:var(--dim);font-size:12px;cursor:default;user-select:none;-webkit-user-select:none;transition:background .15s,color .15s}
+    #tabNew{flex-shrink:0;margin-right:auto}
+    .tab{display:flex;align-items:center;gap:6px;flex:0 1 260px;width:260px;min-width:96px;max-width:260px;height:28px;padding:0 4px 0 10px;border-radius:6px;border:1px solid transparent;color:var(--dim);font-size:12px;cursor:default;user-select:none;-webkit-user-select:none;transition:background .15s,color .15s}
     .tab:hover{background:rgba(255,255,255,.05);color:var(--tx)}
     .tab.active{background:var(--bg);border-color:var(--bd);color:var(--tx)}
     .tab.dragging{opacity:.75;cursor:grabbing}

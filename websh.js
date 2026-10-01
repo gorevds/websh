@@ -926,10 +926,13 @@ function showTab(id, o) {
 function scrollTabIntoView(t) {
   let strip = $('tabs');
   if (!strip || !t) return;
-  let el = t.el;
-  let left = el.offsetLeft, right = left + el.offsetWidth;
-  if (left < strip.scrollLeft) strip.scrollLeft = left;
-  else if (right > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = right - strip.clientWidth;
+  // Measured in fractional pixels: the strip's width is whatever the
+  // top bar leaves it, usually not a whole number, and offsetWidth /
+  // clientWidth round it - which left the last tab half a pixel outside
+  // the strip. Overshoot by rounding up; the browser clamps scrollLeft.
+  let sr = strip.getBoundingClientRect(), r = t.el.getBoundingClientRect();
+  if (r.left < sr.left) strip.scrollLeft -= Math.ceil(sr.left - r.left);
+  else if (r.right > sr.right) strip.scrollLeft += Math.ceil(r.right - sr.right);
 }
 
 // Remove an (emptied) tab. If it was the active one, the tab to its
@@ -1065,9 +1068,9 @@ function fillPaneTools(box, p, busy, tag) {
   box.querySelector('[data-act="download"]').disabled = off;
   let tg = box.querySelector('.pane-tag');
   tg.className = 'pane-tag ' + tag + (tag ? '' : ' h');
-  // Short words: the group takes its width from the tab strip. The
-  // tooltip says what they mean.
-  tg.textContent = tag === 'persistent' ? 'tmux' : 'temp';
+  // The same words as a pane's own bar (updatePaneTag); the tooltip
+  // says what they mean.
+  tg.textContent = tag === 'persistent' ? 'persistent' : 'short-lived';
   tg.title = tag === 'persistent'
     ? 'This pane is wrapped in remote tmux and will survive browser refresh.'
     : 'This pane is NOT persistent — it will be lost on refresh.';

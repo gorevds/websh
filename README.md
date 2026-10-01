@@ -52,7 +52,7 @@ For deeper internals — buffer-detection probe, lost-byte handling on disconnec
 Real xterm.js — copy-on-select, right-click paste, `Ctrl+V` paste (on by default; switch it off in ⚙ Options to send a literal `^V` to the shell), scrollback search (`Ctrl+Shift+F`), zoom (`Ctrl+±`), fullscreen (`F11`).
 
 - Tabs in the top bar, each holding its own split layout: `+` opens the login form for a new tab; drag a tab to reorder it, middle-click or `×` to close it (persistent sessions are confirmed once per tab). Tabs in the background stay connected and mark themselves when output arrives. Tabs, their order and layouts come back after a reload
-- A tab with a single pane shows no pane bar: the tab carries the host and state, and the pane's actions (upload, download, split, close, plus a `tmux`/`temp` marker) sit in the top bar next to the tabs. Split it and every pane gets its bar back
+- A tab with a single pane shows no pane bar: the tab carries the host and state, and the pane's actions (upload, download, split, close, plus a `persistent`/`short-lived` marker, the same words as a pane bar) sit at the right end of the top bar, before the global buttons. Split it and every pane gets its bar back
 - Split panes, horizontal or vertical, with draggable dividers
 - Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab` (within the current tab)
 - Font picker (⚙) with live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono, Source Code Pro, Inconsolata, or system default. Custom size, line-height, weight
