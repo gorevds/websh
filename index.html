@@ -58,6 +58,17 @@
     .tab:hover .tab-close,.tab.active .tab-close{visibility:visible}
     .tab-close:hover{color:var(--dg);background:rgba(255,255,255,.08)}
     .tab-root{flex:1;display:flex;min-width:0;min-height:0}
+    /* A tab with one pane: the pane has no bar (the tab carries label and
+       state); its actions are in #paneTools, framed off from the tabs and
+       from the global buttons. websh.js: syncTabSolo / renderPaneTools. */
+    .tab-root.solo .pane-bar{display:none}
+    #paneTools{display:flex;align-items:center;gap:0;flex-shrink:0;padding:0 5px;border-left:1px solid var(--bd);border-right:1px solid var(--bd)}
+    #paneTools .tbtn{padding:4px 3px}
+    #paneTools .pane-tag{margin:0 3px 0 0}
+    #paneTools .tbtn:disabled{opacity:.3;cursor:default;pointer-events:none}
+    #paneTools .tbtn.close:hover{color:var(--dg)}
+    /* A lone pane's transfer progress: a card in the overlay stack. */
+    .pane-overlays>.upload-progress{flex:none;width:360px;padding:5px 8px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;box-shadow:0 4px 14px rgba(0,0,0,.35)}
     .s-off{background:rgba(248,81,73,.15);color:var(--dg)}
     .s-wait{background:rgba(210,153,34,.15);color:var(--wn)}
     .s-on{background:rgba(63,185,80,.15);color:var(--ok)}
@@ -562,6 +573,14 @@
   </div>
   <div id="tabs" role="tablist" aria-label="Tabs"></div>
   <button id="tabNew" class="tbtn" onclick="newTab()" title="New tab" aria-label="New tab"><svg class="ic"><use href="#i-plus"></use></svg></button>
+  <div id="paneTools" class="h" role="group" aria-label="Pane actions">
+    <span class="pane-tag h"></span>
+    <button class="tbtn" data-act="upload" title="Upload file" aria-label="Upload file" disabled><svg class="ic"><use href="#i-upload"></use></svg></button>
+    <button class="tbtn" data-act="download" title="Download file" aria-label="Download file" disabled><svg class="ic"><use href="#i-download"></use></svg></button>
+    <button class="tbtn" data-act="split-h" title="Split horizontal" aria-label="Split horizontal"><svg class="ic"><use href="#i-split-h"></use></svg></button>
+    <button class="tbtn" data-act="split-v" title="Split vertical" aria-label="Split vertical"><svg class="ic"><use href="#i-split-v"></use></svg></button>
+    <button class="tbtn close" data-act="close" title="Close pane" aria-label="Close pane"><svg class="ic"><use href="#i-close"></use></svg></button>
+  </div>
   <div class="top-r">
     <button class="tbtn" onclick="toggleSearch()" title="Search (Ctrl+Shift+F)" aria-label="Search"><svg class="ic"><use href="#i-search"></use></svg></button>
     <button class="tbtn" onclick="zoomIn()" title="Zoom in (Ctrl+Plus)" aria-label="Zoom in">A+</button>

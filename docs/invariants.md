@@ -123,6 +123,19 @@ as one tab holding that layout, and the panes keep their sessionStorage
 secrets. Guard: frontend `tabs: a manifest saved by the previous
 version loads as one tab…`.
 
+**U4. A lone pane has no bar, and the bar coming or going resizes
+the PTY once.** A tab with exactly one pane is `.tab-root.solo`: the
+pane bar is hidden, its actions are in the top bar (`#paneTools`, on
+the active pane), a transfer's progress moves into the pane's overlay
+stack. `renderTab` recomputes this on every call, so any path that
+changes a tab's pane count (split, close, dismissed split, restore, and
+a move between tabs - which must render BOTH tabs) keeps it right. The
+refit is the pane's ResizeObserver: one fit, one debounced, deduped
+`/api/resize`; a hidden tab's pane is skipped as in U1. On reload the
+solo state is set before the synchronous fit, so a restored lone pane
+connects at its full height. Guard: frontend `solo: …`; e2e `tabsolo`
+(`stty size` against the terminal after split and close).
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

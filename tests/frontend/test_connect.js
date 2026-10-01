@@ -8511,7 +8511,10 @@ test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pan
   const exp = code.match(/<symbol id="i-export"[\s\S]*?<\/symbol>/)[0];
   ok(/M13\.4 3\.6v5h5/.test(exp), 'Export icon is a document with a down arrow');
   ok(!/[\u{1F300}-\u{1FAFF}]/u.test(code), 'no emoji left in the markup');
-  const paneIcons = p.el.querySelectorAll('.pane-bar svg.ic use');
+  // The transfer card may sit in the bar or float over a lone pane (tabs
+  // step 2), so it is found by its pane id, not by its place.
+  const paneIcons = Array.from(p.el.querySelectorAll('.pane-bar .pane-btn svg.ic use'))
+    .concat(Array.from(win.document.querySelectorAll('[data-upload-progress="' + p.id + '"] .upload-progress-cancel svg.ic use')));
   ok(paneIcons.length === 6, 'pane bar buttons (5 + transfer cancel) use the sprite; got ' + paneIcons.length);
   ok(Array.from(paneIcons).every(u => /^#i-/.test(u.getAttribute('href'))), 'each references a symbol');
   // File rows: icon by type, actions as icons with their labels intact.
@@ -8652,19 +8655,73 @@ async function until(fn, ms) {
 }
 
 function installLayoutModel(win) {
-  const lay = {box: {cols: 80, rows: 24}, ros: []};
+  // barRows (0 unless a test sets it): the pane bar's height in rows.
+  // While a pane's .pane-bar is shown, everything inside that pane's
+  // .pane-term is that much shorter - so hiding the bar gives the
+  // terminal more rows, and the ResizeObserver sees the change.
+  const lay = {box: {cols: 80, rows: 24}, ros: [], barRows: 0};
   const hiddenEl = el => {
     if (!el || !el.isConnected) return true;
     for (let e = el; e && e.nodeType === 1; e = e.parentElement) {
       if (e.hidden || (e.classList && e.classList.contains('h'))) return true;
       if (e.style && e.style.display === 'none') return true;
-      if (win.getComputedStyle(e).display === 'none') return true;
+      if (displayOf(e) === 'none') return true;
     }
     return false;
   };
+  // jsdom's getComputedStyle ignores selector specificity (the later
+  // rule wins), so `.tab-root.solo .pane-bar{display:none}` written
+  // before `.pane-bar{display:flex}` would read as shown. Cascade the
+  // `display` declarations ourselves: !important, then specificity,
+  // then source order; inline style over sheet rules.
+  let displayRules = null;
+  const specificity = sel => {
+    const s = sel.replace(/::?[a-z-]+\([^)]*\)/g, m => /^:not\(/.test(m) ? m.slice(5, -1) : ':x');
+    const a = (s.match(/#[\w-]+/g) || []).length;
+    const b = (s.match(/\.[\w-]+|\[[^\]]*\]|:(?!:)[\w-]+/g) || []).length;
+    const c = (s.replace(/#[\w-]+|\.[\w-]+|\[[^\]]*\]|::?[\w-]+/g, ' ').match(/[a-z][\w-]*/gi) || []).length;
+    return a * 10000 + b * 100 + c;
+  };
+  const collectRules = () => {
+    const out = [];
+    let order = 0;
+    const walk = rules => Array.from(rules || []).forEach(r => {
+      if (r.cssRules && !r.selectorText) { walk(r.cssRules); return; }
+      if (!r.selectorText || !r.style) return;
+      const v = r.style.getPropertyValue('display');
+      if (!v) return;
+      const imp = r.style.getPropertyPriority('display') === 'important';
+      r.selectorText.split(',').forEach(sel => out.push({sel: sel.trim(), v: v.trim(), imp, spec: specificity(sel), order: order++}));
+    });
+    Array.from(win.document.styleSheets).forEach(sh => { try { walk(sh.cssRules); } catch (e) {} });
+    return out;
+  };
+  const displayOf = el => {
+    if (!displayRules) displayRules = collectRules();
+    let best = null;
+    for (const r of displayRules) {
+      let m = false;
+      try { m = el.matches(r.sel); } catch (e) {}
+      if (!m) continue;
+      if (!best || (r.imp !== best.imp ? r.imp : (r.spec !== best.spec ? r.spec > best.spec : r.order > best.order))) best = r;
+    }
+    const inl = el.style && el.style.getPropertyValue('display');
+    if (inl && !(best && best.imp)) return inl;
+    return best ? best.v : '';
+  };
+  lay.displayOf = displayOf;
   lay.hidden = hiddenEl;
+  const barOver = el => {
+    if (!lay.barRows || !el || !el.closest) return 0;
+    const term = el.closest('.pane-term');
+    const pane = term && term.closest('.pane');
+    if (!pane) return 0;
+    const bar = Array.from(pane.children).find(c => c.classList.contains('pane-bar'));
+    return bar && !hiddenEl(bar) ? lay.barRows : 0;
+  };
+  lay.barOver = barOver;
   const sizeOf = el => hiddenEl(el) ? {width: 0, height: 0}
-    : {width: lay.box.cols * 9, height: lay.box.rows * 18};
+    : {width: lay.box.cols * 9, height: (lay.box.rows - barOver(el)) * 18};
   lay.sizeOf = sizeOf;
   const P = win.HTMLElement.prototype;
   const def = (k, f) => Object.defineProperty(P, k, {get() { return f(this); }, configurable: true});
@@ -8717,7 +8774,7 @@ function installLayoutModel(win) {
       // The box holds box.cols x box.rows cells at the font size the
       // first terminal was made with; a bigger font fits fewer.
       const k = (lay.baseFont && t.options && t.options.fontSize) ? lay.baseFont / t.options.fontSize : 1;
-      return {cols: Math.floor(lay.box.cols * k), rows: Math.floor(lay.box.rows * k)};
+      return {cols: Math.floor(lay.box.cols * k), rows: Math.floor((lay.box.rows - barOver(t.element)) * k)};
     }
     fit() {
       const d = this.proposeDimensions();
@@ -8768,7 +8825,7 @@ const TAB_EXPOSE = `
   Object.defineProperty(window, 'activeId', {get: () => activeId, configurable: true});
 })();`;
 
-async function mkTabEnv(plan, pre) {
+async function mkTabEnv(plan, pre, o) {
   const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true,
                                url: 'http://localhost/websh/'});
   const win = dom.window;
@@ -8776,6 +8833,7 @@ async function mkTabEnv(plan, pre) {
   const state = {dead: false};
   makeFakes(win);
   const lay = installLayoutModel(win);
+  if (o && o.barRows) lay.barRows = o.barRows;
   win.fetch = makeFetch(plan, log, state);
   _injectVaultGlobals(win);
   win.localStorage.clear();
@@ -9860,6 +9918,625 @@ test('tabs: a background reconnect while the + form is open does not hijack the 
   const c = await tConnect(win, 'c.host');
   ok(!!c && tabEls(win).length === 3 && panesOfTab(win, tabOfPane(c)).length === 1, 'the + connect makes its own tab');
   ok(panesOfTab(win, tabOfPane(a)).length === 1 && a.sid === 'sid-a.host', 'a keeps its tab and session');
+  cleanup(env);
+});
+
+// =====================================================================
+// Tabs (step 2): a lone pane has no bar of its own.
+// Written from the behaviour spec, before the feature existed.
+//
+// DOM contract these tests rely on (the implementer provides it):
+//   .pane > .pane-bar         hidden (.h, [hidden] or display:none, also
+//                             through a class on an ancestor such as
+//                             .tab-root.solo) while its tab has ONE pane;
+//                             shown in a tab with 2+ panes
+//   #paneTools                group in .top, after #tabNew and before
+//                             .top-r; shown only when the active tab has
+//                             exactly one pane, hidden otherwise (also
+//                             when there is no tab: initial login form)
+//   #paneTools [data-act=upload|download|split-h|split-v|close]
+//                             buttons acting on the active pane;
+//                             upload/download .disabled until it is
+//                             connected and while a transfer runs
+//   .upload-progress          (with .upload-progress-text and
+//                             .upload-progress-cancel) a VISIBLE one for a
+//                             lone pane's transfer - in #paneTools or as
+//                             a card over the pane
+//   .pane-tag.persistent / .pane-tag.ephemeral
+//                             the marker stays visible for a lone pane
+//                             (in the tab handle or #paneTools)
+// The layout model gives the bar 2 rows: the bar shown, the terminal
+// has 22 of the box's 24 rows; hidden, all 24.
+// =====================================================================
+const BAR = 2;
+const S2 = {barRows: BAR};
+const barOf = p => p && p.el && p.el.querySelector('.pane-bar');
+const barShown = (env, p) => { const b = barOf(p); return !!b && !env.lay.hidden(b); };
+const tools = win => $(win, 'paneTools');
+const toolsShown = env => !!tools(env.win) && !env.lay.hidden(tools(env.win));
+const toolBtn = (win, act) => { const g = tools(win); return g ? g.querySelector('[data-act="' + act + '"]') : null; };
+const ACTS = ['upload', 'download', 'split-h', 'split-v', 'close'];
+function needTools(win) {
+  const g = !!tools(win);
+  ok(g, 'top-bar pane actions present: #paneTools');
+  return g;
+}
+const sizesSent = (env, sid, from) => resizesFor(env, sid, from).map(e => e.body.cols + 'x' + e.body.rows);
+// The size the server last heard for a session: the connect, then every
+// resize after it.
+function serverSize(env, sid) {
+  let s = null;
+  env.log.forEach(e => {
+    if (e.action === 'connect' && e.body && ('sid-' + (e.body.host || e.body.connection)) === sid && e.body.cols)
+      s = e.body.cols + 'x' + e.body.rows;
+    if (e.action === 'resize' && e.body && e.body.session_id === sid) s = e.body.cols + 'x' + e.body.rows;
+  });
+  return s;
+}
+// Settles the debounced resize of a pane so later counts start clean.
+async function settled(win, p) {
+  win.flushPaneResize(p);
+  await until(() => p.lastSentCols === p.term.cols && p.lastSentRows === p.term.rows, 1000);
+  await sleep(200);            // past the 150 ms resize debounce
+}
+function visibleAll(env, sel) {
+  return Array.from(env.win.document.querySelectorAll(sel)).filter(e => !env.lay.hidden(e));
+}
+function fireChange(win, input) {
+  const code = input.getAttribute && input.getAttribute('onchange');
+  if (code) win.eval('(function(){' + code + '})').call(input);
+  else input.dispatchEvent(new win.Event('change', {bubbles: true}));
+}
+// Records every <input> .click() (the file picker opening).
+function pickerSpy(win) {
+  const seen = [];
+  const P = win.HTMLInputElement.prototype;
+  const orig = P.click;
+  P.click = function() { seen.push(this); };
+  seen.restore = () => { P.click = orig; };
+  return seen;
+}
+// XHR that reports some progress and then hangs until aborted.
+function hangingXhr(win) {
+  const st = {xhrs: []};
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; st.xhrs.push(this); }
+    open(m, url) { this.url = url; }
+    setRequestHeader() {}
+    abort() { this.aborted = true; }
+    send() { win.setTimeout(() => { if (!this.aborted && this.upload.onprogress) this.upload.onprogress({loaded: 400}); }, 2); }
+  };
+  return st;
+}
+
+test('solo: a lone pane has no bar; its terminal gets the height and the server that size', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const g0 = tools(win);
+  ok(!g0 || env.lay.hidden(g0), 'no pane actions in the top bar while the initial login form is up');
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  ok(!barShown(env, a), 'the lone pane\'s .pane-bar is not shown');
+  ok(a.term.cols === 80 && a.term.rows === 24,
+     'the terminal has the whole box, 80x24 (22 rows would mean the bar still takes its place); got ' + a.term.cols + 'x' + a.term.rows);
+  ok(serverSize(env, 'sid-a.host') === '80x24', 'the server has 80x24 for the PTY; got ' + serverSize(env, 'sid-a.host'));
+  if (!needTools(win)) { cleanup(env); return; }
+  ok(toolsShown(env), '#paneTools is shown with one pane in the tab');
+  const top = win.document.querySelector('.top');
+  const g = tools(win);
+  const F = win.Node.DOCUMENT_POSITION_FOLLOWING;
+  ok(top.contains(g), '#paneTools is in the top bar');
+  ok(!!($(win, 'tabNew').compareDocumentPosition(g) & F) && !!(g.compareDocumentPosition(top.querySelector('.top-r')) & F),
+     '#paneTools sits after the tab strip and "+" and before the global buttons (.top-r)');
+  ACTS.forEach(act => {
+    const btn = toolBtn(win, act);
+    ok(!!btn && !env.lay.hidden(btn), 'top-bar button [data-act=' + act + '] is there and shown');
+    const u = btn && btn.querySelector('svg.ic use');
+    ok(!!u && /^#i-/.test(u.getAttribute('href') || ''), '[data-act=' + act + '] uses the icon sprite like the pane bar');
+    ok(!!btn && !!btn.getAttribute('aria-label'), '[data-act=' + act + '] has an aria-label');
+  });
+  ok(toolBtn(win, 'upload') && !toolBtn(win, 'upload').disabled, 'upload is enabled for a connected pane');
+  ok(toolBtn(win, 'download') && !toolBtn(win, 'download').disabled, 'download is enabled for a connected pane');
+  ok(!!(toolBtn(win, 'upload') || {}).title && !!(toolBtn(win, 'close') || {}).title, 'the buttons carry tooltips');
+  cleanup(env);
+});
+
+test('solo: a split brings the bars back and refits once; closing back to one pane hides it and refits once', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  needTools(win);
+  await settled(win, a);
+  ok(a.term.rows === 24 && !barShown(env, a), 'start: lone pane, no bar, 24 rows; got ' + a.term.rows);
+  let mark = env.log.length;
+  const b = await tSplit(win, a, 'h', 'b.host');
+  if (!b) { ok(false, 'setup: split'); cleanup(env); return; }
+  await until(() => a.term.rows === 24 - BAR, 1000);
+  await sleep(300);
+  ok(barShown(env, a) && barShown(env, b), 'with two panes both bars are shown');
+  ok(!toolsShown(env), 'and the top-bar pane actions are hidden');
+  ok(a.term.rows === 24 - BAR, 'the first pane gave the bar its rows: ' + (24 - BAR) + '; got ' + a.term.rows);
+  let rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x' + (24 - BAR), 'exactly one /api/resize 80x' + (24 - BAR) + ' for the first pane; got ' + JSON.stringify(rs));
+  ok(b.term.rows === 24 - BAR, 'the new pane, with its bar, has ' + (24 - BAR) + ' rows; got ' + b.term.rows);
+  await settled(win, b);
+  mark = env.log.length;
+  win.closePane(b.id);
+  await until(() => !win.panes[b.id], 500);
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  ok(!barShown(env, a), 'one pane left: its bar is hidden again');
+  ok(toolsShown(env), 'and the pane actions are back in the top bar');
+  ok(a.term.rows === 24, 'the terminal gets the bar\'s rows back: 24; got ' + a.term.rows);
+  rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x24', 'exactly one /api/resize 80x24; got ' + JSON.stringify(rs));
+  ok(env.log.filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('solo: switching between a one-pane tab and a split tab flips bars and top-bar actions, with no resize', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a1 = await tConnect(win, 'a1.host');
+  if (!needTabs(win) || !a1) { cleanup(env); return; }
+  needTools(win);
+  const a2 = await tSplit(win, a1, 'v', 'a2.host');
+  const b = await tNewTab(win, 'b.host');
+  if (!a2 || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a1), tB = tabOfPane(b);
+  await settled(win, b);
+  ok(tabId(activeTab(win)) === tB, 'B (one pane) in front');
+  ok(!barShown(env, b) && toolsShown(env), 'B: no pane bar, actions in the top bar');
+  ok(b.term.rows === 24, 'B\'s terminal has 24 rows; got ' + b.term.rows);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await until(() => !toolsShown(env), 500);
+  ok(!toolsShown(env), 'A (two panes) in front: top-bar pane actions hidden');
+  ok(barShown(env, a1) && barShown(env, a2), 'A: both panes show their bar');
+  await settled(win, a1); await settled(win, a2);
+  ok(a1.term.rows === 24 - BAR && a2.term.rows === 24 - BAR, 'A\'s terminals leave room for their bars; got ' + a1.term.rows + '/' + a2.term.rows);
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  await until(() => toolsShown(env), 500);
+  ok(toolsShown(env) && !barShown(env, b), 'back on B: actions in the top bar, no pane bar');
+  ok(b.term.rows === 24, 'B still 24 rows; got ' + b.term.rows);
+  // Now everything is settled: switching back and forth sends nothing.
+  await sleep(200);
+  const mark = env.log.length;
+  for (let i = 0; i < 3; i++) {
+    clickTab(win, tabById(win, tA)); await until(() => tabId(activeTab(win)) === tA, 500);
+    await sleep(20);
+    clickTab(win, tabById(win, tB)); await until(() => tabId(activeTab(win)) === tB, 500);
+    await sleep(20);
+  }
+  await sleep(300);
+  const rs = env.log.slice(mark).filter(e => e.action === 'resize').map(e => e.body.session_id + ' ' + e.body.cols + 'x' + e.body.rows);
+  ok(rs.length === 0, 'switching tabs (sizes unchanged) sends no /api/resize; got ' + JSON.stringify(rs));
+  ok(toolsShown(env) && !barShown(env, b), 'ends on B with the right chrome');
+  cleanup(env);
+});
+
+test('solo: the top-bar actions act on the active pane of the active tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'ls', response: {path: '/home/u', entries: []}},
+  ]), null, S2); const win = env.win;
+  const urls = recordUrls(win);
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needTools(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host', {persistent: true});
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  ok(tabId(activeTab(win)) === tB && win.activeId === b.id, 'B in front');
+  const esc = async () => {
+    win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+    await until(() => hidden($(win, 'ov')), 500);
+  };
+  // Split horizontal / vertical: the login form for a split of b.
+  press(win, toolBtn(win, 'split-h'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'split-h opens the login form');
+  ok(win.pendingSplit && win.pendingSplit.fromId === b.id && win.pendingSplit.dir === 'h',
+     'for a horizontal split of the active pane; got ' + JSON.stringify(win.pendingSplit));
+  await esc();
+  press(win, toolBtn(win, 'split-v'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(win.pendingSplit && win.pendingSplit.fromId === b.id && win.pendingSplit.dir === 'v',
+     'split-v: a vertical split of the active pane; got ' + JSON.stringify(win.pendingSplit));
+  await esc();
+  await until(() => toolsShown(env) && !barShown(env, b), 500);
+  ok(panesOfTab(win, tB).length === 1 && !barShown(env, b) && toolsShown(env) && hidden($(win, 'ov')),
+     'dismissed: B unchanged, still one pane without a bar; panes=' + panesOfTab(win, tB).length +
+     ' bar=' + barShown(env, b) + ' tools=' + toolsShown(env) + ' form open=' + !hidden($(win, 'ov')));
+  // Upload: the file picker opens, and what is picked goes to b.
+  const st = hangingXhr(win);
+  const picks = pickerSpy(win);
+  press(win, toolBtn(win, 'upload'));
+  picks.restore();
+  const inp = picks.find(i => i.type === 'file');
+  ok(!!inp, 'upload opens a file picker; inputs clicked: ' + picks.length);
+  if (inp) {
+    Object.defineProperty(inp, 'files', {value: [{name: 'top.txt', size: 4}], configurable: true});
+    fireChange(win, inp);
+    await until(() => st.xhrs.length > 0, 500);
+    ok(st.xhrs.length === 1 && /session_id=sid-b\.host/.test(st.xhrs[0].url || ''),
+       'the picked file uploads into b; got ' + JSON.stringify(st.xhrs.map(x => x.url)));
+    ok(!a.upload, 'nothing goes to the pane in the hidden tab');
+    if (b.upload) win.cancelTransfer(b.id);
+    await until(() => !b.upload, 3000);
+  }
+  // Download: the file browser for b.
+  await until(() => !toolBtn(win, 'download').disabled, 3000);
+  press(win, toolBtn(win, 'download'));
+  await until(() => !hidden($(win, 'fbOv')), 500);
+  ok(!hidden($(win, 'fbOv')), 'download opens the file browser');
+  ok(($(win, 'fbHost') || {}).textContent === 'u@b.host', 'on b\'s host; got ' + JSON.stringify(($(win, 'fbHost') || {}).textContent));
+  await until(() => urls.some(u => /action=ls/.test(u)), 500);
+  const ls = urls.filter(u => /action=ls/.test(u));
+  ok(ls.length > 0 && ls.every(u => /session_id=sid-b\.host/.test(u)), 'the listing is for b\'s session; got ' + JSON.stringify(ls));
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Escape', bubbles: true, cancelable: true}));
+  await until(() => hidden($(win, 'fbOv')), 500);
+  // Close on a live tmux pane: the same terminate question as the pane's own x.
+  const modal = confirmCounter(win);
+  press(win, toolBtn(win, 'close'));
+  await until(() => modal.opened > 0, 500);
+  ok(modal.opened === 1, 'close on a live tmux pane asks to terminate, once; got ' + modal.opened);
+  win.confirmCancel();
+  await sleep(30);
+  ok(!!win.panes[b.id] && b.sid === 'sid-b.host', 'Cancel keeps it');
+  press(win, toolBtn(win, 'close'));
+  await until(() => modal.opened > 1, 500);
+  win.confirmTerminate(false);
+  await until(() => !win.panes[b.id], 500);
+  const d = disconnectsFor(env, 'sid-b.host');
+  ok(d.length === 1 && d[0].body.terminate === true, 'b terminated once; got ' + JSON.stringify(d.map(e => e.body)));
+  ok(!tabById(win, tB) && tabId(activeTab(win)) === tA, 'its tab is gone and A is in front');
+  ok(!!win.panes[a.id] && a.sid === 'sid-a.host', 'a untouched');
+  // Close on a short-lived lone pane in the last tab: initial form.
+  ok(toolsShown(env), 'A (one pane): actions in the top bar');
+  press(win, toolBtn(win, 'close'));
+  await until(() => !win.panes[a.id], 500);
+  ok(!win.panes[a.id] && disconnectsFor(env, 'sid-a.host').length === 1, 'close closed a, no question');
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')) && win.overlayMode === 'initial', 'last pane gone: the initial login form');
+  await until(() => !toolsShown(env), 500);
+  ok(!toolsShown(env), 'and no pane actions in the top bar');
+  cleanup(env);
+});
+
+test('solo: top-bar upload/download are disabled until the pane is connected and while a transfer runs', async () => {
+  // A pane exists without a session while it reconnects after a reload:
+  // the connect below is held for 400 ms.
+  const env0 = await mkTabEnv(TAB_PLAN(), null, S2);
+  const a0 = await tConnect(env0.win, 'slow.host');
+  if (!needTabs(env0.win) || !a0) { cleanup(env0); return; }
+  const snap = snapshotStorage(env0.win);
+  cleanup(env0);
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'slow.host', response: {session_id: 'sid-slow.host', alive: true}, delay: 400},
+  ]), snap, S2); const win = env.win;
+  if (!needTools(win)) { cleanup(env); return; }
+  const pending = () => paneList(win).find(p => p.host === 'slow.host' && !p.sid);
+  const seen = await until(() => !!pending() && win.activeId === pending().id && toolsShown(env), 350);
+  if (seen) {
+    ok(toolBtn(win, 'upload').disabled && toolBtn(win, 'download').disabled,
+       'upload and download are disabled while the lone pane (re)connects');
+  } else {
+    ok(false, 'while the restored pane connects, it is active and #paneTools is shown');
+  }
+  await until(() => paneList(win).some(p => p.host === 'slow.host' && p.sid), 2000);
+  const s = paneList(win).find(p => p.host === 'slow.host');
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(!toolBtn(win, 'upload').disabled && !toolBtn(win, 'download').disabled, 'enabled once connected');
+  const a = await tNewTab(win, 'a.host');
+  if (!a) { ok(false, 'setup: second tab'); cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, s));
+  await until(() => win.activeId === s.id, 500);
+  // A running transfer disables both, like the pane's own buttons.
+  const st = hangingXhr(win);
+  win.handleUpload(s.id, {files: [{name: 'x.bin', size: 5000}], value: ''});
+  await until(() => toolBtn(win, 'upload').disabled, 500);
+  ok(toolBtn(win, 'upload').disabled && toolBtn(win, 'download').disabled, 'disabled while an upload runs');
+  // Switching to the idle tab: the buttons follow that tab's pane.
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id, 500);
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(!toolBtn(win, 'upload').disabled, 'in the other tab the buttons are for its (idle, connected) pane');
+  clickTab(win, tabElOfPane(win, s));
+  await until(() => win.activeId === s.id, 500);
+  await until(() => toolBtn(win, 'upload').disabled, 500);
+  ok(toolBtn(win, 'upload').disabled, 'back: disabled again (the upload is still running)');
+  win.cancelTransfer(s.id);
+  await until(() => !s.upload, 3000);
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(!toolBtn(win, 'upload').disabled, 'enabled again once the transfer is over');
+  // The session drops: disabled again.
+  win.endSession(s, {badge: true});
+  await until(() => toolBtn(win, 'upload').disabled, 500);
+  ok(toolBtn(win, 'upload').disabled && toolBtn(win, 'download').disabled, 'disabled after the session ended');
+  ok(st.xhrs.length >= 1, 'the upload really started');
+  cleanup(env);
+});
+
+test('solo: a lone pane\'s upload shows its progress and a working cancel, for its own tab only', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !a || !b) { cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'no progress shown before an upload');
+  const st = hangingXhr(win);
+  win.handleUpload(a.id, {files: [{name: 'report.pdf', size: 1000}], value: ''});
+  await until(() => visibleAll(env, '.upload-progress').length > 0, 500);
+  let vis = visibleAll(env, '.upload-progress');
+  ok(vis.length === 1, 'one upload progress is visible for the lone pane; got ' + vis.length);
+  const pr = vis[0];
+  await until(() => pr && /report\.pdf|\d+%/.test((pr.querySelector('.upload-progress-text') || {}).textContent || ''), 500);
+  ok(!!pr && /report\.pdf|\d+%/.test((pr.querySelector('.upload-progress-text') || {}).textContent || ''),
+     'it says what is being uploaded / how far; got ' + JSON.stringify(pr && (pr.querySelector('.upload-progress-text') || {}).textContent));
+  const cancel = pr && pr.querySelector('.upload-progress-cancel');
+  ok(!!cancel && !env.lay.hidden(cancel), 'its cancel button is visible');
+  ok(!barShown(env, a), 'and the pane bar stays hidden (the progress is not shown by bringing it back)');
+  ok(a.term.rows === 24, 'the terminal keeps its 24 rows during the upload; got ' + a.term.rows);
+  // Another tab: its pane has no transfer, nothing shown there.
+  clickTab(win, tabById(win, tB));
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  await sleep(20);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'in the other tab, a\'s upload progress is not shown');
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await until(() => visibleAll(env, '.upload-progress').length === 1, 500);
+  vis = visibleAll(env, '.upload-progress');
+  ok(vis.length === 1, 'back in A, the progress is shown again');
+  const c2 = vis[0] && vis[0].querySelector('.upload-progress-cancel');
+  if (c2) press(win, c2);
+  await until(() => st.xhrs.some(x => x.aborted), 500);
+  ok(st.xhrs.length === 1 && st.xhrs[0].aborted, 'cancel aborts the upload');
+  ok(/cancel/i.test(((visibleAll(env, '.upload-progress')[0] || {}).textContent) || ''),
+     'the visible banner says Cancelled; got ' + JSON.stringify(((visibleAll(env, '.upload-progress')[0] || {}).textContent) || ''));
+  await until(() => !a.upload, 3000);
+  await until(() => visibleAll(env, '.upload-progress').length === 0, 500);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'and then goes away');
+  cleanup(env);
+});
+
+test('solo: the persistent / short-lived marker stays visible for a lone pane', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host', {persistent: true});
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !a || !b) { cleanup(env); return; }
+  const tA = tabOfPane(a);
+  // B (short-lived) in front.
+  await until(() => visibleAll(env, '.pane-tag.ephemeral').length >= 1 && visibleAll(env, '.pane-tag.persistent').length === 0, 500);
+  ok(visibleAll(env, '.pane-tag.ephemeral').length >= 1, 'short-lived lone pane: a visible short-lived marker');
+  ok(visibleAll(env, '.pane-tag.persistent').length === 0, 'and no visible persistent marker');
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  await until(() => visibleAll(env, '.pane-tag.persistent').length >= 1 && visibleAll(env, '.pane-tag.ephemeral').length === 0, 500);
+  ok(visibleAll(env, '.pane-tag.persistent').length >= 1, 'persistent lone pane: a visible persistent marker');
+  ok(visibleAll(env, '.pane-tag.ephemeral').length === 0, 'and no visible short-lived marker');
+  ok(!barShown(env, a), 'without bringing the pane bar back');
+  cleanup(env);
+});
+
+test('solo: a split whose login fails and is dismissed leaves the lone pane without a bar, at full height', async () => {
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'bad.host', response: {auth_failed: true, alive: false}},
+  ]), null, S2);
+  const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  needTools(win);
+  await settled(win, a);
+  win.splitPane(a.id, 'h');
+  await until(() => !hidden($(win, 'ov')), 1000);
+  $(win, 'iH').value = 'bad.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'nope';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await until(() => !hidden($(win, 'tmuxOv')) && /Authentication failed/.test($(win, 'tmTitle').textContent), 1000);
+  clickBtn(win, 'tmCancel');
+  await until(() => hidden($(win, 'tmuxOv')), 500);
+  clickBtn(win, 'btnCancel');
+  await until(() => hidden($(win, 'ov')), 500);
+  await until(() => a.term.rows === 24 && !barShown(env, a), 1000);
+  await sleep(300);
+  ok(paneList(win).length === 1, 'one pane left');
+  ok(!barShown(env, a) && toolsShown(env), 'no pane bar, actions in the top bar');
+  ok(a.term.rows === 24, 'full height again: 24 rows; got ' + a.term.rows);
+  ok(serverSize(env, 'sid-a.host') === '80x24', 'the server ends with 80x24; got ' + serverSize(env, 'sid-a.host'));
+  cleanup(env);
+});
+
+test('solo: after a reload a one-pane tab has no bar and a split tab has both', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN(), null, S2); const w1 = env1.win;
+  const a = await tConnect(w1, 'a.host');
+  if (!needTabs(w1) || !a) { cleanup(env1); return; }
+  const b1 = await tNewTab(w1, 'b1.host');
+  const b2 = b1 && await tSplit(w1, b1, 'h', 'b2.host');
+  if (!b2) { ok(false, 'setup'); cleanup(env1); return; }
+  clickTab(w1, tabElOfPane(w1, a));
+  await until(() => tabId(activeTab(w1)) === tabOfPane(a), 500);
+  await sleep(50);
+  const snap = snapshotStorage(w1);
+  cleanup(env1);
+  const env = await mkTabEnv(TAB_PLAN(), snap, S2); const win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 3, 2000);
+  const pa = paneList(win).find(p => p.host === 'a.host');
+  const pb1 = paneList(win).find(p => p.host === 'b1.host');
+  const pb2 = paneList(win).find(p => p.host === 'b2.host');
+  if (!pa || !pb1 || !pb2) { ok(false, 'three panes restored'); cleanup(env); return; }
+  ok(tabOfPane(pa) === tabId(activeTab(win)), 'A (one pane) is in front after the reload');
+  await settled(win, pa);
+  ok(!barShown(env, pa), 'its pane bar is not shown');
+  ok(toolsShown(env), 'the pane actions are in the top bar');
+  ok(pa.term.rows === 24, 'its terminal has 24 rows; got ' + pa.term.rows);
+  ok(serverSize(env, 'sid-a.host') === '80x24', 'and the server has 80x24; got ' + serverSize(env, 'sid-a.host'));
+  const ca = env.log.find(e => e.action === 'connect' && e.body && e.body.host === 'a.host');
+  ok(!!ca && ca.body.cols === 80 && ca.body.rows === 24,
+     'the restored lone pane connects at its full height, 80x24 (not 22 rows and a resize after); got ' +
+     (ca ? ca.body.cols + 'x' + ca.body.rows : 'no connect'));
+  ok(sizesSent(env, 'sid-a.host').every(x => x === '80x24'), 'and is never resized to the 22-row size; got ' + JSON.stringify(sizesSent(env, 'sid-a.host')));
+  ok(env.log.filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  clickTab(win, tabElOfPane(win, pb1));
+  await until(() => tabId(activeTab(win)) === tabOfPane(pb1), 500);
+  await until(() => !toolsShown(env), 500);
+  ok(barShown(env, pb1) && barShown(env, pb2) && !toolsShown(env), 'the split tab shows both bars and no top-bar actions');
+  cleanup(env);
+});
+
+// ---- Step 2, second round: trying to break it ----
+test('solo (break): rapid split / close / split / close ends bar-less at full height, no degenerate size', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const mark = env.log.length;
+  for (let i = 0; i < 4; i++) {
+    const b = await tSplit(win, a, i % 2 ? 'v' : 'h', 'r' + i + '.host');
+    if (!b) { ok(false, 'split ' + i); break; }
+    win.closePane(b.id);
+    await until(() => !win.panes[b.id], 500);
+  }
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  ok(!barShown(env, a) && toolsShown(env), 'ends without a bar, actions in the top bar');
+  ok(a.term.rows === 24 && serverSize(env, 'sid-a.host') === '80x24', 'ends 80x24 on both sides; term ' + a.term.rows + ' server ' + serverSize(env, 'sid-a.host'));
+  const rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length <= 8 && rs.every(x => x === '80x22' || x === '80x24'), 'only the two real sizes, at most one per change; got ' + JSON.stringify(rs));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('solo (break): the bar flips while output floods: still one resize, output intact', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const b = await tSplit(win, a, 'h', 'b.host');
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  await settled(win, a);
+  const written = [];
+  const w0 = a.term.write.bind(a.term);
+  a.term.write = d => { written.push(typeof d === 'string' ? d : String.fromCharCode.apply(null, Array.from(d))); };
+  const mark = env.log.length;
+  let n = 0;
+  const flood = setInterval(() => { for (let k = 0; k < 5; k++) win.handleOutputPayload(a, {data: b64(win, 'L' + (++n) + '\n'), alive: true}, a.sid); }, 1);
+  await sleep(30);
+  win.closePane(b.id);
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  clearInterval(flood);
+  a.term.write = w0;
+  const rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x24', 'one resize to 80x24 under flood; got ' + JSON.stringify(rs));
+  ok(!barShown(env, a) && toolsShown(env), 'bar gone, actions in the top bar');
+  const got = written.join('');
+  let missing = 0;
+  for (let i = 1; i <= n; i++) if (got.indexOf('L' + i + '\n') < 0) missing++;
+  ok(n > 20 && missing === 0, 'all ' + n + ' flooded lines reached the terminal; missing ' + missing);
+  cleanup(env);
+});
+
+test('solo (break): cancel a lone pane\'s upload, switch tabs at once, come back', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !needTools(win) || !b) { cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id, 500);
+  const st = hangingXhr(win);
+  win.handleUpload(a.id, {files: [{name: 'c.bin', size: 1000}], value: ''});
+  await until(() => visibleAll(env, '.upload-progress').length === 1, 500);
+  press(win, visibleAll(env, '.upload-progress')[0].querySelector('.upload-progress-cancel'));
+  clickTab(win, tabElOfPane(win, b));
+  await until(() => win.activeId === b.id, 500);
+  ok(st.xhrs[0] && st.xhrs[0].aborted, 'the upload was aborted');
+  ok(visibleAll(env, '.upload-progress').length === 0, 'B shows no progress of a\'s cancelled upload');
+  ok(!toolBtn(win, 'upload').disabled, 'B\'s upload button is enabled (B is idle)');
+  await until(() => !a.upload, 3000);
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => win.activeId === a.id, 500);
+  await sleep(20);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'back in A after the banner expired: nothing left over');
+  ok(!toolBtn(win, 'upload').disabled && !toolBtn(win, 'download').disabled, 'A\'s buttons are enabled again');
+  ok(!barShown(env, a) && a.term.rows === 24, 'no bar, 24 rows');
+  // And a new upload works and shows again.
+  win.handleUpload(a.id, {files: [{name: 'd.bin', size: 1000}], value: ''});
+  await until(() => visibleAll(env, '.upload-progress').length === 1, 500);
+  ok(visibleAll(env, '.upload-progress').length === 1 && st.xhrs.length === 2, 'a second upload starts and shows');
+  win.cancelTransfer(a.id);
+  cleanup(env);
+});
+
+test('solo (break): reload in the middle of an upload leaves no progress and usable buttons', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN(), null, S2); const w1 = env1.win;
+  const a = await tConnect(w1, 'a.host');
+  if (!needTabs(w1) || !a) { cleanup(env1); return; }
+  hangingXhr(w1);
+  w1.handleUpload(a.id, {files: [{name: 'm.bin', size: 1000}], value: ''});
+  await until(() => !!a.upload, 500);
+  const snap = snapshotStorage(w1);
+  cleanup(env1);
+  const env = await mkTabEnv(TAB_PLAN(), snap, S2); const win = env.win;
+  await until(() => paneList(win).some(p => p.sid), 2000);
+  const p = paneList(win)[0];
+  if (!p || !needTools(win)) { cleanup(env); return; }
+  await until(() => !toolBtn(win, 'upload').disabled, 500);
+  ok(visibleAll(env, '.upload-progress').length === 0, 'no stale progress after the reload');
+  ok(!toolBtn(win, 'upload').disabled, 'upload is enabled');
+  ok(!barShown(env, p) && p.term.rows === 24, 'no bar, 24 rows');
+  cleanup(env);
+});
+
+test('solo (break): a hidden tab drops from 2 panes to 1; shown, it is bar-less with one resize', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const a2 = a && await tSplit(win, a, 'h', 'a2.host');
+  const b = a2 && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { cleanup(env); return; }
+  await settled(win, b);
+  ok(a.lastSentRows === 24 - BAR, 'a settled at ' + (24 - BAR) + ' rows; got ' + a.lastSentRows);
+  const mark = env.log.length;
+  // A's tab is hidden; one of its panes goes (as when another browser tab signs out of the vault).
+  win.closePane(a2.id);
+  await until(() => !win.panes[a2.id], 500);
+  await sleep(300);
+  ok(tabId(activeTab(win)) === tabOfPane(b), 'B stays in front');
+  ok(resizesFor(env, 'sid-a.host', mark).length === 0, 'nothing sent for the hidden pane; got ' + JSON.stringify(sizesSent(env, 'sid-a.host', mark)));
+  ok(a.term.rows === 24 - BAR, 'the hidden terminal is not refitted; got ' + a.term.rows);
+  ok(toolsShown(env) && !barShown(env, b), 'B\'s chrome is unchanged');
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => a.term.rows === 24, 1000);
+  await sleep(300);
+  ok(!barShown(env, a) && toolsShown(env), 'shown: a has no bar, actions in the top bar');
+  const rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === '80x24', 'exactly one resize, 80x24; got ' + JSON.stringify(rs));
+  ok(env.log.slice(mark).filter(e => e.action === 'resize' && degenerate(e)).length === 0, 'no degenerate resize');
+  cleanup(env);
+});
+
+test('solo (break): zoom on a lone pane fits the bar-less box, one resize per step', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const f0 = a.term.options.fontSize;
+  let mark = env.log.length;
+  win.zoomIn();
+  const k = f0 / (f0 + 2);
+  const want = Math.floor(80 * k) + 'x' + Math.floor(24 * k);
+  await until(() => a.term.cols + 'x' + a.term.rows === want, 1500);
+  await sleep(300);
+  ok(a.term.cols + 'x' + a.term.rows === want, 'zoomed in: ' + want + ' (the whole box, no bar); got ' + a.term.cols + 'x' + a.term.rows);
+  let rs = sizesSent(env, 'sid-a.host', mark);
+  ok(rs.length === 1 && rs[0] === want, 'one resize ' + want + '; got ' + JSON.stringify(rs));
+  ok(!barShown(env, a) && toolsShown(env), 'no bar after the zoom');
+  mark = env.log.length;
+  win.zoomOut();
+  await until(() => a.term.rows === 24, 1500);
+  await sleep(300);
+  rs = sizesSent(env, 'sid-a.host', mark);
+  ok(a.term.rows === 24 && rs.length === 1 && rs[0] === '80x24', 'zoomed back: 80x24, one resize; got ' + JSON.stringify(rs));
   cleanup(env);
 });
 

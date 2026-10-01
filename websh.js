@@ -688,6 +688,7 @@ function activatePane(id) {
   if (!p) return;
   p.el.classList.add('active');
   updatePaneBadge(p);
+  renderPaneTools();
   p.term.focus();
 }
 
@@ -721,6 +722,7 @@ function updatePaneBadge(p) {
   let db = p.el.querySelector('[data-download-btn]');
   if (db) db.disabled = !p.sid || busy;
   updatePaneTag(p);
+  if (activeId === p.id) renderPaneTools();
   // The tab's dot is the worst state of its panes, so ANY pane's change
   // must reach it - not only the active pane's (a background pane that
   // drops while the user works elsewhere has to turn its tab red).
@@ -852,13 +854,22 @@ document.addEventListener('mousemove', e => {
   let strip = $('tabs');
   let others = Array.prototype.filter.call(strip.children,
     c => c !== d.t.el && c.classList.contains('tab'));
+  // Past the strip's edge means "to that end": in a narrow strip (the
+  // pane actions of a lone pane take width from it) the tabs scrolled
+  // out of view have midpoints the pointer can never reach - left of
+  // the logo or outside the window.
+  let sr = strip.getBoundingClientRect();
   let before = null;
-  for (let i = 0; i < others.length; i++) {
-    let r = others[i].getBoundingClientRect();
-    if (e.clientX < r.left + r.width / 2) { before = others[i]; break; }
+  if (e.clientX <= sr.left) before = others[0] || null;
+  else if (e.clientX < sr.right) {
+    for (let i = 0; i < others.length; i++) {
+      let r = others[i].getBoundingClientRect();
+      if (e.clientX < r.left + r.width / 2) { before = others[i]; break; }
+    }
   }
   if (before) { if (d.t.el.nextSibling !== before) strip.insertBefore(d.t.el, before); }
   else if (strip.lastElementChild !== d.t.el) strip.appendChild(d.t.el);
+  if (e.clientX <= sr.left || e.clientX >= sr.right) scrollTabIntoView(d.t);
 });
 document.addEventListener('mouseup', () => endTabDrag());
 function endTabDrag() {
@@ -907,6 +918,7 @@ function showTab(id, o) {
     fitPaneWhenStable(q);
   });
   tabs.forEach(renderTab);
+  renderPaneTools();
   scrollTabIntoView(t);
   if (changed && !(o && o.noSave)) saveSessions();
 }
@@ -931,6 +943,7 @@ function removeTab(t) {
   if (!tabs.length) {
     activeTabId = null;
     document.body.classList.remove('has-tabs');
+    renderPaneTools();
     return;
   }
   if (activeTabId === t.id) {
@@ -947,6 +960,7 @@ function removeAllTabs() {
   $('panes').innerHTML = '';
   $('tabs').innerHTML = '';
   document.body.classList.remove('has-tabs');
+  renderPaneTools();
 }
 
 // Dot (worst pane state), label (the tab's active pane), split marker
@@ -959,6 +973,7 @@ function _paneDotState(p) {
 function renderTab(t) {
   if (!t) return;
   let ps = panesInTab(t);
+  syncTabSolo(t, ps);
   let rank = {on: 0, wait: 1, off: 2};
   let worst = 'on';
   ps.forEach(p => { let s = _paneDotState(p); if (rank[s] > rank[worst]) worst = s; });
@@ -979,7 +994,98 @@ function renderTab(t) {
   sp.title = ps.length > 1 ? ps.length + ' panes' : '';
   t.el.classList.toggle('activity', act);
   t.el.title = label + (ps.length > 1 ? ' (' + ps.length + ' panes)' : '');
+  if (active) renderPaneTools();
 }
+
+// ── A lone pane has no bar of its own ──
+// A tab with exactly one pane is "solo" (.tab-root.solo): the pane's bar
+// is hidden by CSS and the terminal gets its height; the tab already
+// shows the label and state, and the pane actions are in the top bar
+// (#paneTools, acting on the active pane). With 2+ panes every pane
+// shows its bar again, so the user can tell them apart.
+//
+// Runs from renderTab, which every path that changes a tab's pane count
+// calls (materialize, close, a dismissed split, restore) - a path that
+// moves a pane between tabs must call renderTab on BOTH tabs. It is
+// recomputed on every call, not only when the count changes: a pane can
+// arrive while another leaves.
+//
+// The refit after the bar appears or goes is left to the pane's
+// ResizeObserver (the terminal box changes height): one fit, and the
+// resize reaches the server once, debounced in onResize and deduped
+// against lastSent. A pane in a hidden tab is skipped there as
+// everywhere (U1); showTab fits it.
+//
+// A transfer's progress lives in the bar; for a lone pane it is moved
+// into the pane's overlay stack (a card over the terminal, like the
+// Reconnect card) so it and its cancel button stay visible, and only
+// while that tab is on screen.
+function syncTabSolo(t, ps) {
+  let solo = ps.length === 1;
+  if (t.root.classList.contains('solo') !== solo) t.root.classList.toggle('solo', solo);
+  ps.forEach(p => { if (p._progSolo !== solo) placeTransferProgress(p, solo); });
+}
+function placeTransferProgress(p, solo) {
+  let prog = p.el.querySelector('[data-upload-progress]');
+  let bar = p.el.querySelector('.pane-bar');
+  let ovl = p.el.querySelector('.pane-overlays');
+  if (!prog || !bar || !ovl) return;
+  p._progSolo = solo;
+  if (solo) { if (prog.parentNode !== ovl) ovl.appendChild(prog); }
+  else if (prog.parentNode !== bar) bar.insertBefore(prog, bar.querySelector('[data-upload-btn]'));
+}
+
+// The top-bar copy of the pane actions, for the active pane of the
+// active tab when that tab is solo. Hidden with 2+ panes (each pane has
+// its bar) and with no tab at all. Upload/download are disabled by the
+// same rule as the pane's own buttons (updatePaneBadge).
+function renderPaneTools() {
+  let box = $('paneTools');
+  if (!box) return;
+  let t = activeTab();
+  let p = activeId ? panes[activeId] : null;
+  let show = !!(t && p && tabOfPane(p) === t && panesInTab(t).length === 1);
+  let busy = !!(p && (p.upload || p.download));
+  let tag = p && (p.host || p.connection) ? (p.persistent ? 'persistent' : 'ephemeral') : '';
+  let key = show ? [p.id, p.sid ? 1 : 0, busy ? 1 : 0, tag].join('\u0001') : '';
+  if (box._key === key) return;
+  box._key = key;
+  // The group takes width from the tab strip, and its width changes
+  // after showTab scrolled the active tab into view (a new tab is shown
+  // before its pane exists; the marker appears at connect). Scroll again
+  // when it did. Runs only when the key changes, so the reflow is rare.
+  let w0 = box.offsetWidth;
+  box.classList.toggle('h', !show);
+  if (show) fillPaneTools(box, p, busy, tag);
+  if (t && box.offsetWidth !== w0) scrollTabIntoView(t);
+}
+function fillPaneTools(box, p, busy, tag) {
+  let off = !p.sid || busy;
+  box.querySelector('[data-act="upload"]').disabled = off;
+  box.querySelector('[data-act="download"]').disabled = off;
+  let tg = box.querySelector('.pane-tag');
+  tg.className = 'pane-tag ' + tag + (tag ? '' : ' h');
+  // Short words: the group takes its width from the tab strip. The
+  // tooltip says what they mean.
+  tg.textContent = tag === 'persistent' ? 'tmux' : 'temp';
+  tg.title = tag === 'persistent'
+    ? 'This pane is wrapped in remote tmux and will survive browser refresh.'
+    : 'This pane is NOT persistent — it will be lost on refresh.';
+}
+(function () {
+  let box = $('paneTools');
+  if (!box) return;
+  box.addEventListener('click', e => {
+    let b = e.target.closest && e.target.closest('[data-act]');
+    if (!b || b.disabled || !activeId || !panes[activeId]) return;
+    let id = activeId, act = b.getAttribute('data-act');
+    if (act === 'upload') triggerUpload(id);
+    else if (act === 'download') triggerDownload(id);
+    else if (act === 'split-h') splitPane(id, 'h');
+    else if (act === 'split-v') splitPane(id, 'v');
+    else if (act === 'close') closePane(id);
+  });
+})();
 
 // Output reached a pane whose tab is not on screen: mark the tab.
 function noteTabActivity(p) {
@@ -1132,6 +1238,7 @@ function cancelConnect() {
       if (t && !panesInTab(t).length) removeTab(t);
     } else if (wrap) {
       // Split case: unwrap and restore the sibling.
+      let t = tabOfPane(np);
       let parent = wrap.parentNode;
       let sibling = null;
       for (let i=0; i<wrap.children.length; i++) {
@@ -1145,6 +1252,7 @@ function cancelConnect() {
         sibling.style.flex = '';
         parent.replaceChild(sibling, wrap);
       }
+      renderTab(t);   // back to one pane: its bar goes again
     }
     saveSessions();
   }
@@ -7251,6 +7359,7 @@ function tryRestoreSessions() {
     let before = Object.keys(restored).length;
     build(t.root, tm.layout);
     if (Object.keys(restored).length === before) { removeTab(t); return; }
+    renderTab(t);    // solo or not BEFORE the fit below: a lone pane has no bar
     panesInTab(t).forEach(q => { try { q.fitAddon.fit(); } catch (e) {} });
     t.lastActive = (tm.active && restored[tm.active]) ? restored[tm.active].id
                                                       : panesInTab(t)[0].id;

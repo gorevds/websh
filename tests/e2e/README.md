@@ -22,6 +22,7 @@ and on the network, and unit tests passed while they were live.
 | `away` | two panes, tab frozen 75 s, server session expired: both back, first keys delivered |
 | `upload` | 12 MB upload with the connection reset twice under it: arrives whole and identical |
 | `tabs` | two tabs: output streams into the hidden one, its PTY keeps its size, shown again it is refitted; a reload restores tabs, order and the active tab |
+| `tabsolo` | one pane in a tab: no pane bar, the terminal has the whole pane and the PTY that size (`stty size`); a split from the top-bar button brings both bars back, closing back to one hides it with exactly one resize; upload through the real file picker from the top-bar button shows progress + cancel; a reload keeps it bar-less |
 | `tabstress` | five tabs in a narrow window: the strip scrolls, the page does not; rapid switching while two tabs flood; zoom while a tab is hidden; a tab dragged to the front keeps its place across a reload |
 
 ## Needs
