@@ -72,6 +72,22 @@
        state); its actions are in #paneTools, framed off from the tabs and
        from the global buttons. websh.js: syncTabSolo / renderPaneTools. */
     .tab-root.solo .pane-bar{display:none}
+    /* Moving panes between tabs (mouse drags, not HTML5 drag-and-drop):
+       a pane's bar dragged over the strip marks the tab it would join
+       (.drop-into) or the strip itself for a new tab (.drop-new); a tab
+       dragged over a pane of the tab on screen shades the half it would
+       take (.drop-zone-*). Drawn above the terminal like .drop-target. */
+    body.pane-moving,body.pane-moving *{cursor:grabbing!important}
+    .pane-label{cursor:grab}
+    .tab-root.solo .pane-label{cursor:default}
+    .tab.drop-into{background:rgba(88,166,255,.18);border-color:var(--ac);color:var(--tx)}
+    #tabs.drop-new{box-shadow:inset 0 0 0 1px var(--ac);border-radius:6px}
+    #tabNew.drop-new{color:var(--ac);background:rgba(88,166,255,.18)}
+    .pane.drop-zone-left::before,.pane.drop-zone-right::before,.pane.drop-zone-top::before,.pane.drop-zone-bottom::before{content:'';position:absolute;z-index:30;pointer-events:none;background:rgba(88,166,255,.22);border:2px solid var(--ac);border-radius:6px;box-sizing:border-box}
+    .pane.drop-zone-left::before{left:0;top:0;bottom:0;width:50%}
+    .pane.drop-zone-right::before{right:0;top:0;bottom:0;width:50%}
+    .pane.drop-zone-top::before{left:0;right:0;top:0;height:50%}
+    .pane.drop-zone-bottom::before{left:0;right:0;bottom:0;height:50%}
     #paneTools{display:flex;align-items:center;gap:0;flex-shrink:0;padding:0 5px;border-left:1px solid var(--bd);border-right:1px solid var(--bd)}
     #paneTools .tbtn{padding:4px 3px}
     #paneTools .pane-tag{margin:0 3px 0 0}
@@ -541,6 +557,7 @@
   <symbol id="i-file" viewBox="0 0 24 24"><path d="M6.5 3.5h7l4.5 4.5v12a1 1 0 0 1-1 1h-10.5a1 1 0 0 1-1-1v-15a1 1 0 0 1 1-1z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M13.3 3.7V8.3h4.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13.8a4 4 0 0 0 5.7 0l2.6-2.6a4 4 0 1 0-5.7-5.7l-1.3 1.3M14 10.2a4 4 0 0 0-5.7 0l-2.6 2.6a4 4 0 1 0 5.7 5.7l1.3-1.3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></symbol>
   <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M4 20h4l10-10a2.4 2.4 0 1 0-3.4-3.4L4.6 16.6z" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/></symbol>
+  <symbol id="i-to-tab" viewBox="0 0 24 24"><path d="M3.5 9V7a2 2 0 0 1 2-2h5l2 3h6a2 2 0 0 1 2 2v7a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2v-2" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"/><path d="M2.5 13h8m-3-3 3 3-3 3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/></symbol>
   <symbol id="i-chevron-up" viewBox="0 0 24 24"><path d="m6 14 6-6 6 6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="m6 10 6 6 6-6" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></symbol>

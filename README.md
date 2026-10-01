@@ -53,6 +53,7 @@ Real xterm.js — copy-on-select, right-click paste, `Ctrl+V` paste (on by defau
 
 - Tabs in the top bar, each holding its own split layout: `+` opens the login form for a new tab; drag a tab to reorder it, middle-click or `×` to close it (persistent sessions are confirmed once per tab). Tabs in the background stay connected and mark themselves when output arrives. Tabs, their order and layouts come back after a reload
 - A tab with a single pane shows no pane bar: the tab carries the host and state, and the pane's actions (upload, download, split, close, plus a `persistent`/`short-lived` marker, the same words as a pane bar) sit at the right end of the top bar, before the global buttons. Split it and every pane gets its bar back
+- Panes move between tabs without reconnecting: the pane bar's "Move to new tab" button, or drag a pane by its name onto the tab strip (a new tab) or onto a tab (it joins that tab). Drag a tab onto an edge of a pane on screen to merge its whole layout there; the side it will take is highlighted before you let go
 - Split panes, horizontal or vertical, with draggable dividers
 - Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab` (within the current tab)
 - Font picker (⚙) with live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono, Source Code Pro, Inconsolata, or system default. Custom size, line-height, weight

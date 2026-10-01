@@ -136,6 +136,26 @@ solo state is set before the synchronous fit, so a restored lone pane
 connects at its full height. Guard: frontend `solo: …`; e2e `tabsolo`
 (`stty size` against the terminal after split and close).
 
+**U5. Moving a pane never reconnects it.** Moving a pane to a new
+tab, into another tab, or merging a whole tab beside a pane moves the
+pane ELEMENT only (`movePaneToNewTab`, `movePaneToTab`, `mergeTabInto`
+and the mouse drags that call them). No connect or disconnect, no
+stream restart, no `term.reset`/`dispose`/`open`: the session, the
+scrollback, the input queue and held keys, and an upload in progress
+stay on the pane object, and a tab is only a DOM container (a pane's
+tab is read from the DOM, never stored). The move is synchronous up to
+`saveSessions()`, so the saved layout never shows half a move and the
+ResizeObserver sees only the final boxes: one fit and at most one
+`/api/resize` per pane whose size changed; a pane left behind in a tab
+that is now hidden is fitted when that tab is shown (U1). Both tabs are
+re-rendered, so the solo state is right on each side (U4). Re-parenting
+resets the scroll position of xterm's viewport to 0 while xterm keeps
+showing the bottom; `_resyncScroll` puts it back (deferred to `showTab`
+for a hidden pane). Drags are plain mouse events, never HTML5
+drag-and-drop, so a pane or tab drag cannot reach the file-drop
+handlers and an OS file drag cannot start a move. Guard: frontend
+`Tabs (step 3)` block; e2e `tabmove`.
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

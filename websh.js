@@ -369,6 +369,7 @@ function createPane(container) {
       `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>${ic('upload')}</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
       `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>${ic('download')}</button>` +
+      `<button class="pane-btn" data-act="to-tab" onclick="movePaneToNewTab('${id}')" title="Move to new tab" aria-label="Move pane to a new tab">${ic('to-tab')}</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">${ic('split-h')}</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">${ic('split-v')}</button>` +
       `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">${ic('close')}</button>` +
@@ -815,11 +816,14 @@ function createTab() {
   return t;
 }
 
-// Mouse handling of one tab handle. Activation is on mousedown (as in
-// browsers), with preventDefault so the click does not move keyboard
-// focus out of the terminal showTab just focused. The close button and
-// the middle button never activate: closing a background tab must not
-// bring it to the front first.
+// Mouse handling of one tab handle. A press on the tab in front only
+// keeps the focus in its terminal; a press on another tab shows it on
+// RELEASE, if the pointer did not travel (a click): the same press may
+// become a drag of that tab onto a pane of the tab on screen, which has
+// to stay in front while it happens (see ── Moving panes between tabs).
+// preventDefault keeps keyboard focus in the terminal. The close button
+// and the middle button never activate: closing a background tab must
+// not bring it to the front first.
 function wireTab(t) {
   let el = t.el;
   let closeBtn = el.querySelector('.tab-close');
@@ -829,9 +833,8 @@ function wireTab(t) {
     if (e.button === 1) { e.preventDefault(); return; }   // no autoscroll
     if (e.button !== 0) return;
     e.preventDefault();
-    if (activeTabId !== t.id) showTab(t.id);
-    else { let p = panes[activeId]; if (p) { try { p.term.focus(); } catch (err) {} } }
-    startTabDrag(t, e.clientX);
+    if (activeTabId === t.id) { let p = panes[activeId]; if (p) { try { p.term.focus(); } catch (err) {} } }
+    startTabDrag(t, e.clientX, e.clientY);
   });
   el.addEventListener('auxclick', e => {
     if (e.button !== 1) return;
@@ -840,17 +843,87 @@ function wireTab(t) {
   });
 }
 
-// Drag a tab along the strip to reorder. Plain mouse events, not HTML5
-// drag-and-drop: a native drag would be seen by the panes' file-drop
-// handlers, and a tab is not a file.
+// Drag a tab: along the strip to reorder, or onto an edge of a pane in
+// the tab on screen to merge its whole layout there. Plain mouse events,
+// not HTML5 drag-and-drop: a native drag would be seen by the panes'
+// file-drop handlers, and a tab is not a file - and the file drags the
+// browser does send never touch this state.
+//
+// The strip is reordered only while the pointer is not over the panes
+// or outside the window; a drag that ends there without a merge (its
+// own pane, no pane, released outside) puts the strip back as it was.
+const DRAG_START_PX = 5;
 let _tabDrag = null;
-function startTabDrag(t, x) { _tabDrag = {t: t, x0: x, moved: false}; }
+function startTabDrag(t, x, y) {
+  let order = Array.prototype.slice.call($('tabs').children);
+  _tabDrag = {t: t, x0: x, y0: y, moved: false, order: order,
+              over: 'strip', zone: null};
+}
+// Where the pointer is during a drag: the element under it (null
+// outside the window), and whether that is in the panes area.
+function _dragPoint(e) {
+  let x = e.clientX, y = e.clientY;
+  let w = window.innerWidth || document.documentElement.clientWidth || 0;
+  let h = window.innerHeight || document.documentElement.clientHeight || 0;
+  let outside = x < 0 || y < 0 || (w && x >= w) || (h && y >= h);
+  let el = null;
+  if (!outside) {
+    try { el = document.elementFromPoint(x, y); } catch (err) { el = null; }
+    if (!el && e.target && e.target.nodeType === 1) el = e.target;
+  }
+  let panesBox = $('panes');
+  let inPanes = !!(el && panesBox && panesBox.contains(el));
+  return {el: el, outside: outside, inPanes: inPanes};
+}
+// The side of pane element `el` nearest to (x, y).
+function _dropSide(el, x, y) {
+  let r = el.getBoundingClientRect();
+  if (!r || !(r.width > 0) || !(r.height > 0)) return null;
+  let dx = (x - r.left) / r.width, dy = (y - r.top) / r.height;
+  let best = 'left', d = dx;
+  if (1 - dx < d) { best = 'right'; d = 1 - dx; }
+  if (dy < d) { best = 'top'; d = dy; }
+  if (1 - dy < d) { best = 'bottom'; d = 1 - dy; }
+  return best;
+}
+const DROP_ZONES = ['drop-zone-left', 'drop-zone-right', 'drop-zone-top', 'drop-zone-bottom'];
+function clearDropZones() {
+  document.querySelectorAll('.drop-zone-left,.drop-zone-right,.drop-zone-top,.drop-zone-bottom')
+    .forEach(el => el.classList.remove.apply(el.classList, DROP_ZONES));
+}
+// The merge target under the pointer: a pane of the tab on screen that
+// is not one of the dragged tab's own panes, and the side.
+function _tabDropTarget(d, pt, e) {
+  if (!pt.inPanes || !pt.el || !pt.el.closest) return null;
+  let pel = pt.el.closest('.pane');
+  let p = pel ? panes[pel.getAttribute('data-pane')] : null;
+  if (!p) return null;
+  let t = tabOfPane(p);
+  if (!t || t.id !== activeTabId || t === d.t) return null;
+  let side = _dropSide(pel, e.clientX, e.clientY);
+  return side ? {p: p, side: side} : null;
+}
+function _restoreStripOrder(d) {
+  let strip = $('tabs');
+  d.order.forEach(el => { if (el.parentNode === strip) strip.appendChild(el); });
+}
 document.addEventListener('mousemove', e => {
   let d = _tabDrag;
   if (!d) return;
-  if ((e.buttons & 1) === 0) { endTabDrag(); return; }
-  if (!d.moved && Math.abs(e.clientX - d.x0) < 5) return;
+  if ((e.buttons & 1) === 0) { endTabDrag(null); return; }
+  if (!d.moved && Math.abs(e.clientX - d.x0) < DRAG_START_PX
+      && Math.abs(e.clientY - d.y0) < DRAG_START_PX) return;
   if (!d.moved) { d.moved = true; d.t.el.classList.add('dragging'); }
+  let pt = _dragPoint(e);
+  d.over = pt.outside ? 'out' : (pt.inPanes ? 'panes' : 'strip');
+  let target = d.over === 'panes' ? _tabDropTarget(d, pt, e) : null;
+  let zone = target ? 'drop-zone-' + target.side : null;
+  if (!target || !d.zone || d.zone.p !== target.p || d.zone.cls !== zone) {
+    clearDropZones();
+    if (target) target.p.el.classList.add(zone);
+  }
+  d.zone = target ? {p: target.p, side: target.side, cls: zone} : null;
+  if (d.over !== 'strip') return;
   let strip = $('tabs');
   let others = Array.prototype.filter.call(strip.children,
     c => c !== d.t.el && c.classList.contains('tab'));
@@ -871,12 +944,35 @@ document.addEventListener('mousemove', e => {
   else if (strip.lastElementChild !== d.t.el) strip.appendChild(d.t.el);
   if (e.clientX <= sr.left || e.clientX >= sr.right) scrollTabIntoView(d.t);
 });
-document.addEventListener('mouseup', () => endTabDrag());
-function endTabDrag() {
+document.addEventListener('mouseup', e => endTabDrag(e));
+// `e` is the mouseup, or null when the button was found released
+// without one (let go outside the window): then the last position
+// decides.
+function endTabDrag(e) {
   let d = _tabDrag;
   _tabDrag = null;
-  if (!d || !d.moved) return;
+  if (!d) return;
+  if (!d.moved) {
+    // A click: now it is safe to bring the tab forward.
+    if (activeTabId !== d.t.id && tabs.indexOf(d.t) >= 0) showTab(d.t.id);
+    return;
+  }
   d.t.el.classList.remove('dragging');
+  _blockClickAfterDrag();
+  // Without a mouseup (the button went up outside the window) nothing
+  // is dropped: a merge needs a release over the pane.
+  let over = d.over, zone = null;
+  if (e) {
+    let pt = _dragPoint(e);
+    over = pt.outside ? 'out' : (pt.inPanes ? 'panes' : 'strip');
+    zone = over === 'panes' ? _tabDropTarget(d, pt, e) : null;
+  }
+  clearDropZones();
+  if (over !== 'strip') {
+    _restoreStripOrder(d);
+    if (zone && panes[zone.p.id] && tabs.indexOf(d.t) >= 0) mergeTabInto(d.t.id, zone.p.id, zone.side);
+    return;
+  }
   // The strip's DOM order is the truth; bring the array in line.
   let order = [];
   $('tabs').querySelectorAll('.tab').forEach(el => {
@@ -884,8 +980,23 @@ function endTabDrag() {
     if (t) order.push(t);
   });
   if (order.length === tabs.length) { tabs.length = 0; order.forEach(t => tabs.push(t)); }
+  // As in a browser, the tab that was dragged along the strip is the
+  // one in front afterwards (it used to be activated on the press).
+  if (activeTabId !== d.t.id) showTab(d.t.id, {noSave: true});
   saveSessions();
 }
+// A drag that ends over a button (the "+", a tab's close) must not
+// also click it: a pane dropped on "+" makes a tab, it does not open
+// the login form.
+let _clickBlockUntil = 0;
+function _blockClickAfterDrag() { _clickBlockUntil = Date.now() + 400; }
+document.addEventListener('click', e => {
+  if (!_clickBlockUntil) return;
+  if (Date.now() > _clickBlockUntil) { _clickBlockUntil = 0; return; }
+  _clickBlockUntil = 0;
+  e.stopPropagation();
+  e.preventDefault();
+}, true);
 
 // Show tab `id`: hide every other root, show this one, fit its panes to
 // their real box, and focus the pane that was last active in it.
@@ -913,6 +1024,7 @@ function showTab(id, o) {
   // size. The settle loop ends in flushPaneResize, which posts only a
   // size the server does not already have.
   ps.forEach(q => {
+    if (q._scrollResync) _resyncScroll(q);   // moved while hidden (── Moving panes)
     q._fitDeferred = false;
     applyTermSettings(q);        // a zoom or font change made while hidden
     fitPaneWhenStable(q);
@@ -1130,6 +1242,244 @@ function closeTab(id) {
     if (neverAgain) localStorage.setItem(TERMINATE_NO_ASK_KEY, '1');
     doClose();
   }, title);
+}
+
+// ── Moving panes between tabs ──────────────────────────────────────
+// A pane moves by moving its element: out of its split (the sibling
+// takes the space, as on close) and into another tab's root or split.
+// Nothing else about the pane is touched - no connect or disconnect,
+// no stream restart, no term.reset/dispose/open, the input queue and an
+// upload in progress stay on `p` - because which tab a pane is in is
+// read from the DOM (see ── Tabs). xterm keeps working in a re-parented
+// element as long as it is not disposed. docs/invariants.md U5.
+//
+// Every move is synchronous from the first DOM change to saveSessions():
+// the layout in localStorage never shows a half-done move, and the
+// ResizeObserver only sees the final boxes (one fit, one resize per
+// pane whose size changed; a pane left in a hidden tab is skipped, U1).
+// renderTab runs for BOTH tabs (via showTab), so the solo state and the
+// bars are right on each side (U4).
+
+// Moving an element out of the document and back resets the scroll
+// position of everything inside it - xterm's viewport jumps to 0 (the
+// top of the scrollback) while xterm still shows, and believes it
+// shows, the bottom; it does not put it back by itself (it caches the
+// last value it set), so the scrollbar lied and the first wheel or
+// drag on it threw the view to the top. Put it where xterm's buffer
+// says it is. A pane in a hidden tab cannot be scrolled (display:none
+// keeps a scroll position but cannot take one): showTab does it.
+// Checked in Chromium 2026-10-01: display:none and back keeps the
+// position; removeChild + appendChild loses it.
+function _resyncScroll(p) {
+  if (!p || !p.term || !p.term.element) return;
+  if (paneHidden(p)) { p._scrollResync = true; return; }
+  p._scrollResync = false;
+  try {
+    let vp = p.term.element.querySelector('.xterm-viewport');
+    let area = vp && vp.querySelector('.xterm-scroll-area');
+    let buf = p.term.buffer && p.term.buffer.active;
+    if (!vp || !area || !buf || !buf.length) return;
+    let core = p.term._core && p.term._core.viewport;
+    let rowH = (core && core._currentRowHeight) || (area.offsetHeight / buf.length);
+    if (!(rowH > 0)) return;
+    let top = Math.round(buf.viewportY * rowH);
+    if (Math.abs(vp.scrollTop - top) > 1) vp.scrollTop = top;
+  } catch (e) {}
+}
+
+// Take a pane out of its layout: its split wrapper is replaced by the
+// sibling, as _destroyPane does. Returns the tab it was in.
+function _detachPane(p) {
+  let t = tabOfPane(p);
+  let wrap = p.el.parentNode;
+  if (wrap && !wrap.classList.contains('tab-root')) {
+    let sibling = null;
+    for (let i = 0; i < wrap.children.length; i++) {
+      let ch = wrap.children[i];
+      if (ch !== p.el && !ch.classList.contains('split-handle')) { sibling = ch; break; }
+    }
+    if (sibling && wrap.parentNode) {
+      // The sibling inherits the wrapper's share of ITS parent.
+      sibling.style.flex = wrap.style.flex || '';
+      wrap.parentNode.replaceChild(sibling, wrap);
+      _panesUnder(sibling).forEach(_resyncScroll);
+    }
+  }
+  if (p.el.parentNode) p.el.parentNode.removeChild(p.el);
+  p.el.style.flex = '';
+  if (t && t.lastActive === p.id) {
+    let ps = panesInTab(t);
+    t.lastActive = ps.length ? ps[0].id : null;
+  }
+  return t;
+}
+// The panes in (or being) element `el`.
+function _panesUnder(el) {
+  let out = [];
+  if (!el) return out;
+  let list = el.classList.contains('pane') ? [el] : Array.prototype.slice.call(el.querySelectorAll('.pane'));
+  list.forEach(e => { let p = panes[e.getAttribute('data-pane')]; if (p) out.push(p); });
+  return out;
+}
+// Put `el` beside `anchor` in a new split ('h' or 'v'); `first` puts it
+// before the anchor (left / top). The wrapper takes the anchor's place
+// and its share of the parent.
+function _placeBeside(anchor, el, dir, first) {
+  let wrap = document.createElement('div');
+  wrap.className = 'split-' + dir;
+  wrap.style.flex = anchor.style.flex || '';
+  anchor.style.flex = '';
+  el.style.flex = '';
+  let handle = document.createElement('div');
+  handle.className = 'split-handle';
+  anchor.parentNode.replaceChild(wrap, anchor);
+  wrap.appendChild(first ? el : anchor);
+  wrap.appendChild(handle);
+  wrap.appendChild(first ? anchor : el);
+}
+// Show `t` with pane `id` active; the moved pane takes the focus. The
+// element was out of the document for a moment, which blurs a focused
+// terminal, so focus it even when it already was the active pane.
+function _showAfterMove(t, id, moved) {
+  if (panes[id]) t.lastActive = id;
+  showTab(t.id, {noSave: true});
+  let p = panes[id];
+  if (p) {
+    if (activeId !== id) activatePane(id);
+    try { p.term.focus(); } catch (e) {}
+  }
+  (moved || []).forEach(_resyncScroll);
+}
+function _dropEmptyTab(t) {
+  if (!t || tabs.indexOf(t) < 0 || panesInTab(t).length) return;
+  if (activeTabId === t.id) activeTabId = null;   // the caller shows another
+  removeTab(t);
+}
+
+// "Move to new tab": the pane leaves its split and becomes a tab of its
+// own, shown. A pane alone in its tab already is one: nothing to do.
+function movePaneToNewTab(id) {
+  let p = panes[id];
+  if (!p) return;
+  let from = tabOfPane(p);
+  if (!from || panesInTab(from).length < 2) return;
+  _detachPane(p);
+  let t = createTab();
+  t.root.appendChild(p.el);
+  _showAfterMove(t, id, [p]);
+  saveSessions();
+}
+
+// The pane joins tab `tabId`, split to the right of that tab's active
+// pane; that tab is shown with the moved pane active. A tab emptied by
+// the move goes.
+function movePaneToTab(id, tabId) {
+  let p = panes[id];
+  let to = tabById(tabId);
+  if (!p || !to) return;
+  let from = tabOfPane(p);
+  if (!from || from === to) return;
+  let ps = panesInTab(to);
+  let anchor = panes[to.lastActive];
+  if (!anchor || ps.indexOf(anchor) < 0) anchor = ps[ps.length - 1] || null;
+  _detachPane(p);
+  if (anchor) _placeBeside(anchor.el, p.el, 'h', false);
+  else to.root.appendChild(p.el);
+  _dropEmptyTab(from);
+  _showAfterMove(to, id, [p].concat(_panesUnder(anchor ? anchor.el : null)));
+  saveSessions();
+}
+
+// Tab `tabId`'s whole layout goes beside pane `paneId` (of another tab):
+// side 'left'/'right' split horizontally, 'top'/'bottom' vertically;
+// left/top put the merged layout first. The merged tab's handle and
+// root go; its inner layout is kept as it was. The pane's tab is shown,
+// with the merged tab's active pane active.
+function mergeTabInto(tabId, paneId, side) {
+  let src = tabById(tabId);
+  let q = panes[paneId];
+  if (!src || !q) return;
+  let dst = tabOfPane(q);
+  if (!dst || dst === src) return;
+  if (['left', 'right', 'top', 'bottom'].indexOf(side) < 0) return;
+  let node = null;
+  for (let i = 0; i < src.root.children.length; i++) {
+    let ch = src.root.children[i];
+    if (ch.classList.contains('pane') || ch.classList.contains('split-h')
+        || ch.classList.contains('split-v')) { node = ch; break; }
+  }
+  if (!node) return;
+  let srcPanes = panesInTab(src);
+  let focusId = (src.lastActive && srcPanes.indexOf(panes[src.lastActive]) >= 0)
+    ? src.lastActive : (srcPanes[0] ? srcPanes[0].id : q.id);
+  src.root.removeChild(node);
+  _placeBeside(q.el, node, (side === 'left' || side === 'right') ? 'h' : 'v',
+               side === 'left' || side === 'top');
+  _dropEmptyTab(src);
+  _showAfterMove(dst, focusId, _panesUnder(node).concat([q]));
+  saveSessions();
+}
+
+// Dragging a pane by its bar's label onto the strip: onto a tab - the
+// pane joins it; onto the strip around the tabs or "+" - a new tab.
+// Anywhere else (back on the panes, outside the window) nothing
+// happens. Mouse events only, as for tabs: an HTML5 drag would look
+// like a file to wirePaneDrop, and an OS file drag never starts this.
+let _paneDrag = null;
+function _paneDropTarget(pt) {
+  if (pt.outside || pt.inPanes || !pt.el || !pt.el.closest) return null;
+  let tabEl = pt.el.closest('#tabs .tab');
+  if (tabEl) return {kind: 'tab', el: tabEl, tabId: tabEl.getAttribute('data-tab')};
+  let nb = pt.el.closest('#tabNew');
+  if (nb) return {kind: 'new', el: nb};
+  let strip = pt.el.closest('#tabs');
+  if (strip) return {kind: 'new', el: strip};
+  // The free room of the top bar after "+" belongs to the strip too.
+  if (pt.el.classList && pt.el.classList.contains('top')) return {kind: 'new', el: $('tabs')};
+  return null;
+}
+function _clearPaneDropMarks() {
+  document.querySelectorAll('.tab.drop-into,.drop-new')
+    .forEach(el => el.classList.remove('drop-into', 'drop-new'));
+}
+document.addEventListener('mousedown', e => {
+  if (e.button !== 0 || !e.target || !e.target.closest) return;
+  let label = e.target.closest('.pane-label');
+  if (!label) return;
+  let pel = label.closest('.pane');
+  let p = pel ? panes[pel.getAttribute('data-pane')] : null;
+  if (!p) return;
+  e.preventDefault();          // no text selection of the label
+  _paneDrag = {p: p, x0: e.clientX, y0: e.clientY, moved: false};
+}, true);
+document.addEventListener('mousemove', e => {
+  let d = _paneDrag;
+  if (!d) return;
+  if ((e.buttons & 1) === 0) { _endPaneDrag(null); return; }
+  if (!d.moved && Math.abs(e.clientX - d.x0) < DRAG_START_PX
+      && Math.abs(e.clientY - d.y0) < DRAG_START_PX) return;
+  if (!d.moved) { d.moved = true; document.body.classList.add('pane-moving'); }
+  let tg = _paneDropTarget(_dragPoint(e));
+  _clearPaneDropMarks();
+  if (tg && tg.kind === 'tab') {
+    let own = tabOfPane(d.p);
+    if (!own || own.id !== tg.tabId) tg.el.classList.add('drop-into');
+  } else if (tg) tg.el.classList.add('drop-new');
+});
+document.addEventListener('mouseup', e => _endPaneDrag(e));
+function _endPaneDrag(e) {
+  let d = _paneDrag;
+  _paneDrag = null;
+  if (!d) return;
+  _clearPaneDropMarks();
+  if (!d.moved) return;
+  document.body.classList.remove('pane-moving');
+  _blockClickAfterDrag();
+  if (!e || !panes[d.p.id]) return;
+  let tg = _paneDropTarget(_dragPoint(e));
+  if (!tg) return;
+  if (tg.kind === 'tab') movePaneToTab(d.p.id, tg.tabId);
+  else movePaneToNewTab(d.p.id);
 }
 
 // Strip: a vertical wheel scrolls it sideways when it overflows.
