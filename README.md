@@ -55,6 +55,7 @@ Real xterm.js — copy-on-select, right-click paste, `Ctrl+V` paste (on by defau
 - A tab with a single pane shows no pane bar: the tab carries the host and state, and the pane's actions (upload, download, split, close, plus a `persistent`/`short-lived` marker, the same words as a pane bar) sit at the right end of the top bar, before the global buttons. Split it and every pane gets its bar back
 - Panes move between tabs without reconnecting: the pane bar's "Move to new tab" button, or drag a pane by its name onto the tab strip (a new tab) or onto a tab (it joins that tab). Drag a tab onto an edge of a pane on screen to merge its whole layout there; the side it will take is highlighted before you let go
 - Split panes, horizontal or vertical, with draggable dividers
+- Tab keys: `Alt+1`…`Alt+8` go to tab N, `Alt+9` to the last tab, `Alt+Shift+[` / `Alt+Shift+]` to the previous / next one, `Alt+T` opens a new tab, `Alt+W` closes the tab on screen (with the same confirm as `×`). They work with any keyboard layout and with Option on a Mac; every other Alt key (`Alt+B`, `Alt+F`, `Alt+.`…) still goes to the shell. Tab tooltips show their number
 - Pane switching with `Ctrl+Tab` / `Ctrl+Shift+Tab` (within the current tab)
 - Font picker (⚙) with live preview — JetBrains Mono, Fira Code, IBM Plex Mono, Roboto Mono, Source Code Pro, Inconsolata, or system default. Custom size, line-height, weight
 

@@ -171,6 +171,24 @@ fit, no `/api/resize`. Guard: e2e `scrollpos` (intermittent before the
 fix: ~1 in 30 for a resize while hidden, up to 1 in 3 for a merge, so
 run it with `--repeat`).
 
+**U7. A tab key never reaches the shell; no other Alt key is taken.**
+Alt+1..9, Alt+T, Alt+W and Alt+Shift+[ / ] are matched by `e.code`
+(Cyrillic layouts, macOS Option symbols) with plain Alt only - not
+Ctrl+Alt (AltGr), not Meta. In a terminal they are taken in xterm's
+custom key handler (a document listener never sees them: xterm sends
+ESC+x and stops the event) and the keydown is prevented, or macOS types
+the Option symbol into the shell. Every other Alt combo (readline's
+Alt+B/F/./D, Alt+arrows, Alt+[) goes to the shell unchanged. While any
+`.ov` dialog is up the keys do nothing. In a text field that is not
+xterm's helper textarea (search box, a pane's reconnect password, any
+contenteditable) they are not taken at all and nothing is prevented:
+every Alt/Option character types there. During a tab or pane-bar drag
+(from the press to the release) they are taken - prevented, never sent
+to the shell - but do nothing, so the release drops exactly where it
+would have. `tabKeyHandled()`. Guard:
+frontend `tabs keys: …`; e2e `tabkeys` (real key events, Mac platform
+included).
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

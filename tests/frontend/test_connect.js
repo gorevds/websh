@@ -11400,6 +11400,788 @@ test('move (break): a tab drag over a pane, the window loses focus, comes back w
 });
 
 // =====================================================================
+// Tabs (step 4) - keyboard.
+//
+// Alt+1..Alt+8 go to tab N (nothing if there is no tab N), Alt+9 to the
+// last tab, Alt+T is "+", Alt+W closes the active tab (same confirm rule
+// as the tab's x), Alt+Shift+[ / Alt+Shift+] previous / next tab with
+// wrap. Matched by e.code, so a Cyrillic layout (e.key 'е' for KeyT) and
+// macOS Option (e.key '¡' for Digit1) work. The combos are websh's: they
+// are consumed (preventDefault) and never reach the shell; every other
+// Alt combo (readline's Alt+B/F/D/., Alt+Backspace, Option+arrows) does.
+// Ctrl+Alt (AltGr on Windows layouts) never switches tabs. Under a modal
+// (login form, options, the terminate confirm) nothing happens.
+//
+// The real path is xterm's: keys are typed into xterm's hidden textarea
+// inside the pane, and xterm's keydown listener on that textarea first
+// asks the handler from attachCustomKeyEventHandler, and - unless it
+// returns false - turns the key into data (Alt+x -> ESC x), emits it on
+// onData, and CANCELS the event (preventDefault + stopPropagation), so a
+// plain bubbling listener on document never sees it. xtermKeys() below
+// installs exactly that model on a pane; on "mac" it models Option
+// without macOptionIsMeta: xterm leaves the key alone in keydown and the
+// composed character ('¡', '∫', ...) arrives afterwards (keypress/input)
+// unless the keydown was default-prevented.
+// =====================================================================
+const US_PUNCT = {BracketLeft: ['[', '{'], BracketRight: [']', '}'], Period: ['.', '>'],
+                  Comma: [',', '<'], Minus: ['-', '_'], Slash: ['/', '?']};
+function xtermData(e) {
+  if (e.ctrlKey && e.altKey) return null;          // AltGr / Ctrl+Alt: not modelled, sends nothing
+  if (e.metaKey) return null;
+  if (e.altKey) {
+    if (e.code === 'Backspace') return '\x1b\x7f';
+    if (e.code === 'ArrowLeft') return '\x1b[1;3D';
+    if (e.code === 'ArrowRight') return '\x1b[1;3C';
+    let m = /^Key([A-Z])$/.exec(e.code);
+    if (m) return '\x1b' + (e.shiftKey ? m[1] : m[1].toLowerCase());
+    m = /^Digit(\d)$/.exec(e.code);
+    if (m) return '\x1b' + m[1];
+    if (US_PUNCT[e.code]) return '\x1b' + US_PUNCT[e.code][e.shiftKey ? 1 : 0];
+    return null;
+  }
+  if (!e.ctrlKey && e.key && e.key.length === 1) return e.key;
+  if (e.code === 'Enter') return '\r';
+  return null;
+}
+function xtermKeys(win, p, mac) {
+  const host = p.el.querySelector('.pane-term') || p.el;
+  let ta = host.querySelector('textarea.xterm-helper-textarea');
+  if (!ta) {
+    ta = win.document.createElement('textarea');
+    ta.className = 'xterm-helper-textarea';
+    host.appendChild(ta);
+    ta.addEventListener('keydown', e => {
+      const term = p.term;
+      if (term._customKey && term._customKey(e) === false) return;
+      if (mac && e.altKey && !e.ctrlKey && !e.metaKey) return;   // composed char comes later
+      const d = xtermData(e);
+      if (d == null) return;
+      if (term._onDataCb) term._onDataCb(d);
+      e.preventDefault(); e.stopPropagation();
+    });
+  }
+  return ta;
+}
+const KEYCODES = {BracketLeft: 219, BracketRight: 221, Period: 190, Backspace: 8, ArrowLeft: 37, ArrowRight: 39, Enter: 13};
+// Dispatch one keydown like a browser would; returns the event.
+function keyOn(win, target, code, key, mods, mac) {
+  mods = mods || {};
+  const ev = new win.KeyboardEvent('keydown', {key, code, bubbles: true, cancelable: true,
+    altKey: !!mods.alt, shiftKey: !!mods.shift, ctrlKey: !!mods.ctrl, metaKey: !!mods.meta, repeat: false});
+  let kc = KEYCODES[code];
+  if (kc == null) { const m = /^(?:Key|Digit)(.)$/.exec(code); kc = m ? m[1].toUpperCase().charCodeAt(0) : 0; }
+  try { Object.defineProperty(ev, 'keyCode', {value: kc}); Object.defineProperty(ev, 'which', {value: kc}); } catch (e) {}
+  target.dispatchEvent(ev);
+  // macOS Option without macOptionIsMeta: the composed character is
+  // typed unless the keydown was cancelled.
+  if (mac && ev.altKey && !ev.ctrlKey && !ev.metaKey && !ev.defaultPrevented && key.length === 1) {
+    const p = target.__pane;
+    if (p && p.term._onDataCb) p.term._onDataCb(key);
+  }
+  return ev;
+}
+// Keys go into the active pane's xterm textarea.
+function typeIn(win, p, code, key, mods, mac) {
+  const ta = xtermKeys(win, p, mac);
+  ta.__pane = p;
+  try { ta.focus(); } catch (e) {}
+  return keyOn(win, ta, code, key, mods, mac);
+}
+const activePane = win => win.panes[win.activeId];
+// Everything /api/input carried, per session.
+function inputRecorder() {
+  const got = [];
+  const entry = {action: 'input', match: bd => bd && typeof bd.data === 'string',
+                 response: bd => { got.push({sid: bd.session_id, data: bd.data}); return {ok: true}; }};
+  return {got, entry, all: () => got.map(g => g.data).join(''),
+          of: sid => got.filter(g => g.sid === sid).map(g => g.data).join('')};
+}
+// Wait until everything typed so far has been flushed: type a sentinel
+// (plain key) into pane p, wait for it on the wire. Input is ordered.
+let _sentinelN = 0;
+async function flushedThrough(win, rec, p) {
+  const s = String.fromCharCode(0x71 + (_sentinelN++ % 8));   // q..x, one key
+  const mark = '@' + s;
+  const ta = xtermKeys(win, p);
+  ta.__pane = p;
+  keyOn(win, ta, 'Digit2', '@', {shift: true});
+  keyOn(win, ta, 'Key' + s.toUpperCase(), s);
+  const okk = await until(() => rec.of(p.sid).indexOf(mark) >= 0, 1500);
+  ok(okk, 'sentinel ' + JSON.stringify(mark) + ' reached the shell of ' + p.host + ' (input path alive)');
+  return okk;
+}
+const show = s => JSON.stringify(s);
+async function threeTabs(win, opts) {
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host', opts && opts.b);
+  const c = b && await tNewTab(win, 'c.host');
+  return [a, b, c];
+}
+const tabIdx = win => tabEls(win).indexOf(activeTab(win));
+const titleOf = t => {
+  if (!t) return '';
+  const own = t.getAttribute('title') || '';
+  const kids = Array.from(t.querySelectorAll('[title]')).map(x => x.getAttribute('title')).join(' | ');
+  return own + (kids ? ' | ' + kids : '');
+};
+
+test('tabs keys: Alt+1..Alt+8 go to tab N from inside the terminal; Alt+9 to the last; a missing N does nothing', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup: three tabs'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b), tC = tabOfPane(c);
+  ok(tabId(activeTab(win)) === tC, 'setup: C in front');
+  let ev = typeIn(win, c, 'Digit1', '1', {alt: true});
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(tabId(activeTab(win)) === tA, 'Alt+1 typed in C\'s terminal shows tab 1 (A); active tab is now #' + tabIdx(win));
+  ok(win.activeId === a.id, 'and A\'s pane is the active pane');
+  ok(ev.defaultPrevented, 'Alt+1 is consumed (preventDefault)');
+  ev = typeIn(win, a, 'Digit2', '2', {alt: true});
+  await until(() => tabId(activeTab(win)) === tB, 500);
+  ok(tabId(activeTab(win)) === tB && win.activeId === b.id, 'Alt+2 shows tab 2 (B)');
+  ok(b.term._focusCalls > 0, 'keyboard focus goes into B\'s pane');
+  ok(ev.defaultPrevented, 'Alt+2 consumed');
+  ev = typeIn(win, b, 'Digit9', '9', {alt: true});
+  await until(() => tabId(activeTab(win)) === tC, 500);
+  ok(tabId(activeTab(win)) === tC, 'Alt+9 shows the last tab (C)');
+  ok(ev.defaultPrevented, 'Alt+9 consumed');
+  // Missing tab: nothing changes, but the key is still not the shell's.
+  const before = tabId(activeTab(win)), beforePane = win.activeId;
+  const ev5 = typeIn(win, c, 'Digit5', '5', {alt: true});
+  const ev8 = typeIn(win, c, 'Digit8', '8', {alt: true});
+  await sleep(30);
+  ok(tabId(activeTab(win)) === before && win.activeId === beforePane, 'Alt+5 / Alt+8 with 3 tabs change nothing');
+  ok(ev5.defaultPrevented && ev8.defaultPrevented, 'Alt+5 / Alt+8 with no such tab are still consumed');
+  // Alt+3 when on tab 3 already: stays.
+  typeIn(win, c, 'Digit3', '3', {alt: true});
+  ok(tabId(activeTab(win)) === tC, 'Alt+3 on tab 3 stays on tab 3');
+  await flushedThrough(win, rec, c);
+  await flushedThrough(win, rec, c);
+  const all = rec.all();
+  ok(!/\x1b[0-9]/.test(all), 'no ESC+digit reached any shell; /api/input carried ' + show(all));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+N also works when the focus is not in a terminal (after clicking the tab strip)', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ev = keyOn(win, $(win, 'tabs'), 'Digit1', '1', {alt: true});
+  await until(() => tabId(activeTab(win)) === tabOfPane(a), 500);
+  ok(tabId(activeTab(win)) === tabOfPane(a), 'Alt+1 dispatched on the tab strip shows tab 1');
+  ok(ev.defaultPrevented, 'consumed');
+  const ev2 = keyOn(win, win.document.body, 'BracketRight', '}', {alt: true, shift: true});
+  await until(() => tabId(activeTab(win)) === tabOfPane(b), 500);
+  ok(tabId(activeTab(win)) === tabOfPane(b), 'Alt+Shift+] on body shows the next tab');
+  ok(ev2.defaultPrevented, 'consumed');
+  cleanup(env);
+});
+
+test('tabs keys: Alt+Shift+[ / Alt+Shift+] go to the previous / next tab and wrap, one step per press', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ids = [a, b, c].map(tabOfPane);
+  const seen = [];
+  for (let i = 0; i < 4; i++) {
+    const ev = typeIn(win, activePane(win), 'BracketRight', '}', {alt: true, shift: true});
+    await sleep(5);
+    seen.push(ids.indexOf(tabId(activeTab(win))) + (ev.defaultPrevented ? '' : '!'));
+  }
+  ok(show(seen) === show(['0', '1', '2', '0']),
+     'from C, Alt+Shift+] x4 goes A,B,C,A (wraps, one step each, consumed); got ' + show(seen) + ' (! = not consumed)');
+  const back = [];
+  for (let i = 0; i < 4; i++) {
+    const ev = typeIn(win, activePane(win), 'BracketLeft', '{', {alt: true, shift: true});
+    await sleep(5);
+    back.push(ids.indexOf(tabId(activeTab(win))) + (ev.defaultPrevented ? '' : '!'));
+  }
+  ok(show(back) === show(['2', '1', '0', '2']),
+     'from A, Alt+Shift+[ x4 goes C,B,A,C (wraps); got ' + show(back));
+  ok(win.activeId === c.id, 'the active pane follows the tab');
+  await flushedThrough(win, rec, c);
+  const all = rec.all();
+  ok(!/\x1b[{}\[\]]/.test(all), 'no ESC+{ / ESC+} reached a shell; /api/input carried ' + show(all));
+  cleanup(env);
+});
+
+test('tabs keys: with one tab, next/previous and Alt+1/Alt+9 stay put and still do not reach the shell', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const evs = [typeIn(win, a, 'BracketRight', '}', {alt: true, shift: true}),
+               typeIn(win, a, 'BracketLeft', '{', {alt: true, shift: true}),
+               typeIn(win, a, 'Digit1', '1', {alt: true}), typeIn(win, a, 'Digit9', '9', {alt: true})];
+  ok(tabEls(win).length === 1 && win.activeId === a.id, 'still one tab, same pane');
+  ok(evs.every(e => e.defaultPrevented), 'all four consumed; got ' + show(evs.map(e => e.defaultPrevented)));
+  await flushedThrough(win, rec, a);
+  ok(!/\x1b[19{}]/.test(rec.all()), 'nothing of them on the wire; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: a Cyrillic layout (e.key "е"/"ц"/"х"/"ъ") and macOS Option ("¡","™","†","∑","”","’") work by e.code', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b), tC = tabOfPane(c);
+  // Cyrillic (ЙЦУКЕН): Digit keys give digits, KeyT -> 'е', KeyW -> 'ц', [ -> 'х', ] -> 'ъ'.
+  typeIn(win, c, 'Digit1', '1', {alt: true});
+  ok(tabId(activeTab(win)) === tA, 'cyrillic Alt+1 -> tab 1');
+  typeIn(win, a, 'BracketRight', 'Ъ', {alt: true, shift: true});
+  ok(tabId(activeTab(win)) === tB, 'cyrillic Alt+Shift+] (e.key "Ъ") -> next tab');
+  typeIn(win, b, 'BracketLeft', 'Х', {alt: true, shift: true});
+  ok(tabId(activeTab(win)) === tA, 'cyrillic Alt+Shift+[ (e.key "Х") -> previous tab');
+  const evT = typeIn(win, a, 'KeyT', 'е', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'cyrillic Alt+T (e.key "е") opens the + form');
+  ok(evT.defaultPrevented, 'and is consumed');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(tabEls(win).length === 3, 'dismissing it made no tab');
+  const evW = typeIn(win, a, 'KeyW', 'ц', {alt: true});
+  await until(() => !tabById(win, tA), 500);
+  ok(!tabById(win, tA) && !win.panes[a.id], 'cyrillic Alt+W (e.key "ц") closes the active tab (A)');
+  ok(evW.defaultPrevented, 'and is consumed');
+  await flushedThrough(win, rec, activePane(win));
+  ok(!/\x1b[1te{}\[\]]|[еёцхъЪХ]/i.test(rec.all()), 'nothing of the cyrillic combos on the wire; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: macOS Option+digit / Option+T / Option+W / Option+Shift+[ ] act and the symbols never reach the shell', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b), tC = tabOfPane(c);
+  const M = true;
+  typeIn(win, c, 'Digit1', '¡', {alt: true}, M);
+  ok(tabId(activeTab(win)) === tA, 'Option+1 (e.key "¡") -> tab 1');
+  typeIn(win, a, 'Digit2', '™', {alt: true}, M);
+  ok(tabId(activeTab(win)) === tB, 'Option+2 (e.key "™") -> tab 2');
+  typeIn(win, b, 'Digit9', 'ª', {alt: true}, M);
+  ok(tabId(activeTab(win)) === tC, 'Option+9 (e.key "ª") -> last tab');
+  typeIn(win, c, 'BracketRight', '’', {alt: true, shift: true}, M);
+  ok(tabId(activeTab(win)) === tA, 'Option+Shift+] (e.key "’") -> next tab, wrapping C -> A');
+  typeIn(win, a, 'BracketLeft', '”', {alt: true, shift: true}, M);
+  ok(tabId(activeTab(win)) === tC, 'Option+Shift+[ (e.key "”") -> previous tab, wrapping A -> C');
+  typeIn(win, c, 'KeyT', '†', {alt: true}, M);
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'Option+T (e.key "†") opens the + form');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  typeIn(win, c, 'KeyW', '∑', {alt: true}, M);
+  await until(() => !tabById(win, tC), 500);
+  ok(!tabById(win, tC), 'Option+W (e.key "∑") closes the active tab');
+  await flushedThrough(win, rec, activePane(win));
+  ok(!/[¡™ª’”†∑]/.test(rec.all()), 'none of the Option symbols reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+T is "+": opens the form, connecting makes a new active tab; dismissing makes none', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), {local: {websh_connections: JSON.stringify([
+    {name: 'saved one', host: 's.host', user: 'u', port: 22}])}});
+  const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const ev = typeIn(win, a, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(!hidden($(win, 'ov')), 'Alt+T opens the login form');
+  ok(ev.defaultPrevented, 'Alt+T is consumed');
+  ok(!hidden($(win, 'btnCancel')), 'as for "+": the form can be dismissed');
+  ok(/saved one/.test($(win, 'savedList').textContent), 'as for "+": saved connections are listed');
+  ok(tabEls(win).length === 1, 'opening the form alone creates no tab');
+  // Alt+T again while the form is open: nothing new.
+  keyOn(win, $(win, 'iH'), 'KeyT', 't', {alt: true});
+  ok(!hidden($(win, 'ov')) && tabEls(win).length === 1, 'Alt+T inside the open form changes nothing');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  ok(tabEls(win).length === 1 && win.activeId === a.id, 'dismissed: no tab made, A still in front');
+  typeIn(win, a, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  const b = await tConnect(win, 'b.host');
+  await until(() => tabEls(win).length === 2, 500);
+  ok(!!b && tabEls(win).length === 2 && tabOfPane(b) !== tabOfPane(a), 'connecting from it makes a new tab');
+  ok(b && tabId(activeTab(win)) === tabOfPane(b) && win.activeId === b.id, 'and the new tab is active');
+  await flushedThrough(win, rec, a.sid ? a : b);
+  ok(!/\x1bt/i.test(rec.all()), 'no ESC+t reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+W closes the active tab, asks once for a tmux tab, honours "don\'t ask again"', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b1 = await tNewTab(win, 'b1.host', {persistent: true});
+  const b2 = b1 && await tSplit(win, b1, 'h', 'b2.host', {persistent: true});
+  const c = b2 && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'setup: A, B (two tmux panes), C'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b1), tC = tabOfPane(c);
+  const modal = confirmCounter(win);
+  // A short-lived tab: closes without a question; the right neighbour, else left, takes over.
+  let ev = typeIn(win, c, 'KeyW', 'w', {alt: true});
+  await until(() => !tabById(win, tC), 500);
+  ok(!tabById(win, tC) && !win.panes[c.id], 'Alt+W in C closes C');
+  ok(ev.defaultPrevented, 'Alt+W consumed');
+  ok(modal.opened === 0, 'no confirm for a short-lived tab');
+  ok(disconnectsFor(env, 'sid-c.host').length === 1, 'C disconnected once');
+  ok(tabId(activeTab(win)) === tB, 'the left neighbour (B) is in front');
+  // tmux tab: one confirm for both panes; Cancel keeps everything.
+  typeIn(win, activePane(win), 'KeyW', 'w', {alt: true});
+  await until(() => modal.opened > 0, 500);
+  ok(modal.opened === 1, 'Alt+W on a tab with two tmux panes asks once; got ' + modal.opened);
+  win.confirmCancel();
+  await sleep(30);
+  ok(!!tabById(win, tB) && !!b1.sid && !!b2.sid, 'Cancel keeps B and both sessions');
+  typeIn(win, activePane(win), 'KeyW', 'w', {alt: true});
+  await until(() => modal.opened > 1, 500);
+  ok(modal.opened === 2, 'asked again (once) on the second Alt+W');
+  win.confirmTerminate(false);
+  await until(() => !tabById(win, tB), 500);
+  await sleep(30);
+  ok(modal.opened === 2, 'still one question per Alt+W');
+  ok(disconnectsFor(env, 'sid-b1.host').filter(e => e.body.terminate).length === 1 &&
+     disconnectsFor(env, 'sid-b2.host').filter(e => e.body.terminate).length === 1, 'both tmux sessions terminated once');
+  ok(tabEls(win).length === 1 && tabId(activeTab(win)) === tA, 'A remains, in front');
+  await flushedThrough(win, rec, a);
+  ok(!/\x1bw/i.test(rec.all()), 'no ESC+w reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys: Alt+W with "don\'t ask again" asks nothing; Alt+W on the last tab returns to the login form', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host', {persistent: true});
+  if (!b) { ok(false, 'setup'); cleanup(env); return; }
+  win.localStorage.setItem('websh_terminate_no_ask', '1');
+  const modal = confirmCounter(win);
+  typeIn(win, b, 'KeyW', 'w', {alt: true});
+  await until(() => tabEls(win).length === 1, 500);
+  ok(modal.opened === 0 && tabEls(win).length === 1, 'tmux tab closed by Alt+W without a question');
+  ok(disconnectsFor(env, 'sid-b.host').some(e => e.body.terminate), 'and its session terminated');
+  typeIn(win, a, 'KeyW', 'w', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  ok(Object.keys(win.panes).length === 0 && !hidden($(win, 'ov')), 'Alt+W on the last tab: no panes, the initial login form');
+  ok(win.overlayMode === 'initial', 'the form is the initial one; got ' + win.overlayMode);
+  cleanup(env);
+});
+
+test('tabs keys: other Alt combos reach the shell unchanged and switch nothing', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b] = await (async () => { const x = await tConnect(win, 'a.host'); return [x, x && await tNewTab(win, 'b.host')]; })();
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabOfPane(b);
+  const combos = [['KeyB', 'b', {alt: true}, '\x1bb'], ['KeyF', 'f', {alt: true}, '\x1bf'],
+                  ['Period', '.', {alt: true}, '\x1b.'], ['KeyD', 'd', {alt: true}, '\x1bd'],
+                  ['Backspace', 'Backspace', {alt: true}, '\x1b\x7f'],
+                  ['ArrowLeft', 'ArrowLeft', {alt: true}, '\x1b[1;3D'], ['ArrowRight', 'ArrowRight', {alt: true}, '\x1b[1;3C'],
+                  ['BracketLeft', '[', {alt: true}, '\x1b['], ['BracketRight', ']', {alt: true}, '\x1b]']];
+  combos.forEach(k => typeIn(win, b, k[0], k[1], k[2]));
+  ok(tabId(activeTab(win)) === tB && win.activeId === b.id, 'none of them switched tabs (Alt+Left/Right included)');
+  await flushedThrough(win, rec, b);
+  const want = combos.map(k => k[3]).join('');
+  const got = rec.of(b.sid);
+  ok(got.indexOf(want) === 0, 'B\'s shell got exactly ' + show(want) + ' (Alt+B,F,.,D,Backspace,Left,Right,[,] in order); got ' + show(got));
+  cleanup(env);
+});
+
+test('tabs keys: Ctrl+Alt+digit / Ctrl+Alt+Shift+] (AltGr) never switch tabs', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tC = tabOfPane(c);
+  const evs = [];
+  for (const d of ['1', '2', '9']) evs.push(typeIn(win, c, 'Digit' + d, d === '2' ? '@' : d, {alt: true, ctrl: true}));
+  evs.push(typeIn(win, c, 'BracketRight', '}', {alt: true, ctrl: true, shift: true}));
+  evs.push(typeIn(win, c, 'KeyW', 'w', {alt: true, ctrl: true}));
+  evs.push(typeIn(win, c, 'KeyT', 't', {alt: true, ctrl: true}));
+  await sleep(30);
+  ok(tabId(activeTab(win)) === tC && tabEls(win).length === 3 && hidden($(win, 'ov')),
+     'Ctrl+Alt+1/2/9, Ctrl+Alt+Shift+], Ctrl+Alt+W, Ctrl+Alt+T: still on C, 3 tabs, no form');
+  ok(evs.every(e => !e.defaultPrevented), 'websh did not cancel them (AltGr characters must still type); got ' +
+     show(evs.map(e => e.defaultPrevented)));
+  // And an AltGr event as Chrome on Windows really sends it: ctrlKey+altKey+AltGraph.
+  const ev = new win.KeyboardEvent('keydown', {key: '@', code: 'Digit2', ctrlKey: true, altKey: true, bubbles: true, cancelable: true});
+  ev.getModifierState = m => m === 'AltGraph';
+  xtermKeys(win, c).dispatchEvent(ev);
+  ok(tabId(activeTab(win)) === tC, 'AltGr+2 does not switch tabs');
+  cleanup(env);
+});
+
+test('tabs keys: under the login form, the options and the terminate confirm the shortcuts do nothing', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host', {persistent: true});
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tB = tabOfPane(b);
+  // Each key alone, checked right after it: a sequence could undo
+  // itself (Alt+1 then Alt+9 lands where it started).
+  const moved = [];
+  const allKeys = (target, where) => {
+    const confirmWas = !hidden($(win, 'confirmOv'));
+    [['Digit1', '1', {alt: true}], ['Digit9', '9', {alt: true}], ['BracketLeft', '{', {alt: true, shift: true}],
+     ['BracketRight', '}', {alt: true, shift: true}], ['KeyW', 'w', {alt: true}]].forEach(k => {
+      keyOn(win, target, k[0], k[1], k[2]);
+      if (tabId(activeTab(win)) !== tB || tabEls(win).length !== 2 || win.activeId !== b.id ||
+          (!confirmWas && !hidden($(win, 'confirmOv')))) {
+        moved.push(where + ': ' + k[0] + (k[2].shift ? '+shift' : ''));
+        if (!confirmWas && !hidden($(win, 'confirmOv'))) win.confirmCancel();
+        if (tabById(win, tB)) clickTab(win, tabById(win, tB));
+      }
+    });
+  };
+  // 1. The + form, keys typed in its host field and on the body.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  allKeys($(win, 'iH'), 'form/host field'); allKeys(win.document.body, 'form/body');
+  await sleep(30);
+  ok(moved.length === 0 && tabId(activeTab(win)) === tB && tabEls(win).length === 2 && win.activeId === b.id,
+     'login form open: Alt+1/9/Shift+[/Shift+]/W switched, closed or asked nothing; did: ' + show(moved));
+  ok(!hidden($(win, 'ov')), 'the form is still open');
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 500);
+  // 2. Options.
+  win.openOptions();
+  ok(!hidden($(win, 'ovOpt')), 'setup: options open');
+  moved.length = 0;
+  allKeys(win.document.body, 'options');
+  keyOn(win, win.document.body, 'KeyT', 't', {alt: true});
+  await sleep(30);
+  ok(moved.length === 0 && tabId(activeTab(win)) === tB && tabEls(win).length === 2,
+     'options open: nothing switched, closed or asked; did: ' + show(moved));
+  ok(hidden($(win, 'ov')), 'options open: Alt+T did not open the login form over it');
+  win.closeOptions();
+  // 3. The terminate confirm (Alt+W on the tmux tab), then more keys under it.
+  const modal = confirmCounter(win);
+  typeIn(win, b, 'KeyW', 'w', {alt: true});
+  await until(() => modal.opened === 1, 500);
+  ok(modal.opened === 1, 'setup: Alt+W asks to terminate');
+  moved.length = 0;
+  allKeys(win.document.body, 'confirm');
+  keyOn(win, win.document.body, 'KeyT', 't', {alt: true});
+  await sleep(30);
+  ok(moved.length === 0 && tabId(activeTab(win)) === tB && tabEls(win).length === 2,
+     'confirm open: no switch, nothing closed; did: ' + show(moved));
+  ok(modal.opened === 1 && !hidden($(win, 'confirmOv')), 'confirm still the one question');
+  ok(hidden($(win, 'ov')), 'confirm open: Alt+T did not open the login form');
+  win.confirmCancel();
+  await sleep(30);
+  ok(!!tabById(win, tA) && !!tabById(win, tB), 'Cancel keeps both tabs');
+  cleanup(env);
+});
+
+test('tabs keys: tooltips name the shortcut - tab N says Alt+N (N<=8), + says Alt+T, and they follow the order', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ts = tabEls(win);
+  ts.forEach((t, i) => ok(titleOf(t).indexOf('Alt+' + (i + 1)) >= 0,
+    'tab ' + (i + 1) + ' tooltip mentions Alt+' + (i + 1) + '; got ' + show(titleOf(t))));
+  ok(titleOf($(win, 'tabNew')).indexOf('Alt+T') >= 0, '"+" tooltip mentions Alt+T; got ' + show(titleOf($(win, 'tabNew'))));
+  // Close tab 1: the former tab 2 is now tab 1, and says so.
+  closeTabX(win, tabElOfPane(win, a));
+  await until(() => tabEls(win).length === 2, 500);
+  const t2 = tabEls(win);
+  ok(t2.length === 2 && titleOf(t2[0]).indexOf('Alt+1') >= 0 && titleOf(t2[0]).indexOf('Alt+2') < 0,
+     'after closing tab 1, B (now first) says Alt+1, not Alt+2; got ' + show(titleOf(t2[0])));
+  ok(titleOf(t2[1]).indexOf('Alt+2') >= 0 && titleOf(t2[1]).indexOf('Alt+3') < 0,
+     'C (now second) says Alt+2; got ' + show(titleOf(t2[1])));
+  cleanup(env);
+});
+
+test('tabs keys: the tooltip of tab 9 and later does not promise Alt+9..', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  let p = await tConnect(win, 'h1.host');
+  if (!needTabs(win) || !p) { cleanup(env); return; }
+  for (let i = 2; i <= 10; i++) p = await tNewTab(win, 'h' + i + '.host');
+  const ts = tabEls(win);
+  ok(ts.length === 10, 'setup: 10 tabs; got ' + ts.length);
+  ok(titleOf(ts[7]).indexOf('Alt+8') >= 0, 'tab 8 says Alt+8; got ' + show(titleOf(ts[7])));
+  ok(!/Alt\+9\b/.test(titleOf(ts[8])) && !/Alt\+10/.test(titleOf(ts[9])),
+     'tab 9 of 10 does not claim Alt+9 (that is the last tab), tab 10 does not claim Alt+10; got ' + show(titleOf(ts[8])) + ' / ' + show(titleOf(ts[9])));
+  // Alt+9 is still "last".
+  clickTab(win, ts[0]);
+  await until(() => tabId(activeTab(win)) === tabId(ts[0]), 500);
+  keyOn(win, win.document.body, 'Digit9', '9', {alt: true});
+  ok(tabId(activeTab(win)) === tabId(ts[9]), 'Alt+9 with 10 tabs goes to the 10th, the last');
+  keyOn(win, win.document.body, 'Digit8', '8', {alt: true});
+  ok(tabId(activeTab(win)) === tabId(ts[7]), 'Alt+8 goes to the 8th');
+  cleanup(env);
+});
+
+test('tabs keys (break): held Alt+Shift+] (autorepeat) and a burst of Alt+N leave one consistent tab in front', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry])); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const ids = [a, b, c].map(tabOfPane);
+  for (let i = 0; i < 31; i++) {
+    const ev = new win.KeyboardEvent('keydown', {key: '}', code: 'BracketRight', altKey: true, shiftKey: true,
+      repeat: i > 0, bubbles: true, cancelable: true});
+    xtermKeys(win, activePane(win)).dispatchEvent(ev);
+  }
+  // from C (index 2): 31 steps -> (2+31)%3 = 0
+  ok(tabId(activeTab(win)) === ids[0], '31 autorepeated next-tab steps from C land on A; on #' + ids.indexOf(tabId(activeTab(win))));
+  for (const d of ['2', '3', '1', '3', '2']) typeIn(win, activePane(win), 'Digit' + d, d, {alt: true});
+  ok(tabId(activeTab(win)) === ids[1] && win.activeId === b.id, 'Alt+2,3,1,3,2 in a burst ends on B with B\'s pane active');
+  const roots = tabRoots(win).filter(r => !env.lay.hidden(r));
+  ok(roots.length === 1 && roots[0].getAttribute('data-tab') === ids[1], 'exactly one tab layout visible, B\'s; got ' + roots.length);
+  await flushedThrough(win, rec, b);
+  ok(!/\x1b[123}]/.test(rec.all()), 'none of it on the wire; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+// ---- step 4, second round: trying to break the tab keys ----
+const tabKeyAt = (win, target, code, key, mods) => keyOn(win, target, code, key, Object.assign({alt: true}, mods || {}));
+const paneTabsSound = win => {
+  // every pane in exactly one tab root, one root visible, active pane in the active tab
+  const errs = [];
+  paneList(win).forEach(p => { if (!tabOfPane(p)) errs.push(p.host + ' has no tab'); });
+  const vis = tabRoots(win).filter(r => !r.classList.contains('h'));
+  if (vis.length !== 1) errs.push(vis.length + ' roots visible');
+  if (activeTab(win) && vis[0] && vis[0].getAttribute('data-tab') !== tabId(activeTab(win))) errs.push('visible root is not the active tab');
+  const ap = win.panes[win.activeId];
+  if (ap && tabOfPane(ap) !== tabId(activeTab(win))) errs.push('active pane ' + ap.host + ' is not in the active tab');
+  if (tabEls(win).length !== tabRoots(win).length) errs.push('tabs ' + tabEls(win).length + ' vs roots ' + tabRoots(win).length);
+  return errs;
+};
+
+// While a tab or pane drag is in progress the tab keys do nothing: they
+// are still consumed (never reach the shell) and the drag goes on
+// unchanged - the zone stays where it was, the release does what it
+// would have done without the key.
+test('tabs keys (break): during a tab drag Alt+N / Alt+W / Alt+T / Alt+Shift+] do nothing; the drop still works', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), null, S3); const win = env.win;
+  const [a, b, c] = await threeTabs(win);
+  if (!needTabs(win) || !c) { ok(false, 'setup'); cleanup(env); return; }
+  const tA = tabOfPane(a), tC = tabOfPane(c);
+  clickTab(win, tabById(win, tA));
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  const modal = confirmCounter(win);
+  let zone = null, zoneAfter = null, state = null;
+  const evs = [];
+  dragTabOnto(win, tabById(win, tC), a, 'right', {beforeUp: () => {
+    zone = zoneOf(a);
+    evs.push(typeIn(win, a, 'Digit2', '2', {alt: true}));            // from the terminal (focus stays there)
+    evs.push(tabKeyAt(win, win.document.body, 'Digit3', '3'));
+    evs.push(typeIn(win, a, 'BracketRight', '}', {alt: true, shift: true}));
+    evs.push(typeIn(win, a, 'Digit9', '9', {alt: true}));
+    evs.push(typeIn(win, a, 'KeyW', 'w', {alt: true}));
+    evs.push(typeIn(win, a, 'KeyT', 't', {alt: true}));
+    zoneAfter = zoneOf(a);
+    state = {front: tabId(activeTab(win)), tabs: tabEls(win).length, form: !hidden($(win, 'ov')),
+             confirm: modal.opened, dragging: !!win.document.querySelector('.dragging')};
+  }});
+  await sleep(50);
+  ok(zone === 'right', 'setup: zone shown on A; got ' + show(zone));
+  ok(state.front === tA && state.tabs === 3 && !state.form && state.confirm === 0,
+     'mid-drag Alt+2/3/Shift+]/9/W/T: no switch, no close, no form, no confirm; got ' +
+     show({front: state.front === tA ? 'A' : state.front, tabs: state.tabs, form: state.form, confirm: state.confirm}));
+  ok(evs.every(e => e.defaultPrevented), 'all consumed; prevented: ' + show(evs.map(e => e.defaultPrevented)));
+  ok(zoneAfter === 'right' && state.dragging, 'the drag goes on unchanged: zone still "right", tab still dragging; got ' +
+     show(zoneAfter) + '/' + state.dragging);
+  ok(show(shapesNow(win)) === show(['(h a.host c.host)', 'b.host']),
+     'the release merged C to the right of A as it would without the keys; got ' + show(shapesNow(win)));
+  ok(anyZone(win) === 0 && !win.document.querySelector('.dragging') && layoutProblems(win).length === 0 &&
+     paneTabsSound(win).length === 0, 'nothing left behind: ' + show(layoutProblems(win).concat(paneTabsSound(win))));
+  await flushedThrough(win, rec, a);
+  ok(!/\x1b[0-9tw}]/.test(rec.all()), 'none of the keys reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys (break): during a pane-bar drag Alt+N does nothing; the drop on the strip still makes a tab', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), null, S3); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { cleanup(env); return; }
+  const c = await tNewTab(win, 'c.host');
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => tabId(activeTab(win)) === tabOfPane(a), 500);
+  const tA = tabOfPane(a);
+  const spy = sessionSpy(win, [a, b, c]);
+  const m = pointer(win);
+  const [x0, y0] = centre(labelEl(b));
+  m.down(labelEl(b), x0, y0);
+  m.move(labelEl(b), x0 + 20, y0 + 20);
+  m.move($(win, 'tabs'), x0 + 40, y0);
+  const e1 = typeIn(win, b, 'Digit2', '2', {alt: true});
+  const e2 = tabKeyAt(win, win.document.body, 'BracketRight', '}', {shift: true});
+  ok(tabId(activeTab(win)) === tA && tabEls(win).length === 2, 'mid pane-drag Alt+2 / Alt+Shift+] switch nothing');
+  ok(e1.defaultPrevented && e2.defaultPrevented, 'and are consumed');
+  m.move($(win, 'tabs'), x0 + 42, y0);
+  m.up($(win, 'tabs'), x0 + 42, y0);
+  await until(() => tabEls(win).length === 3, 500);
+  ok(tabEls(win).length === 3 && panesOfTab(win, tabOfPane(b)).length === 1 && tabOfPane(b) !== tA,
+     'the drop on the strip still made b a tab of its own; tabs ' + tabEls(win).length);
+  ok(b.sid === 'sid-b.host' && spy.length === 0, 'same session, nothing restarted; got ' + show(spy));
+  ok(layoutProblems(win).length === 0 && paneTabsSound(win).length === 0,
+     'layout sound: ' + show(layoutProblems(win).concat(paneTabsSound(win))));
+  await flushedThrough(win, rec, b);
+  ok(!/\x1b[0-9}]/.test(rec.all()), 'nothing reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys (break): Alt+W on a tab whose pane is still connecting after a reload', async () => {
+  const rec = h => ({label: 'u@' + h, via: 'manual', host: h, port: 22, user: 'u', auth: 'pw',
+                     persistent: false, slot_id: null, tmux_cmd: 'tmux', cols: 80, rows: 24});
+  const pre = {local: {websh_panes: JSON.stringify({version: 2,
+    layout: {type: 'leaf', pane: 'p1'}, panes: {p1: rec('a.host')}})},
+    session: {websh_panes_session: JSON.stringify({p1: {password: 'pw-a.host'}})}};
+  const env0 = await mkTabEnv(TAB_PLAN(), pre); const w0 = env0.win;
+  await until(() => paneList(w0).some(p => p.sid), 2000);
+  if (!needTabs(w0)) { cleanup(env0); return; }
+  const b0 = await tNewTab(w0, 'b.host');
+  if (!b0) { ok(false, 'setup'); cleanup(env0); return; }
+  const snap = snapshotStorage(w0);                 // B in front
+  cleanup(env0);
+  const env = await mkTabEnv(TAB_PLAN([
+    {action: 'connect', match: b => b.host === 'b.host', response: {session_id: 'sid-b-late', alive: true}, delay: 300},
+  ]), snap);
+  const win = env.win;
+  await until(() => tabEls(win).length === 2, 1500);
+  const b = paneList(win).find(p => p.host === 'b.host');
+  ok(!!b && !b.sid && b.connecting && tabId(activeTab(win)) === tabOfPane(b), 'setup: B in front, still connecting');
+  if (!b) { cleanup(env); return; }
+  const ev = typeIn(win, b, 'KeyW', 'w', {alt: true});
+  ok(ev.defaultPrevented, 'Alt+W consumed');
+  await until(() => tabEls(win).length === 1, 500);
+  ok(tabEls(win).length === 1, 'B closed by Alt+W while connecting');
+  await until(() => disconnectsFor(env, 'sid-b-late').length > 0, 1000);
+  await sleep(50);
+  ok(disconnectsFor(env, 'sid-b-late').length === 1, 'the late session is disconnected once');
+  ok(tabEls(win).length === 1 && tabRoots(win).length === 1 && paneList(win).length === 1, 'nothing came back');
+  ok(hidden($(win, 'ov')) && paneTabsSound(win).length === 0, 'A in front, no form; ' + show(paneTabsSound(win)));
+  cleanup(env);
+});
+
+test('tabs keys (break): Alt+T twice in a row opens one form; connecting makes one tab', async () => {
+  const env = await mkTabEnv(TAB_PLAN()); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const modal = (() => { const el = $(win, 'ov'); const c = {opened: 0}; let was = !hidden(el);
+    new win.MutationObserver(() => { const n = !hidden(el); if (n && !was) c.opened++; was = n; })
+      .observe(el, {attributes: true, attributeFilter: ['class']}); return c; })();
+  const e1 = typeIn(win, a, 'KeyT', 't', {alt: true});
+  const e2 = typeIn(win, a, 'KeyT', 't', {alt: true});     // same tick, before anything renders
+  const e3 = keyOn(win, win.document.activeElement || win.document.body, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  await sleep(30);
+  ok(modal.opened === 1 && win.overlayMode === 'tab', 'one form, for a new tab; opened ' + modal.opened + ', mode ' + win.overlayMode);
+  ok(e1.defaultPrevented, 'the first Alt+T consumed');
+  void e2; void e3;
+  const b = await tConnect(win, 'b.host');
+  await until(() => tabEls(win).length === 2, 500);
+  await sleep(50);
+  ok(!!b && tabEls(win).length === 2 && paneList(win).length === 2, 'exactly one new tab; got ' + tabEls(win).length + ' tabs');
+  ok(hidden($(win, 'ov')), 'no second form left over');
+  cleanup(env);
+});
+
+// A text field outside a terminal (any input/textarea/contenteditable
+// that is not xterm's helper textarea) is left alone: no tab key acts
+// there and nothing is prevented, so every Alt/Option character types.
+async function textFieldRule(env, field, label, tB) {
+  const win = env.win;
+  if (!hidden($(win, 'ov'))) win.cancelConnect();
+  if (!hidden($(win, 'confirmOv'))) win.confirmCancel();
+  if (tabId(activeTab(win)) !== tB && tabById(win, tB)) { clickTab(win, tabById(win, tB)); await until(() => tabId(activeTab(win)) === tB, 500); }
+  try { field.focus(); } catch (e) {}
+  const keys = [['Digit1', '¡'], ['Digit2', '™'], ['Digit9', 'ª'], ['KeyT', '†'], ['KeyW', '∑']].map(k => [k[0], k[1], {}]);
+  keys.push(['BracketLeft', '”', {shift: true}], ['BracketRight', '’', {shift: true}]);
+  const did = [], prevented = [];
+  keys.forEach(k => {
+    const ev = tabKeyAt(win, field, k[0], k[1], k[2]);
+    const name = k[0] + (k[2].shift ? '+shift' : '');
+    if (ev.defaultPrevented) prevented.push(name);
+    if (tabId(activeTab(win)) !== tB || tabEls(win).length !== 2 || !hidden($(win, 'confirmOv')) ||
+        !hidden($(win, 'ov'))) {
+      did.push(name);
+      if (!hidden($(win, 'ov'))) win.cancelConnect();
+      if (!hidden($(win, 'confirmOv'))) win.confirmCancel();
+      if (tabById(win, tB)) clickTab(win, tabById(win, tB));
+    }
+  });
+  await sleep(20);
+  if (!hidden($(win, 'ov'))) win.cancelConnect();
+  if (tabId(activeTab(win)) !== tB && tabById(win, tB)) { clickTab(win, tabById(win, tB)); await until(() => tabId(activeTab(win)) === tB, 500); }
+  ok(did.length === 0, label + ': Alt+1/2/9/T/W/Shift+[/Shift+] did nothing (no switch, close, form); acted: ' + show(did));
+  ok(prevented.length === 0, label + ': none prevented, so the characters type; prevented: ' + show(prevented));
+}
+
+test('tabs keys (break): text fields outside a terminal (search box, file-browser filter, reconnect password, contenteditable) are left alone', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry, {action: 'ls', response: {ok: true, path: '/home/u', entries: []}}])); const win = env.win;
+  const [a, b] = await (async () => { const x = await tConnect(win, 'a.host'); return [x, x && await tNewTab(win, 'b.host', {persistent: true})]; })();
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tB = tabOfPane(b);   // tmux: a wrong Alt+W asks (and is cancelled) instead of closing B
+  // Search box of B.
+  win.toggleSearch();
+  const sb = b.el.querySelector('[data-search] input');
+  ok(!!sb && !hidden(b.el.querySelector('[data-search]')), 'setup: B\'s search box open');
+  if (sb) await textFieldRule(env, sb, 'search box', tB);
+  if (typeof win.closeSearch === 'function') win.closeSearch();
+  // File-browser filter.
+  const st = {front: tabId(activeTab(win)) === tB ? 'B' : 'A', ov: !hidden($(win, 'ov')), confirm: !hidden($(win, 'confirmOv')),
+              fbOv: !hidden($(win, 'fbOv')), bsid: b.sid};
+  win.showFileBrowser(b.id);
+  await until(() => !hidden($(win, 'fbOv')), 500);
+  const ff = $(win, 'fbFilter');
+  ok(!hidden($(win, 'fbOv')) && !!ff, 'setup: file browser open with its filter field; before: ' + show(st));
+  if (ff) await textFieldRule(env, ff, 'file-browser filter', tB);
+  win.closeFb();
+  await until(() => hidden($(win, 'fbOv')), 500);
+  // Reconnect password field.
+  const pw = b.el.querySelector('input.reconnect-pw');
+  ok(!!pw, 'setup: B has a reconnect password field');
+  if (pw) { pw.classList.remove('h'); await textFieldRule(env, pw, 'reconnect password', tB); pw.classList.add('h'); }
+  // A contenteditable outside a terminal.
+  const ce = win.document.createElement('div');
+  ce.setAttribute('contenteditable', 'true');
+  win.document.body.appendChild(ce);
+  await textFieldRule(env, ce, 'contenteditable', tB);
+  ce.remove();
+  // Back in B's terminal the keys work again.
+  const ev = typeIn(win, b, 'Digit1', '1', {alt: true});
+  ok(tabId(activeTab(win)) === tabOfPane(a) && ev.defaultPrevented, 'back in a terminal Alt+1 switches again');
+  await flushedThrough(win, rec, a);
+  ok(!/\x1b[0-9tw{}]|[¡™ª†∑”’]/.test(rec.all()), 'nothing reached a shell; got ' + show(rec.all()));
+  cleanup(env);
+});
+
+test('tabs keys (break): Ctrl+Tab, Ctrl+V and Ctrl+Shift+F still do their jobs from inside the terminal', async () => {
+  const rec = inputRecorder();
+  const env = await mkTabEnv(TAB_PLAN([rec.entry]), {local: {websh_settings: JSON.stringify({ctrlVPaste: true})}}); const win = env.win;
+  const [a1, a2] = await splitTabEnv(win, ['a1.host', 'a2.host']);
+  if (!needTabs(win) || !a2) { ok(false, 'setup'); cleanup(env); return; }
+  const was = win.activeId;
+  // Ctrl+Tab at document level, like the existing test (xterm does not stop it: Tab with ctrl)
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'Tab', code: 'Tab', ctrlKey: true, bubbles: true, cancelable: true}));
+  ok(win.activeId !== was && [a1.id, a2.id].includes(win.activeId), 'Ctrl+Tab cycles to the other pane');
+  const p = activePane(win);
+  // Ctrl+V: declined to xterm (custom handler false), as before.
+  const ev = new win.KeyboardEvent('keydown', {key: 'v', code: 'KeyV', ctrlKey: true, bubbles: true, cancelable: true});
+  const r = p.term._customKey ? p.term._customKey(ev) : null;
+  const expectPaste = win._ctrlVShouldPaste ? win._ctrlVShouldPaste(ev) : null;
+  ok(r === !expectPaste, 'Ctrl+V: the custom key handler answers as _ctrlVShouldPaste says (paste=' + expectPaste + ', handler=' + r + ')');
+  // Alt+V is not a tab key: handler lets xterm have it.
+  const ev2 = new win.KeyboardEvent('keydown', {key: 'v', code: 'KeyV', altKey: true, bubbles: true, cancelable: true});
+  ok(p.term._customKey(ev2) === true && !ev2.defaultPrevented, 'Alt+V goes to xterm untouched');
+  // Ctrl+Shift+F opens the search box of the active pane.
+  win.document.dispatchEvent(new win.KeyboardEvent('keydown', {key: 'F', code: 'KeyF', ctrlKey: true, shiftKey: true, bubbles: true, cancelable: true}));
+  const sb = p.el.querySelector('[data-search]');
+  ok(!!sb && !hidden(sb), 'Ctrl+Shift+F opens the active pane\'s search');
+  cleanup(env);
+});
+
+// =====================================================================
 // A stray rejection used to take node down mid-run with no summary, so
 // a crash looked like "no result" rather than a failure. Count it as a
 // failure against the scenario that was running and keep going.

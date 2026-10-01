@@ -614,7 +614,10 @@ function createPane(container) {
   //
   // Returning false here is the ONLY way to get that: any handling at
   // all ends in preventDefault, which kills the native paste.
-  term.attachCustomKeyEventHandler(e => !_ctrlVShouldPaste(e));
+  //
+  // The tab keys (Alt+1..9, Alt+T, Alt+W, Alt+Shift+[ / ]) are taken
+  // here too, before xterm turns Alt+x into ESC x: see tabKeyHandled().
+  term.attachCustomKeyEventHandler(e => !tabKeyHandled(e) && !_ctrlVShouldPaste(e));
 
   // Right-click paste. Also swallow button-2 mousedown at capture phase
   // so xterm.js never forwards it to the remote — otherwise tmux (with
@@ -980,6 +983,7 @@ function endTabDrag(e) {
     if (t) order.push(t);
   });
   if (order.length === tabs.length) { tabs.length = 0; order.forEach(t => tabs.push(t)); }
+  tabs.forEach(renderTab);   // the numbers in the tooltips follow the order
   // As in a browser, the tab that was dragged along the strip is the
   // one in front afterwards (it used to be activated on the press).
   if (activeTabId !== d.t.id) showTab(d.t.id, {noSave: true});
@@ -1068,6 +1072,7 @@ function removeTab(t) {
     activeTabId = null;
     showTab(next.id);
   }
+  tabs.forEach(renderTab);   // the numbers in the tooltips shift
 }
 
 function removeAllTabs() {
@@ -1100,7 +1105,11 @@ function renderTab(t) {
   let label = ap ? (ap.label || '') : '';
   let active = t.id === activeTabId;
   let act = !!t.activity && !active;
-  let key = [worst, label, ps.length, act ? 1 : 0, active ? 1 : 0].join('\u0001');
+  // Tabs 1..8 carry their shortcut; the number follows the strip order,
+  // so every path that reorders or removes a tab re-renders them all.
+  let num = tabs.indexOf(t) + 1;
+  let hint = num >= 1 && num <= 8 ? 'Alt+' + num : '';
+  let key = [worst, label, ps.length, act ? 1 : 0, active ? 1 : 0, hint].join('\u0001');
   if (t._key === key) return;
   t._key = key;
   t.el.querySelector('.tab-dot').className = 'tab-dot s-' + worst;
@@ -1110,7 +1119,8 @@ function renderTab(t) {
   sp.classList.toggle('h', ps.length < 2);
   sp.title = ps.length > 1 ? ps.length + ' panes' : '';
   t.el.classList.toggle('activity', act);
-  t.el.title = label + (ps.length > 1 ? ' (' + ps.length + ' panes)' : '');
+  t.el.title = label + (ps.length > 1 ? ' (' + ps.length + ' panes)' : '')
+    + (hint ? (label ? ' - ' : '') + hint : '');
   if (active) renderPaneTools();
 }
 
@@ -7616,6 +7626,84 @@ window.addEventListener('blur', () => {
 });
 
 // ── Keyboard shortcuts ──────────────────────────────────────────────
+// Tab keys: Alt+1..Alt+8 go to tab N, Alt+9 to the last tab, Alt+T is
+// the "+" button, Alt+W closes the tab on screen (closeTab: the same
+// confirm as its x), Alt+Shift+[ / Alt+Shift+] go to the previous /
+// next tab, wrapping. Not Alt+Left/Right: Option+arrows move by word in
+// the shell on a Mac.
+//
+// Matched by e.code, never e.key: a Cyrillic layout gives key 'е' for
+// Alt+T, and macOS Option gives a symbol ('¡' for Option+1, '’' for
+// Option+Shift+]). Plain Alt only: Ctrl+Alt is AltGr on Windows (it
+// types characters on many layouts), and Meta/Ctrl combos belong to the
+// browser. Any other Alt combo is not ours and reaches the shell as
+// before (readline's Alt+B/F/./D, Alt+[ ...).
+//
+// Two entry points, one rule:
+//  - the terminal: xterm's attachCustomKeyEventHandler sees the key
+//    before xterm sends ESC+x and stops it, so a document listener never
+//    would. Returning false there leaves the event alone; we also
+//    preventDefault, or macOS would type the Option symbol into xterm's
+//    textarea and it would reach the shell through the input event.
+//  - the page outside a terminal (tab strip, body): the document
+//    listener below. A key handled in the terminal bubbles on to it, so
+//    the event is marked and acted on once.
+// While any dialog is up (login form, options, confirm, file browser:
+// every .ov) the keys do nothing and are not taken. In a text field
+// that is not a terminal (search box, a pane's reconnect password,
+// any contenteditable) they are not ours either: every Alt/Option
+// character must type there (a Mac password with ¡ or ™ in it).
+// During a tab or pane drag (from the press on) they are taken but do
+// nothing: switching or closing a tab under the pointer would change
+// what the release drops onto.
+function _tabKeyAction(e) {
+  if (!e || !e.altKey || e.ctrlKey || e.metaKey) return null;
+  if (e.getModifierState && e.getModifierState('AltGraph')) return null;
+  let c = e.code || '';
+  if (e.shiftKey) {
+    if (c === 'BracketLeft') return 'prev';
+    if (c === 'BracketRight') return 'next';
+    return null;
+  }
+  let m = /^Digit([1-9])$/.exec(c);
+  if (m) return m[1];
+  if (c === 'KeyT') return 'new';
+  if (c === 'KeyW') return 'close';
+  return null;
+}
+function _isPageTextField(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (el.classList && el.classList.contains('xterm-helper-textarea')) return false;
+  let tag = (el.tagName || '').toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!el.isContentEditable
+    || (el.getAttribute && /^(|true|plaintext-only)$/i.test(el.getAttribute('contenteditable') || 'x'));
+}
+function tabKeyHandled(e) {
+  let act = _tabKeyAction(e);
+  if (!act || !tabs.length || document.querySelector('.ov:not(.h)')) return false;
+  if (_isPageTextField(e.target)) return false;
+  if (e.type === 'keydown' && !e._wsTabKey && !_tabDrag && !_paneDrag) {
+    e._wsTabKey = true;
+    let idx = tabs.indexOf(activeTab());
+    if (act === 'new') newTab();
+    else if (act === 'close') { if (activeTabId) closeTab(activeTabId); }
+    else if (act === 'prev' || act === 'next') {
+      let n = tabs.length;
+      let i = idx < 0 ? 0 : (idx + (act === 'next' ? 1 : n - 1)) % n;
+      if (tabs[i].id !== activeTabId) showTab(tabs[i].id);
+    } else {
+      let i = act === '9' ? tabs.length - 1 : Number(act) - 1;
+      if (tabs[i] && tabs[i].id !== activeTabId) showTab(tabs[i].id);
+    }
+  }
+  try { e.preventDefault(); } catch (err) {}
+  return true;
+}
+document.addEventListener('keydown', e => {
+  if (e._wsTabKey) return;
+  tabKeyHandled(e);
+});
+
 function cyclePanes(reverse) {
   // Within the tab on screen: a pane in a hidden tab is not a target.
   let ids = panesInTab(activeTab()).map(p => p.id);
