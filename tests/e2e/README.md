@@ -25,6 +25,7 @@ and on the network, and unit tests passed while they were live.
 | `tabsolo` | one pane in a tab: no pane bar, the terminal has the whole pane and the PTY that size (`stty size`); a split from the top-bar button brings both bars back, closing back to one hides it with exactly one resize; upload through the real file picker from the top-bar button shows progress + cancel; a reload keeps it bar-less |
 | `tabstress` | five tabs in a narrow window: the strip scrolls, the page does not; rapid switching while two tabs flood; zoom while a tab is hidden; a tab dragged to the front keeps its place across a reload |
 | `tabmove` | panes moved between tabs with a real mouse: "Move to new tab" while the pane prints, a tab dropped on a pane's edge (zone shown before release), a pane bar dropped on the strip and on another tab: same sessions (tmux shell keeps its variable), output whole and in order, scrollback kept, PTY = terminal size; a reload restores the moved layout |
+| `scrollpos` | a terminal keeps its scroll position when its element is re-parented (split, close, tab hidden and shown, window resized while hidden, moved or merged between tabs): scrollbar at the bottom where the terminal is, one wheel notch scrolls a few lines. The failure it guards was intermittent (1 run in 3 to 1 in 30): run it with `--repeat 10` |
 
 ## Needs
 

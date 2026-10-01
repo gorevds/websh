@@ -1023,11 +1023,13 @@ function showTab(id, o) {
   // Now that the root is laid out again: fit each pane once to its real
   // size. The settle loop ends in flushPaneResize, which posts only a
   // size the server does not already have.
+  // Once fitted, its scrollbar is put back where xterm shows the
+  // buffer (_resyncScroll, ── Moving panes): xterm measured the viewport
+  // while it was display:none, or the pane was re-parented.
   ps.forEach(q => {
-    if (q._scrollResync) _resyncScroll(q);   // moved while hidden (── Moving panes)
     q._fitDeferred = false;
     applyTermSettings(q);        // a zoom or font change made while hidden
-    fitPaneWhenStable(q);
+    fitPaneWhenStable(q, {onSettled: _resyncScrollSoon});
   });
   tabs.forEach(renderTab);
   renderPaneTools();
@@ -1270,10 +1272,25 @@ function closeTab(id) {
 // keeps a scroll position but cannot take one): showTab does it.
 // Checked in Chromium 2026-10-01: display:none and back keeps the
 // position; removeChild + appendChild loses it.
+//
+// The same lie comes from a display:none tab without any move: xterm
+// 5.5's Viewport._innerRefresh (run on any output or resize) records
+// the viewport's offsetHeight - 0 while hidden - and sizes the scroll
+// area to rows*rowHeight + (offsetHeight - canvas height), i.e. one
+// screen too short. Shown again (after a window resize or a merge)
+// nothing may call it again before the first wheel: scrollTop is
+// clamped a screen above the bottom, the first notch is eaten by the
+// gap or jumps a screen. So the viewport's own refresh is re-run here,
+// with the pane on screen and fitted (it re-reads offsetHeight, resizes
+// the scroll area and sets scrollTop from the buffer); the arithmetic
+// below is the fallback if that private method is gone. No PTY resize.
 function _resyncScroll(p) {
   if (!p || !p.term || !p.term.element) return;
-  if (paneHidden(p)) { p._scrollResync = true; return; }
-  p._scrollResync = false;
+  if (paneHidden(p)) return;    // showTab resyncs every pane it shows
+  try {
+    let core = p.term._core && p.term._core.viewport;
+    if (core && typeof core._innerRefresh === 'function') core._innerRefresh();
+  } catch (e) {}
   try {
     let vp = p.term.element.querySelector('.xterm-viewport');
     let area = vp && vp.querySelector('.xterm-scroll-area');
@@ -1285,6 +1302,13 @@ function _resyncScroll(p) {
     let top = Math.round(buf.viewportY * rowH);
     if (Math.abs(vp.scrollTop - top) > 1) vp.scrollTop = top;
   } catch (e) {}
+}
+// After a fit: now, and once more on the next frame - the renderer
+// takes the new canvas size on its own frame, and the scroll area's
+// height depends on it.
+function _resyncScrollSoon(p) {
+  _resyncScroll(p);
+  requestAnimationFrame(() => { if (panes[p.id] === p) _resyncScroll(p); });
 }
 
 // Take a pane out of its layout: its split wrapper is replaced by the

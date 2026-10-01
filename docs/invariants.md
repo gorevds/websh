@@ -150,11 +150,26 @@ ResizeObserver sees only the final boxes: one fit and at most one
 that is now hidden is fitted when that tab is shown (U1). Both tabs are
 re-rendered, so the solo state is right on each side (U4). Re-parenting
 resets the scroll position of xterm's viewport to 0 while xterm keeps
-showing the bottom; `_resyncScroll` puts it back (deferred to `showTab`
-for a hidden pane). Drags are plain mouse events, never HTML5
+showing the bottom; `_resyncScroll` puts it back (for a hidden pane,
+`showTab` does it after the fit, U6). Drags are plain mouse events, never HTML5
 drag-and-drop, so a pane or tab drag cannot reach the file-drop
 handlers and an OS file drag cannot start a move. Guard: frontend
 `Tabs (step 3)` block; e2e `tabmove`.
+
+**U6. A shown pane's scrollbar is at the bottom it shows.** xterm
+5.5's viewport sizes its scroll area from the viewport's offsetHeight
+whenever output or a resize arrives; in a hidden tab that height is 0,
+so the area comes out one screen short and the scrollbar is clamped a
+screen above the bottom. Shown again at a different size (a window
+resize while hidden, a merge from another tab) nothing may refresh it
+before the first wheel: the notch is eaten or jumps a screen. `showTab`
+fits each pane with `onSettled: _resyncScrollSoon`, which re-runs the
+viewport's own refresh (`_innerRefresh`) with the pane on screen and
+fitted, and once more on the next frame (the renderer takes its new
+canvas size on its own frame). It touches only the DOM scroll state: no
+fit, no `/api/resize`. Guard: e2e `scrollpos` (intermittent before the
+fix: ~1 in 30 for a resize while hidden, up to 1 in 3 for a merge, so
+run it with `--repeat`).
 
 ## Server lifecycle
 
