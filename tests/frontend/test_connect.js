@@ -3185,12 +3185,20 @@ test('reconnect-bar: one alarm, not two - the card is quiet unless it must not b
      'disconnected state shown by a dot');
   ok(/\.pane-badge\.s-on,\.pane-badge\.s-wait,\.pane-badge\.s-off\{background:none;padding:0;color:var\(--dim\)\}/.test(css),
      'badge text is dim, not a coloured pill');
-  ok(/\.pane-overlays\{[^}]*align-items:flex-end/.test(css),
-     'overlay cards size to their content instead of spanning the pane');
-  // Centred at the top the card landed on the first line of output and
-  // pressed against the pane bar.
-  ok(/\.pane-overlays\{position:absolute;bottom:0/.test(css),
-     'the stack sits in the bottom corner, off the first line of output');
+  // The stack sits at the top centre of the terminal area. It was moved to
+  // the bottom-right corner once (4b4f2c7) to keep it off the first line of
+  // output; the owner found that worse - the button is where the eye goes
+  // first at the top, and the first line under it is a fair price. Cards
+  // stay sized to their content (centred, not stretched across the pane).
+  const ov = (css.match(/\.pane-overlays\{([^}]*)\}/) || [, ''])[1];
+  ok(/(^|;)align-items:center(;|$)/.test(ov),
+     'overlay cards are centred and size to their content; rule: ' + ov);
+  ok(/(^|;)top:0(px)?(;|$)/.test(ov),
+     'the stack is anchored at the top of the terminal area; rule: ' + ov);
+  ok(!/(^|;)bottom:/.test(ov),
+     'the stack is not anchored to the bottom; rule: ' + ov);
+  ok(/(^|;)left:0(px)?(;|$)/.test(ov) && /(^|;)right:0(px)?(;|$)/.test(ov),
+     'the stack spans the pane width so its centre is the pane centre; rule: ' + ov);
   ok(!/class="reconnect-bar h"[^>]*>\s*<span[^>]*>Disconnected/.test(js),
      'the card carries no pre-baked status word to leak');
   // Every line websh writes into the terminal shares one form, so ours

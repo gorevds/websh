@@ -219,13 +219,12 @@
        back. The stack is anchored to the terminal area, so it needs no
        knowledge of the pane bar's height.
 
-       Bottom-right, not top-centre: centred at the top the card landed
-       squarely on the first line of output ("tail -f /va[Reconnect]ted")
-       and pressed against the pane bar. The bottom-right corner is the
-       emptiest part of a terminal - lines are left-aligned and rarely
-       full width - and it is where the eye already is when a session
-       dies, next to the prompt. */
-    .pane-overlays{position:absolute;bottom:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:flex-end;gap:4px;padding:6px;pointer-events:none}
+       Top-centre: that is where the owner finds the Reconnect card most
+       convenient - it is the first thing seen when a pane goes dead. The
+       price is known and accepted: the card covers the first rows of
+       output while it is up. Each card is only as wide as its content,
+       so the rest of those rows stays visible on both sides. */
+    .pane-overlays{position:absolute;top:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:center;gap:4px;padding:6px;pointer-events:none}
     .pane-overlays>*{max-width:100%}
     .pane-overlays>*{pointer-events:auto}
     /* Dim the terminal of inactive panes so the one in use stands out: a
