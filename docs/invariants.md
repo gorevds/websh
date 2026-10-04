@@ -84,6 +84,30 @@ Guard: backend `test_upload_in_pieces_appends_at_the_right_offset`,
 frontend `upload in pieces: …`; e2e `upload` (two connection resets
 under a 12 MB upload, sha256 compared on disk).
 
+**O7. A hyperlink a program prints (OSC 8) is a link in the browser,
+in a plain pane and in a tmux pane.** Claude Code, `ls --hyperlink`,
+gcc print `ESC ] 8 ; ; URL ESC \ text ESC ] 8 ; ; ESC \`; the owner
+clicked such words and nothing happened (2026-10). Two layers lost it:
+tmux 3.4 re-draws a pane for the outer terminal and drops OSC 8 unless
+that terminal has the `hyperlinks` feature, which websh's tmux command
+did not set; and xterm.js without a `linkHandler` answers every click
+with a confirm() "WARNING" dialog and shows no target. What must hold:
+the link survives tmux (new session, re-attached session, any running
+tmux server) without the server-wide option growing on every connect,
+and a tmux that predates the option still attaches; hovering shows the
+real target (the text may differ); a plain, Ctrl or Cmd click opens one
+tab at exactly that target, no dialog, no opener; only http(s) open -
+javascript:, data:, file: never do. Plain URLs open as before.
+The hover box exists to show where a link really goes, so it must show
+the host that would open near its start: a target like
+`https://github.com:<200 x>@evil.example/` shown raw was cut by the
+box's ellipsis after "https://github.com:xxx" (found before release,
+2026-10-04). It goes away with its terminal: a pane closed under the
+pointer gets no `leave` from xterm, and the box stayed on screen.
+Guard: backend `TestTmuxForwardsHyperlinks`, `TestTmuxAttachOnAnyVersion`
+(against tmux 3.1c: `scripts/check.sh --full`, leg "tmux 3.1c attach
+chain"); frontend `test_links.js`; e2e `links`, `linkbreak`.
+
 ## Layout and tabs
 
 **U1. A pane in a hidden tab is never fitted to its hidden box.**

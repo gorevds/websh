@@ -352,6 +352,100 @@ function applyTheme(name) {
   SEARCH_OPTS.decorations = Object.assign({}, t.search);
 }
 
+// Links in the terminal. Two kinds reach a click: plain-text URLs found
+// by WebLinksAddon, and OSC 8 hyperlinks a program prints (Claude Code,
+// `ls --hyperlink`, gcc: `ESC]8;;URL ESC\ text ESC]8;; ESC\`), which
+// xterm.js hands to the Terminal's `linkHandler`. Without one, xterm
+// answers every OSC 8 click with a confirm() "WARNING" dialog and never
+// shows where the link goes - and the text of such a link can differ
+// from its target. So: hovering shows the real target (as text, never
+// HTML), and a click opens it the way plain URLs open (new tab, opener
+// cut) - but only http(s). A program on the remote host chooses the
+// target, so javascript:, data:, file: and the rest open nothing.
+// Invariant O7 in docs/invariants.md.
+function openLinkSafely(uri) {
+  let u;
+  try { u = new URL(String(uri)); } catch (e) { return; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+  // Same as WebLinksAddon's own handler: open blank, cut the opener,
+  // then navigate - noopener in window.open's features would make it
+  // return null and lose the tab on some browsers.
+  let w = window.open();
+  if (!w) return;
+  try { w.opener = null; } catch (e) {}
+  w.location.href = u.href;
+}
+
+// What the tooltip shows is chosen by the remote program, so it is
+// made safe to read: control and bidi-override characters (which can
+// reorder or hide text) become U+FFFD, and the host that will really
+// open - parsed, as the browser sees it, punycode included - comes
+// first, on its own line, and wraps rather than being cut; the full
+// URL under it may be truncated. Otherwise `https://github.com:xxx…@evil/`
+// shows as "https://github.com:xxx…" and the real host is cut off.
+function _linkTipText(s) {
+  return String(s).replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff\ufff9-\ufffb]/g, '\ufffd');
+}
+let _linkTip = null, _linkTipOwner = null, _linkTipWatch = null;
+function showLinkTip(ev, uri, term) {
+  if (!_linkTip) {
+    _linkTip = document.createElement('div');
+    _linkTip.className = 'link-tip';
+    _linkTip.style.cssText = 'position:fixed;z-index:1000;max-width:60vw;' +
+      'display:none;' +
+      'padding:3px 8px;border-radius:4px;border:1px solid var(--bd);' +
+      'background:var(--sf);color:var(--tx);font-size:12px;' +
+      'font-family:ui-monospace,Menlo,monospace;' +
+      'pointer-events:none';
+    let host = document.createElement('b');
+    host.className = 'link-tip-host';
+    host.style.cssText = 'display:block;white-space:normal;word-break:break-all';
+    let full = document.createElement('span');
+    full.className = 'link-tip-url';
+    full.style.cssText = 'display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dim)';
+    _linkTip.appendChild(host); _linkTip.appendChild(full);
+    document.body.appendChild(_linkTip);
+  }
+  let host = '';
+  try { host = new URL(String(uri)).host; } catch (e) {}
+  _linkTip.firstChild.textContent = _linkTipText(host);
+  _linkTip.firstChild.style.display = host ? 'block' : 'none';
+  _linkTip.lastChild.textContent = _linkTipText(uri);
+  let x = (ev && ev.clientX) || 0, y = (ev && ev.clientY) || 0;
+  _linkTip.style.left = Math.max(4, Math.min(x + 12, window.innerWidth - 300)) + 'px';
+  _linkTip.style.top = (y + 18 > window.innerHeight - 24 ? y - 26 : y + 18) + 'px';
+  _linkTip.style.display = 'block';
+  // xterm sends no `leave` when its pane is closed, hidden with its tab
+  // or disposed while hovered, so the box would stay with a dead link.
+  // Pane close / dispose hides it at once (see createPane); this watch
+  // covers every other way the hovered terminal disappears.
+  _linkTipOwner = term || null;
+  if (!_linkTipWatch) _linkTipWatch = setInterval(() => {
+    let o = _linkTipOwner && _linkTipOwner.element;
+    if (!o || !o.isConnected || !o.getClientRects().length) hideLinkTip();
+  }, 200);
+}
+function hideLinkTip() {
+  // Emptied as well as hidden: a dead link's target is not left in the
+  // page for anything that reads its text.
+  if (_linkTip) {
+    _linkTip.style.display = 'none';
+    _linkTip.firstChild.textContent = '';
+    _linkTip.lastChild.textContent = '';
+  }
+  _linkTipOwner = null;
+  if (_linkTipWatch) { clearInterval(_linkTipWatch); _linkTipWatch = null; }
+}
+
+function termLinkHandler(getTerm) {
+  return {
+    activate: (ev, uri) => openLinkSafely(uri),
+    hover: (ev, uri) => showLinkTip(ev, uri, getTerm()),
+    leave: () => hideLinkTip(),
+    allowNonHttpProtocols: false,
+  };
+}
+
 function createPane(container) {
   let id = 'p' + (++paneCounter);
   let el = document.createElement('div');
@@ -407,10 +501,17 @@ function createPane(container) {
     fontWeightBold: Math.min(900, settings.fontWeight + 300),
     lineHeight: settings.lineHeight,
     theme: themeXterm(),
-    allowProposedApi:true, scrollback:50000
+    allowProposedApi:true, scrollback:50000,
+    linkHandler: termLinkHandler(() => term)
   });
   term.loadAddon(fit);
-  term.loadAddon(new WebLinksAddon.WebLinksAddon());
+  term.loadAddon(new WebLinksAddon.WebLinksAddon((ev, uri) => openLinkSafely(uri)));
+  // A hovered link's tooltip goes with its terminal (see showLinkTip).
+  let _termDispose = term.dispose.bind(term);
+  term.dispose = () => {
+    if (_linkTipOwner === term) hideLinkTip();
+    _termDispose();
+  };
   let u = new Unicode11Addon.Unicode11Addon(); term.loadAddon(u);
   term.unicode.activeVersion = '11';
   term.loadAddon(search);
