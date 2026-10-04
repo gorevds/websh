@@ -177,8 +177,19 @@ resets the scroll position of xterm's viewport to 0 while xterm keeps
 showing the bottom; `_resyncScroll` puts it back (for a hidden pane,
 `showTab` does it after the fit, U6). Drags are plain mouse events, never HTML5
 drag-and-drop, so a pane or tab drag cannot reach the file-drop
-handlers and an OS file drag cannot start a move. Guard: frontend
-`Tabs (step 3)` block; e2e `tabmove`.
+handlers and an OS file drag cannot start a move. A spring-loaded
+switch during a drag (resting on another tab) shows that tab without
+saving; a drag that drops nothing shows the tab that was in front at
+the press again, so the saved layout and active tab are untouched.
+The menus ("Move into tab", a pane's "Move to tab") call the same
+`mergeTabInto` / `movePaneToTab`. A tab's name belongs to the tab
+(`t.name`, saved as `name` in its manifest entry): moves into it keep
+it, a tab merged away takes its name with it, a pane taken out gets
+the automatic title. A tab's menu goes when its tab goes (closed by
+Alt+W, its shell, another menu): it must not float over the strip
+offering Rename / Close for nothing. Guard: frontend
+`Tabs (step 3)` block, `tab name: …`, `spring: …`, `marker: …`,
+`tab menu (break): …`; e2e `tabmove`, `tabback`, `tabbreak`.
 
 **U6. A shown pane's scrollbar is at the bottom it shows.** xterm
 5.5's viewport sizes its scroll area from the viewport's offsetHeight
@@ -206,7 +217,8 @@ Alt+B/F/./D, Alt+arrows, Alt+[) goes to the shell unchanged. While any
 `.ov` dialog is up the keys do nothing. In a text field that is not
 xterm's helper textarea (search box, a pane's reconnect password, any
 contenteditable) they are not taken at all and nothing is prevented:
-every Alt/Option character types there. During a tab or pane-bar drag
+every Alt/Option character types there (the tab-name field stops its
+keys itself: nothing in it switches, closes or opens a tab). During a tab or pane-bar drag
 (from the press to the release) they are taken - prevented, never sent
 to the shell - but do nothing, so the release drops exactly where it
 would have. `tabKeyHandled()`. Guard:
@@ -263,7 +275,15 @@ no summary; that is a failure. `scripts/check.sh` enforces it.
 
 **T2. Tests wait for a signal, not for time.** The frontend harness
 waits on `bootReady`; hand-built windows are closed with `closeDom`.
-Fixed sleeps made one run in six fail.
+Fixed sleeps made one run in six fail. In a browser scenario one synthetic
+mouse jump straight onto a link, pressed at once, can click before
+xterm has let go of the previous link (after output scrolled): `links`
+opened nothing 1 run in 10-15 until its click approached in two moves,
+waited for the pointer cursor, and its print waited for the prompt
+(0 in 15 since). And websh
+swallows a click within 400 ms of a drag's release
+(`_blockClickAfterDrag`): a scenario waits that out (`tabbreak`'s
+`calm`), it does not race it.
 
 **T3. A fix comes with a test that fails without it.** Check it: put
 the old code back and watch the test go red.

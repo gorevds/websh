@@ -464,6 +464,7 @@ function createPane(container) {
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
       `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>${ic('download')}</button>` +
       `<button class="pane-btn" data-act="to-tab" onclick="movePaneToNewTab('${id}')" title="Move to new tab" aria-label="Move pane to a new tab">${ic('to-tab')}</button>` +
+      `<button class="pane-btn" data-act="move-to" onclick="openPaneMoveMenu('${id}',this)" title="Move to tab" aria-label="Move pane to another tab" aria-haspopup="menu">${ic('move-to')}</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">${ic('split-h')}</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">${ic('split-v')}</button>` +
       `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">${ic('close')}</button>` +
@@ -913,7 +914,11 @@ function createTab() {
     `<button class="tab-close" title="Close tab" aria-label="Close tab">${ic('close')}</button>`;
   $('tabs').appendChild(el);
 
-  let t = {id: id, root: root, el: el, lastActive: null, activity: false, _key: null};
+  // `name`: what the user called the tab (null: the label of its active
+  // pane, the automatic title). It belongs to the tab, not to a pane:
+  // panes coming, going or switching never change it.
+  let t = {id: id, root: root, el: el, lastActive: null, activity: false, _key: null,
+           name: null};
   tabs.push(t);
   wireTab(t);
   document.body.classList.add('has-tabs');
@@ -927,12 +932,25 @@ function createTab() {
 // to stay in front while it happens (see ── Moving panes between tabs).
 // preventDefault keeps keyboard focus in the terminal. The close button
 // and the middle button never activate: closing a background tab must
-// not bring it to the front first.
+// not bring it to the front first. A double-click renames the tab (the
+// first click already brought it forward); a right-click opens its menu
+// without bringing it forward.
 function wireTab(t) {
   let el = t.el;
   let closeBtn = el.querySelector('.tab-close');
   closeBtn.addEventListener('mousedown', e => { e.stopPropagation(); e.preventDefault(); });
   closeBtn.addEventListener('click', e => { e.stopPropagation(); closeTab(t.id); });
+  el.addEventListener('dblclick', e => {
+    if (!e.target || !e.target.closest || e.target.closest('.tab-close, .tab-edit')) return;
+    e.preventDefault();
+    startTabRename(t.id);
+  });
+  el.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (tabs.indexOf(t) < 0) return;
+    openTabMenu(t, e.clientX, e.clientY);
+  });
   el.addEventListener('mousedown', e => {
     if (e.button === 1) { e.preventDefault(); return; }   // no autoscroll
     if (e.button !== 0) return;
@@ -961,7 +979,22 @@ let _tabDrag = null;
 function startTabDrag(t, x, y) {
   let order = Array.prototype.slice.call($('tabs').children);
   _tabDrag = {t: t, x0: x, y0: y, moved: false, order: order,
-              over: 'strip', zone: null};
+              over: 'strip', zone: null, front: activeTabId, spring: null, sprung: false,
+              slots: _tabSlots(t)};
+}
+// Where the tabs stood at the press, in strip coordinates (so a
+// sideways scroll of the strip does not shift them): see _springTrack.
+// The dragged tab's own place has id null.
+function _tabSlots(t) {
+  let strip = $('tabs');
+  let sl = strip.scrollLeft || 0, out = [];
+  Array.prototype.forEach.call(strip.children, c => {
+    if (!c.classList.contains('tab')) return;
+    let r = c.getBoundingClientRect();
+    if (r && r.width > 0) out.push({id: c === t.el ? null : c.getAttribute('data-tab'),
+                                    l: r.left + sl, r: r.right + sl});
+  });
+  return out;
 }
 // Where the pointer is during a drag: the element under it (null
 // outside the window), and whether that is in the panes area.
@@ -1027,6 +1060,7 @@ document.addEventListener('mousemove', e => {
     if (target) target.p.el.classList.add(zone);
   }
   d.zone = target ? {p: target.p, side: target.side, cls: zone} : null;
+  _springTrack(d, pt, e);
   if (d.over !== 'strip') return;
   let strip = $('tabs');
   let others = Array.prototype.filter.call(strip.children,
@@ -1056,6 +1090,7 @@ function endTabDrag(e) {
   let d = _tabDrag;
   _tabDrag = null;
   if (!d) return;
+  _springCancel(d);
   if (!d.moved) {
     // A click: now it is safe to bring the tab forward.
     if (activeTabId !== d.t.id && tabs.indexOf(d.t) >= 0) showTab(d.t.id);
@@ -1075,6 +1110,7 @@ function endTabDrag(e) {
   if (over !== 'strip') {
     _restoreStripOrder(d);
     if (zone && panes[zone.p.id] && tabs.indexOf(d.t) >= 0) mergeTabInto(d.t.id, zone.p.id, zone.side);
+    else _springBack(d);
     return;
   }
   // The strip's DOM order is the truth; bring the array in line.
@@ -1090,6 +1126,62 @@ function endTabDrag(e) {
   if (activeTabId !== d.t.id) showTab(d.t.id, {noSave: true});
   saveSessions();
 }
+// Spring-loaded tabs: during a tab or pane drag, resting the pointer on
+// another tab for SPRING_MS brings that tab forward (without saving),
+// and the drag goes on: its panes are now drop targets. A drag that ends
+// without dropping anything (released outside the window, on no pane,
+// on its own panes) puts the tab that was in front at the press back;
+// nothing was saved, so the saved layout is as it was.
+//
+// A timer, not mousemove: a resting pointer sends no events. The count
+// starts when the pointer reaches a tab and restarts only when it
+// reaches ANOTHER tab, so a trembling hand still counts as resting and
+// a pass across a tab (it leaves before the timer) never switches. The
+// dragged tab itself is no target: the strip reorders under the pointer
+// while a tab is dragged along it (the dragged tab takes the place of
+// the one it passes), so the pointer resting where A was is over the
+// dragged tab a moment later. Over the dragged tab, the tab that stood
+// there at the press is meant (checked in Chromium: a pass over A that
+// went on and came back to A's place found only the dragged tab there
+// and never switched); elsewhere on it the count goes on.
+// Released, or the dragged tab gone, the timer does nothing.
+const SPRING_MS = 500;
+function _springCancel(d) {
+  if (d && d.spring) { clearTimeout(d.spring.timer); d.spring = null; }
+}
+function _springTrack(d, pt, e) {
+  let tabEl = pt.el && pt.el.closest ? pt.el.closest('#tabs .tab') : null;
+  let id = tabEl ? tabEl.getAttribute('data-tab') : null;
+  if (tabEl && d.t && tabEl === d.t.el) {
+    // Only where the dragged tab now really sits (after a reorder): the
+    // pointer must be inside its box as laid out now.
+    let br = d.t.el.getBoundingClientRect();
+    if (!br || !(e.clientX >= br.left && e.clientX < br.right)) return;
+    let x = e.clientX + ($('tabs').scrollLeft || 0);
+    let at = (d.slots || []).filter(sl => x >= sl.l && x < sl.r);
+    // Its own place at the press is no other tab's, whatever overlaps it.
+    if (at.length !== 1 || !at[0].id) return;
+    id = at[0].id;
+  }
+  if (id === activeTabId) id = null;
+  if (d.spring && d.spring.id === id) return;
+  _springCancel(d);
+  if (!id) return;
+  d.spring = {id: id, timer: setTimeout(() => {
+    if (d.spring && d.spring.id === id) d.spring = null;
+    if (_tabDrag !== d && _paneDrag !== d) return;        // released meanwhile
+    if (d.t && tabs.indexOf(d.t) < 0) return;             // the dragged tab closed
+    if (d.p && !panes[d.p.id]) return;                    // the dragged pane closed
+    if (!tabById(id) || activeTabId === id) return;
+    d.sprung = true;
+    showTab(id, {noSave: true});
+  }, SPRING_MS)};
+}
+function _springBack(d) {
+  if (!d.sprung || !d.front || activeTabId === d.front || !tabById(d.front)) return;
+  showTab(d.front, {noSave: true});
+}
+
 // A drag that ends over a button (the "+", a tab's close) must not
 // also click it: a pane dropped on "+" makes a tab, it does not open
 // the login form.
@@ -1142,6 +1234,19 @@ function showTab(id, o) {
   if (changed && !(o && o.noSave)) saveSessions();
 }
 
+// The strip's width follows the window and the pane actions beside it
+// (#paneTools changes with the active pane): whenever it changes, the tab
+// in front is brought back into view - not during a drag, where the
+// pointer decides what is shown.
+(function () {
+  let strip = $('tabs');
+  if (!strip || typeof ResizeObserver === 'undefined') return;
+  new ResizeObserver(() => {
+    if (_tabDrag || _paneDrag) return;
+    let t = activeTab();
+    if (t) scrollTabIntoView(t);
+  }).observe(strip);
+})();
 function scrollTabIntoView(t) {
   let strip = $('tabs');
   if (!strip || !t) return;
@@ -1159,6 +1264,7 @@ function scrollTabIntoView(t) {
 function removeTab(t) {
   let idx = tabs.indexOf(t);
   if (idx < 0) return;
+  closeMenus(false);    // its menu, or a list of tabs that now names a gone one
   tabs.splice(idx, 1);
   t.root.remove();
   t.el.remove();
@@ -1177,6 +1283,7 @@ function removeTab(t) {
 }
 
 function removeAllTabs() {
+  closeMenus(false);
   tabs.slice().forEach(t => { t.root.remove(); t.el.remove(); });
   tabs.length = 0;
   activeTabId = null;
@@ -1186,9 +1293,12 @@ function removeAllTabs() {
   renderPaneTools();
 }
 
-// Dot (worst pane state), label (the tab's active pane), split marker
-// and activity mark. Memoized: it runs from updatePaneBadge, which runs
-// on every output frame.
+// Dot (worst pane state), label (the tab's name, else its active pane's
+// label), split marker and activity mark. Memoized: it runs from
+// updatePaneBadge, which runs on every output frame - the key holds only
+// strings that are cheap to build (the split shape is a walk of the
+// split wrappers, not of the terminals), so an output frame changes no
+// DOM here.
 function _paneDotState(p) {
   if (p.sid) return p.reconnecting ? 'wait' : 'on';
   return p.connecting ? 'wait' : 'off';
@@ -1203,26 +1313,192 @@ function renderTab(t) {
   if (!ps.length) worst = 'off';
   let ap = panes[t.lastActive];
   if (!ap || ps.indexOf(ap) < 0) ap = ps[0];
-  let label = ap ? (ap.label || '') : '';
+  let label = t.name || (ap ? (ap.label || '') : '');
+  let shape = ps.length > 1 ? _splitShape(_layoutNode(t.root)) : '';
   let active = t.id === activeTabId;
   let act = !!t.activity && !active;
   // Tabs 1..8 carry their shortcut; the number follows the strip order,
   // so every path that reorders or removes a tab re-renders them all.
   let num = tabs.indexOf(t) + 1;
   let hint = num >= 1 && num <= 8 ? 'Alt+' + num : '';
-  let key = [worst, label, ps.length, act ? 1 : 0, active ? 1 : 0, hint].join('\u0001');
+  let key = [worst, label, ps.length, act ? 1 : 0, active ? 1 : 0, hint,
+             shape, shape && ap ? ap.id : ''].join('\u0001');
   if (t._key === key) return;
+  let shapeKey = shape + '\u0001' + (shape && ap ? ap.id : '');
   t._key = key;
   t.el.querySelector('.tab-dot').className = 'tab-dot s-' + worst;
   t.el.querySelector('.tab-label').textContent = label;
   let sp = t.el.querySelector('.tab-split');
-  sp.textContent = ps.length > 1 ? '▥' + ps.length : '';
+  if (sp._shape !== shapeKey) {
+    sp._shape = shapeKey;
+    _drawSplitMarker(sp, shape ? _layoutNode(t.root) : null, ap);
+  }
   sp.classList.toggle('h', ps.length < 2);
   sp.title = ps.length > 1 ? ps.length + ' panes' : '';
   t.el.classList.toggle('activity', act);
   t.el.title = label + (ps.length > 1 ? ' (' + ps.length + ' panes)' : '')
     + (hint ? (label ? ' - ' : '') + hint : '');
   if (active) renderPaneTools();
+}
+
+// The split marker: a 16x12 miniature of the tab's layout, one box per
+// pane, side by side or stacked as the real splits are (halves, not the
+// dragged proportions: at this size only the arrangement reads), the
+// tab's active pane lit. Whole-pixel boxes with a 1px gap, so it is
+// sharp at 1x and 2x; colours come from the theme through CSS
+// (index.html `.tab-split`), none are written here.
+const MINI_W = 16, MINI_H = 12;
+// The top node of a tab's layout: its pane, or its outer split wrapper.
+function _layoutNode(rootEl) {
+  if (!rootEl) return null;
+  for (let i = 0; i < rootEl.children.length; i++) {
+    let ch = rootEl.children[i];
+    if (ch.classList.contains('pane') || ch.classList.contains('split-h')
+        || ch.classList.contains('split-v')) return ch;
+  }
+  return null;
+}
+function _splitKids(el) {
+  let out = [];
+  for (let i = 0; i < el.children.length; i++) {
+    let c = el.children[i];
+    if (c.classList.contains('pane') || c.classList.contains('split-h')
+        || c.classList.contains('split-v')) out.push(c);
+  }
+  return out;
+}
+// The arrangement as a short string: "p3", "h(p1,v(p2,p4))".
+function _splitShape(el) {
+  if (!el) return '';
+  if (el.classList.contains('pane')) return el.getAttribute('data-pane') || '';
+  return (el.classList.contains('split-h') ? 'h(' : 'v(')
+    + _splitKids(el).map(_splitShape).join(',') + ')';
+}
+function _miniRects(el, x, y, w, h, out) {
+  if (!el) return;
+  if (el.classList.contains('pane')) {
+    out.push({id: el.getAttribute('data-pane'), x: x, y: y, w: Math.max(1, w), h: Math.max(1, h)});
+    return;
+  }
+  let kids = _splitKids(el);
+  if (kids.length < 2) { _miniRects(kids[0], x, y, w, h, out); return; }
+  if (el.classList.contains('split-h')) {
+    let w1 = Math.max(1, Math.floor((w - 1) / 2));
+    _miniRects(kids[0], x, y, w1, h, out);
+    _miniRects(kids[1], x + w1 + 1, y, Math.max(1, w - w1 - 1), h, out);
+  } else {
+    let h1 = Math.max(1, Math.floor((h - 1) / 2));
+    _miniRects(kids[0], x, y, w, h1, out);
+    _miniRects(kids[1], x, y + h1 + 1, w, Math.max(1, h - h1 - 1), out);
+  }
+}
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function _drawSplitMarker(sp, node, ap) {
+  while (sp.firstChild) sp.removeChild(sp.firstChild);
+  if (!node) return;
+  let rects = [];
+  _miniRects(node, 0, 0, MINI_W, MINI_H, rects);
+  let svg = document.createElementNS(SVG_NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + MINI_W + ' ' + MINI_H);
+  svg.setAttribute('width', String(MINI_W));
+  svg.setAttribute('height', String(MINI_H));
+  svg.setAttribute('aria-hidden', 'true');
+  svg.setAttribute('focusable', 'false');
+  rects.forEach(r => {
+    let el = document.createElementNS(SVG_NS, 'rect');
+    el.setAttribute('data-pane', r.id);
+    el.setAttribute('x', String(r.x));
+    el.setAttribute('y', String(r.y));
+    el.setAttribute('width', String(r.w));
+    el.setAttribute('height', String(r.h));
+    if (ap && r.id === ap.id) el.setAttribute('class', 'on');
+    svg.appendChild(el);
+  });
+  sp.appendChild(svg);
+}
+
+// ── Tab names ──
+// A double-click on a tab (or "Rename" in its menu) edits its name in
+// place: an <input> over the label, all selected. Enter or leaving the
+// field saves, Escape cancels; an empty name gives the automatic title
+// (the active pane's label) back. The name is text (textContent, never
+// HTML), cut to TAB_NAME_MAX characters here, not only by maxlength,
+// and saved with the layout at once (saveSessions, `name` per tab).
+// While the field is open its keys are its own: they stop at the field,
+// so none reaches the shell, the login form's Enter or the tab keys
+// (U7); a press in it starts no tab drag and leaves the focus there.
+// renderTab never touches the field (it writes the hidden label), so
+// output or a state change does not lose what is being typed.
+const TAB_NAME_MAX = 60;
+function _cleanTabName(v) {
+  let s = String(v == null ? '' : v).replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  let cs = Array.from(s);
+  if (cs.length > TAB_NAME_MAX) s = cs.slice(0, TAB_NAME_MAX).join('').trim();
+  return s || null;
+}
+// What a tab is called on screen.
+function tabTitle(t) {
+  if (!t) return '';
+  if (t.name) return t.name;
+  let ps = panesInTab(t);
+  let ap = panes[t.lastActive];
+  if (!ap || ps.indexOf(ap) < 0) ap = ps[0];
+  return ap ? (ap.label || '') : '';
+}
+function setTabName(id, v) {
+  let t = tabById(id);
+  if (!t) return;
+  let n = _cleanTabName(v);
+  if (n === (t.name || null)) return;
+  t.name = n;
+  renderTab(t);
+  saveSessions();
+}
+function startTabRename(id) {
+  let t = tabById(id);
+  if (!t) return;
+  closeMenus(false);
+  if (_tabDrag && _tabDrag.t === t && !_tabDrag.moved) _tabDrag = null;
+  if (activeTabId !== t.id) showTab(t.id);
+  if (t._edit) { try { t._edit.focus(); t._edit.select(); } catch (e) {} return; }
+  let lab = t.el.querySelector('.tab-label');
+  let inp = document.createElement('input');
+  inp.type = 'text';
+  inp.className = 'tab-edit';
+  inp.maxLength = TAB_NAME_MAX;
+  inp.spellcheck = false;
+  inp.autocomplete = 'off';
+  inp.setAttribute('aria-label', 'Tab name');
+  inp.setAttribute('data-lpignore', 'true');
+  inp.setAttribute('data-1p-ignore', 'true');
+  inp.value = tabTitle(t);
+  lab.classList.add('h');
+  lab.parentNode.insertBefore(inp, lab.nextSibling);
+  t._edit = inp;
+  let done = false;
+  let finish = (save, refocus) => {
+    if (done) return;
+    done = true;
+    if (t._edit === inp) t._edit = null;
+    let v = inp.value;
+    if (inp.parentNode) inp.parentNode.removeChild(inp);
+    lab.classList.remove('h');
+    if (save) setTabName(t.id, v);
+    if (refocus && activeTabId === t.id) {
+      let p = panes[activeId];
+      if (p) { try { p.term.focus(); } catch (e) {} }
+    }
+  };
+  inp.addEventListener('keydown', e => {
+    e.stopPropagation();
+    if (e.isComposing) return;
+    if (e.key === 'Enter') { e.preventDefault(); finish(true, true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false, true); }
+  });
+  ['keyup', 'keypress', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu']
+    .forEach(ev => inp.addEventListener(ev, e => e.stopPropagation()));
+  inp.addEventListener('blur', () => finish(true, false));
+  try { inp.focus(); inp.select(); } catch (e) {}
 }
 
 // ── A lone pane has no bar of its own ──
@@ -1312,6 +1588,7 @@ function fillPaneTools(box, p, busy, tag) {
     else if (act === 'split-h') splitPane(id, 'h');
     else if (act === 'split-v') splitPane(id, 'v');
     else if (act === 'close') closePane(id);
+    else if (act === 'move-to') openPaneMoveMenu(id, b);
   });
 })();
 
@@ -1505,20 +1782,31 @@ function movePaneToNewTab(id) {
   saveSessions();
 }
 
+// Where something joining tab `t` goes by default: beside its active
+// pane (the last one if that is unknown).
+function _tabAnchor(t) {
+  let ps = panesInTab(t);
+  let a = panes[t.lastActive];
+  if (!a || ps.indexOf(a) < 0) a = ps[ps.length - 1] || null;
+  return a;
+}
 // The pane joins tab `tabId`, split to the right of that tab's active
-// pane; that tab is shown with the moved pane active. A tab emptied by
-// the move goes.
-function movePaneToTab(id, tabId) {
+// pane - or, given `anchorId` (a pane of that tab) and `side`, on that
+// side of that pane (a pane dragged onto a pane edge); that tab is shown
+// with the moved pane active. A tab emptied by the move goes. The tab's
+// name stays; the emptied tab's goes with it.
+function movePaneToTab(id, tabId, anchorId, side) {
   let p = panes[id];
   let to = tabById(tabId);
   if (!p || !to) return;
   let from = tabOfPane(p);
   if (!from || from === to) return;
-  let ps = panesInTab(to);
-  let anchor = panes[to.lastActive];
-  if (!anchor || ps.indexOf(anchor) < 0) anchor = ps[ps.length - 1] || null;
+  let anchor = anchorId ? panes[anchorId] : null;
+  if (!anchor || tabOfPane(anchor) !== to) anchor = _tabAnchor(to);
+  if (['left', 'right', 'top', 'bottom'].indexOf(side) < 0) side = 'right';
   _detachPane(p);
-  if (anchor) _placeBeside(anchor.el, p.el, 'h', false);
+  if (anchor) _placeBeside(anchor.el, p.el, (side === 'left' || side === 'right') ? 'h' : 'v',
+                           side === 'left' || side === 'top');
   else to.root.appendChild(p.el);
   _dropEmptyTab(from);
   _showAfterMove(to, id, [p].concat(_panesUnder(anchor ? anchor.el : null)));
@@ -1537,12 +1825,7 @@ function mergeTabInto(tabId, paneId, side) {
   let dst = tabOfPane(q);
   if (!dst || dst === src) return;
   if (['left', 'right', 'top', 'bottom'].indexOf(side) < 0) return;
-  let node = null;
-  for (let i = 0; i < src.root.children.length; i++) {
-    let ch = src.root.children[i];
-    if (ch.classList.contains('pane') || ch.classList.contains('split-h')
-        || ch.classList.contains('split-v')) { node = ch; break; }
-  }
+  let node = _layoutNode(src.root);
   if (!node) return;
   let srcPanes = panesInTab(src);
   let focusId = (src.lastActive && srcPanes.indexOf(panes[src.lastActive]) >= 0)
@@ -1554,11 +1837,23 @@ function mergeTabInto(tabId, paneId, side) {
   _showAfterMove(dst, focusId, _panesUnder(node).concat([q]));
   saveSessions();
 }
+// Tab `srcId`'s whole layout joins tab `dstId`, to the right of its
+// active pane (where movePaneToTab puts a pane): "Move into tab" in a
+// tab's menu. Nothing if either tab has gone meanwhile.
+function mergeTabIntoTab(srcId, dstId) {
+  let src = tabById(srcId), dst = tabById(dstId);
+  if (!src || !dst || src === dst) return;
+  let anchor = _tabAnchor(dst);
+  if (anchor) mergeTabInto(src.id, anchor.id, 'right');
+}
 
 // Dragging a pane by its bar's label onto the strip: onto a tab - the
 // pane joins it; onto the strip around the tabs or "+" - a new tab.
-// Anywhere else (back on the panes, outside the window) nothing
-// happens. Mouse events only, as for tabs: an HTML5 drag would look
+// Resting on a tab brings it forward (spring-loaded, see endTabDrag);
+// then an edge of one of its panes takes the pane on that side, with
+// the same half highlighted as for a tab drag. Its own tab's panes are
+// no target. Anywhere else (outside the window) nothing happens, and the
+// tab that was in front at the press comes back. Mouse events only, as for tabs: an HTML5 drag would look
 // like a file to wirePaneDrop, and an OS file drag never starts this.
 let _paneDrag = null;
 function _paneDropTarget(pt) {
@@ -1585,8 +1880,21 @@ document.addEventListener('mousedown', e => {
   let p = pel ? panes[pel.getAttribute('data-pane')] : null;
   if (!p) return;
   e.preventDefault();          // no text selection of the label
-  _paneDrag = {p: p, x0: e.clientX, y0: e.clientY, moved: false};
+  _paneDrag = {p: p, x0: e.clientX, y0: e.clientY, moved: false,
+               front: activeTabId, spring: null, sprung: false, zone: null};
 }, true);
+// A pane of the tab on screen, not of the dragged pane's own tab, and
+// the side of it under the pointer.
+function _panePaneTarget(d, pt, e) {
+  if (!pt.inPanes || !pt.el || !pt.el.closest) return null;
+  let pel = pt.el.closest('.pane');
+  let q = pel ? panes[pel.getAttribute('data-pane')] : null;
+  if (!q || q === d.p) return null;
+  let tq = tabOfPane(q);
+  if (!tq || tq.id !== activeTabId || tq === tabOfPane(d.p)) return null;
+  let side = _dropSide(pel, e.clientX, e.clientY);
+  return side ? {p: q, side: side} : null;
+}
 document.addEventListener('mousemove', e => {
   let d = _paneDrag;
   if (!d) return;
@@ -1594,27 +1902,46 @@ document.addEventListener('mousemove', e => {
   if (!d.moved && Math.abs(e.clientX - d.x0) < DRAG_START_PX
       && Math.abs(e.clientY - d.y0) < DRAG_START_PX) return;
   if (!d.moved) { d.moved = true; document.body.classList.add('pane-moving'); }
-  let tg = _paneDropTarget(_dragPoint(e));
+  let pt = _dragPoint(e);
+  let tg = _paneDropTarget(pt);
   _clearPaneDropMarks();
   if (tg && tg.kind === 'tab') {
     let own = tabOfPane(d.p);
     if (!own || own.id !== tg.tabId) tg.el.classList.add('drop-into');
   } else if (tg) tg.el.classList.add('drop-new');
+  let zt = _panePaneTarget(d, pt, e);
+  let cls = zt ? 'drop-zone-' + zt.side : null;
+  if (!zt || !d.zone || d.zone.p !== zt.p || d.zone.cls !== cls) {
+    clearDropZones();
+    if (zt) zt.p.el.classList.add(cls);
+  }
+  d.zone = zt ? {p: zt.p, cls: cls} : null;
+  _springTrack(d, pt, e);
 });
 document.addEventListener('mouseup', e => _endPaneDrag(e));
 function _endPaneDrag(e) {
   let d = _paneDrag;
   _paneDrag = null;
   if (!d) return;
+  _springCancel(d);
   _clearPaneDropMarks();
+  clearDropZones();
   if (!d.moved) return;
   document.body.classList.remove('pane-moving');
   _blockClickAfterDrag();
-  if (!e || !panes[d.p.id]) return;
-  let tg = _paneDropTarget(_dragPoint(e));
-  if (!tg) return;
-  if (tg.kind === 'tab') movePaneToTab(d.p.id, tg.tabId);
-  else movePaneToNewTab(d.p.id);
+  if (!e || !panes[d.p.id]) { _springBack(d); return; }
+  let pt = _dragPoint(e);
+  let tg = _paneDropTarget(pt);
+  let zt = tg ? null : _panePaneTarget(d, pt, e);
+  let own = tabOfPane(d.p);
+  if (tg && tg.kind === 'tab') {
+    if (own && own.id === tg.tabId) _springBack(d);
+    else movePaneToTab(d.p.id, tg.tabId);
+  } else if (tg) {
+    if (own && panesInTab(own).length < 2) _springBack(d);   // already a tab of its own
+    else movePaneToNewTab(d.p.id);
+  } else if (zt) movePaneToTab(d.p.id, tabOfPane(zt.p).id, zt.p.id, zt.side);
+  else _springBack(d);
 }
 
 // Strip: a vertical wheel scrolls it sideways when it overflows.
@@ -1627,6 +1954,175 @@ function _endPaneDrag(e) {
     e.preventDefault();
   }, {passive: false});
 })();
+
+// ── Menus: a tab's context menu, a pane's "Move to tab" ──
+// One menu at a time ([role=menu] of [role=menuitem] buttons), plus at
+// most one submenu beside it. Opened by a right-click on a tab or the
+// pane's move button; the first item takes the focus, so the keys go to
+// the menu, not the shell: arrows move, Enter/Space choose, ArrowRight
+// opens a submenu and ArrowLeft leaves it, Escape or Tab closes, as
+// does a press anywhere outside. Items are text (textContent): a tab
+// title is shown as typed. Every action re-checks that its tab and pane
+// still exist - the menu may have been open while they closed.
+let _menus = [];
+function closeMenus(refocus) {
+  if (!_menus.length) return;
+  _menus.forEach(m => { if (m.parentNode) m.parentNode.removeChild(m); });
+  _menus = [];
+  if (refocus) { let p = panes[activeId]; if (p) { try { p.term.focus(); } catch (e) {} } }
+}
+function _menuItemsOf(m) {
+  return Array.prototype.slice.call(m.querySelectorAll('[role="menuitem"]'));
+}
+function _buildMenu(items, label, level) {
+  let m = document.createElement('div');
+  m.className = 'ws-menu';
+  m.setAttribute('role', 'menu');
+  if (label) m.setAttribute('aria-label', label);
+  m._level = level;
+  items.forEach(it => {
+    let b = document.createElement('button');
+    b.type = 'button';
+    b.setAttribute('role', 'menuitem');
+    b.tabIndex = -1;
+    if (it.icon) b.insertAdjacentHTML('beforeend', ic(it.icon));
+    let s = document.createElement('span');
+    s.className = 'mi-label';
+    s.textContent = it.label;
+    b.appendChild(s);
+    if (it.sub) {
+      b.setAttribute('aria-haspopup', 'menu');
+      b.setAttribute('aria-expanded', 'false');
+      b.insertAdjacentHTML('beforeend', '<span class="mi-sub" aria-hidden="true">\u203a</span>');
+    }
+    if (it.disabled) b.setAttribute('aria-disabled', 'true');
+    if (it.danger) b.classList.add('danger');
+    b._mi = it;
+    m.appendChild(b);
+  });
+  m.addEventListener('mousedown', e => { e.preventDefault(); e.stopPropagation(); });
+  m.addEventListener('contextmenu', e => { e.preventDefault(); e.stopPropagation(); });
+  m.addEventListener('click', e => {
+    e.stopPropagation();
+    let b = e.target.closest && e.target.closest('[role="menuitem"]');
+    if (b) _menuChoose(b);
+  });
+  m.addEventListener('mouseover', e => {
+    let b = e.target.closest && e.target.closest('[role="menuitem"]');
+    if (!b) return;
+    try { b.focus(); } catch (err) {}
+    if (m._level !== 0) return;
+    if (b._mi.sub && !b._mi.disabled) { if (!_menus[1] || _menus[1]._parentItem !== b) _openSubmenu(b, false); }
+    else _closeSubmenu();
+  });
+  m.addEventListener('keydown', _menuKey);
+  document.body.appendChild(m);
+  return m;
+}
+function _placeMenu(m, x, y, altX) {
+  let w = window.innerWidth || document.documentElement.clientWidth || 0;
+  let h = window.innerHeight || document.documentElement.clientHeight || 0;
+  let r = m.getBoundingClientRect();
+  if (w && x + r.width > w - 4) x = (altX != null) ? altX - r.width : w - 4 - r.width;
+  if (h && y + r.height > h - 4) y = h - 4 - r.height;
+  m.style.left = Math.max(4, Math.round(x)) + 'px';
+  m.style.top = Math.max(4, Math.round(y)) + 'px';
+}
+function _focusItem(m, i) {
+  let its = _menuItemsOf(m);
+  if (!its.length) return;
+  i = ((i % its.length) + its.length) % its.length;
+  try { its[i].focus(); } catch (e) {}
+}
+function openMenu(items, x, y, label) {
+  closeMenus(false);
+  let m = _buildMenu(items, label, 0);
+  _menus = [m];
+  _placeMenu(m, x, y);
+  let its = _menuItemsOf(m);
+  let first = its.findIndex(b => !b._mi.disabled);
+  _focusItem(m, first < 0 ? 0 : first);
+  return m;
+}
+function _closeSubmenu() {
+  let sub = _menus[1];
+  if (!sub) return;
+  if (sub.parentNode) sub.parentNode.removeChild(sub);
+  if (sub._parentItem) sub._parentItem.setAttribute('aria-expanded', 'false');
+  _menus.length = 1;
+}
+function _openSubmenu(b, focus) {
+  _closeSubmenu();
+  let items = b._mi.sub() || [];
+  if (!items.length) items = [{label: 'No other tabs', disabled: true}];
+  let sub = _buildMenu(items, b._mi.label, 1);
+  sub._parentItem = b;
+  b.setAttribute('aria-expanded', 'true');
+  _menus[1] = sub;
+  let r = b.getBoundingClientRect();
+  _placeMenu(sub, r.right + 2, r.top - 5, r.left - 2);
+  if (focus) _focusItem(sub, 0);
+}
+function _menuChoose(b) {
+  let it = b._mi;
+  if (!it || it.disabled) return;
+  if (it.sub) { _openSubmenu(b, true); return; }
+  closeMenus(false);
+  if (it.act) it.act();
+}
+function _menuKey(e) {
+  let m = e.currentTarget;
+  let its = _menuItemsOf(m);
+  let i = its.indexOf(document.activeElement);
+  let k = e.key;
+  let handled = true;
+  if (k === 'ArrowDown') _focusItem(m, i + 1);
+  else if (k === 'ArrowUp') _focusItem(m, i < 0 ? -1 : i - 1);
+  else if (k === 'Home') _focusItem(m, 0);
+  else if (k === 'End') _focusItem(m, -1);
+  else if (k === 'Enter' || k === ' ') { if (its[i]) _menuChoose(its[i]); }
+  else if (k === 'ArrowRight') { if (its[i] && its[i]._mi.sub && !its[i]._mi.disabled) _openSubmenu(its[i], true); }
+  else if (k === 'ArrowLeft') {
+    if (m._level === 1) { let pb = m._parentItem; _closeSubmenu(); if (pb) { try { pb.focus(); } catch (err) {} } }
+  }
+  else if (k === 'Escape' || k === 'Tab') closeMenus(true);
+  else handled = false;
+  if (handled) { e.preventDefault(); e.stopPropagation(); }
+}
+document.addEventListener('mousedown', e => {
+  if (!_menus.length) return;
+  for (let i = 0; i < _menus.length; i++) if (_menus[i].contains(e.target)) return;
+  closeMenus(false);
+}, true);
+window.addEventListener('resize', () => closeMenus(false));
+window.addEventListener('blur', () => closeMenus(false));
+
+// A tab's menu: rename it, put its whole layout into another tab (to
+// the right of that tab's active pane, as the pane move does), close it.
+function openTabMenu(t, x, y) {
+  openMenu([
+    {label: 'Rename', icon: 'pencil', act: () => startTabRename(t.id)},
+    {label: 'Move into tab', icon: 'move-to', disabled: tabs.length < 2,
+     sub: () => tabs.filter(o => o !== t).map(o => ({
+       label: tabTitle(o) || 'Tab ' + (tabs.indexOf(o) + 1),
+       act: () => { if (tabs.indexOf(t) >= 0) mergeTabIntoTab(t.id, o.id); }}))},
+    {label: 'Close tab', icon: 'close', danger: true,
+     act: () => { if (tabs.indexOf(t) >= 0) closeTab(t.id); }},
+  ], x, y, 'Tab');
+}
+// The pane's move button (its bar, or #paneTools for a lone pane): the
+// other tabs; the pane goes to the right of the chosen tab's active pane.
+function openPaneMoveMenu(id, btn) {
+  let p = panes[id];
+  if (!p) return;
+  let own = tabOfPane(p);
+  let items = tabs.filter(o => o !== own).map(o => ({
+    label: tabTitle(o) || 'Tab ' + (tabs.indexOf(o) + 1),
+    act: () => { if (panes[id] && tabs.indexOf(o) >= 0) movePaneToTab(id, o.id); }}));
+  if (!items.length) items = [{label: 'No other tabs', disabled: true}];
+  let r = btn && btn.getBoundingClientRect ? btn.getBoundingClientRect() : {left: 0, bottom: 0};
+  openMenu(items, r.left, r.bottom + 2, 'Move to tab')._pane = id;
+}
 
 // ── Split / Close ───────────────────────────────────────────────────
 // Split does NOT mutate the DOM. It records the intent and opens the
@@ -1778,6 +2274,7 @@ function closePane(id) {
 function _destroyPane(id, terminate) {
   let p = panes[id];
   if (!p) return;
+  if (_menus[0] && _menus[0]._pane === id) closeMenus(false);   // its "Move to tab" menu
   // Drop any sessionStorage secrets first — the pane is going away,
   // and so should its plaintext SSH credentials. Vault panes have no
   // entry here; the call is a no-op for them.
@@ -2035,8 +2532,9 @@ function reconnectPane(id) {
 //   2  {version, layout, panes}: one layout, no tabs.
 //   3  {version, tabs: [{layout, active}], active, panes}: one layout per
 //      tab in strip order; `active` is the index of the tab in front,
-//      a tab's `active` the id of its last active pane. Version 2 (and
-//      1) load as one tab holding that layout.
+//      a tab's `active` the id of its last active pane, its optional
+//      `name` what the user called it (absent: the automatic title).
+//      Version 2 (and 1) load as one tab holding that layout.
 const PANES_KEY = 'websh_panes';
 const PANES_VERSION = 3;
 
@@ -2162,13 +2660,7 @@ function buildConnectBody(rec, termCols, termRows) {
 
 function serializeLayout(rootEl) {
   // rootEl is a tab's root; walk its single child (pane or split wrapper).
-  let first = null;
-  for (let i = 0; i < rootEl.children.length; i++) {
-    let ch = rootEl.children[i];
-    if (ch.classList.contains('pane') || ch.classList.contains('split-h') || ch.classList.contains('split-v')) {
-      first = ch; break;
-    }
-  }
+  let first = _layoutNode(rootEl);
   return first ? serializeNode(first) : null;
 }
 function serializeNode(el) {
@@ -2198,7 +2690,9 @@ function saveSessions() {
     let layout = serializeLayout(t.root);
     if (!layout) return;
     if (t.id === activeTabId) activeIdx = tabList.length;
-    tabList.push({layout: layout, active: t.lastActive || null});
+    let rec = {layout: layout, active: t.lastActive || null};
+    if (t.name) rec.name = t.name;
+    tabList.push(rec);
   });
   let manifest = {
     version: PANES_VERSION,
@@ -7921,6 +8415,7 @@ function tryRestoreSessions() {
   m.tabs.forEach((tm, idx) => {
     if (!tm || !tm.layout) return;
     let t = createTab();
+    t.name = _cleanTabName(tm.name);
     tabs.forEach(o => o.root.classList.toggle('h', o !== t));
     let before = Object.keys(restored).length;
     build(t.root, tm.layout);
