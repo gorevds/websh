@@ -108,6 +108,21 @@ Guard: backend `TestTmuxForwardsHyperlinks`, `TestTmuxAttachOnAnyVersion`
 (against tmux 3.1c: `scripts/check.sh --full`, leg "tmux 3.1c attach
 chain"); frontend `test_links.js`; e2e `links`, `linkbreak`.
 
+**O8. A link at rest looks the way the program printed it - no
+underline websh or xterm adds.** The owner (2026-10-05): "remove the
+underline under hyperlinks; their colour is enough". xterm.js 5.5 gives
+every OSC 8 cell a dashed underline of its own (its `underlineStyle`
+answers 5 whenever the cell carries a link id), and the same override
+turns a program's own SGR 4 / 4:3 on link text into dashed. Claude Code
+prints links as colour only (SGR 94, no SGR 4); tmux 3.4 re-emits them
+with no underline either. What must hold: OSC 8 text and plain URLs
+show no underline at rest; the hover underline, pointer cursor and
+target box appear on hover and go with it; a program's own underline
+(4, 4:3, 4:4, 4:5) is drawn in its own style, on a link or not - so no
+blanket CSS that hides `xterm-underline-5`. Guard: e2e `linkstyle`
+(pixels below the baseline against the same text unlinked, and the
+computed decoration of the DOM renderer's spans).
+
 ## Layout and tabs
 
 **U1. A pane in a hidden tab is never fitted to its hidden box.**

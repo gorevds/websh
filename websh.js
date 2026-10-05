@@ -362,7 +362,8 @@ function applyTheme(name) {
 // HTML), and a click opens it the way plain URLs open (new tab, opener
 // cut) - but only http(s). A program on the remote host chooses the
 // target, so javascript:, data:, file: and the rest open nothing.
-// Invariant O7 in docs/invariants.md.
+// Invariant O7 in docs/invariants.md. How a link looks at rest (no
+// underline xterm adds): dropImplicitLinkUnderline, invariant O8.
 function openLinkSafely(uri) {
   let u;
   try { u = new URL(String(uri)); } catch (e) { return; }
@@ -446,6 +447,46 @@ function termLinkHandler(getTerm) {
   };
 }
 
+// A link at rest looks the way the program printed it (invariant O8:
+// the owner wants no underline under links, their colour is enough).
+// xterm.js 5.5 draws one anyway: its ExtendedAttrs `underlineStyle`
+// getter answers 5 (dashed) whenever the cell carries an OSC 8 link id,
+// so `isUnderline()` is true for every link cell and the DOM renderer
+// gives it `xterm-underline-5` - and a program's own SGR 4 / 4:3 on
+// link text comes out dashed too. There is no option for it. Hiding the
+// `xterm-underline-5` class would also hide a program's own SGR 4:5 on
+// plain text, so instead the getter itself is replaced, once, on the
+// shared prototype: it answers the style the program set (the same bits
+// the original reads), ignoring the link id. The prototype is reached
+// through the public API (`buffer.getNullCell().extended`), not by a
+// name or offset inside the bundle; and the swap happens only if the
+// getter still behaves as described (link id -> 5) - a later xterm that
+// fixed this, or changed the class, is left alone. The hover underline,
+// pointer and tooltip come from the linkifier, not from this getter.
+let _linkUnderlineFixed = false;
+function dropImplicitLinkUnderline(term) {
+  if (_linkUnderlineFixed) return;
+  _linkUnderlineFixed = true;
+  try {
+    let ext = term.buffer.active.getNullCell().extended;
+    let proto = ext && Object.getPrototypeOf(ext);
+    let d = proto && Object.getOwnPropertyDescriptor(proto, 'underlineStyle');
+    if (!d || !d.get || !d.set || typeof proto.constructor !== 'function') return;
+    let probe = new proto.constructor(0, 1);       // (_ext, _urlId): a link, no style
+    if (!('_urlId' in probe) || !('_ext' in probe) || d.get.call(probe) !== 5) return;
+    let orig = d.get;
+    Object.defineProperty(proto, 'underlineStyle', {
+      configurable: true, enumerable: d.enumerable, set: d.set,
+      get: function () {
+        if (!this._urlId) return orig.call(this);
+        let id = this._urlId;
+        this._urlId = 0;
+        try { return orig.call(this); } finally { this._urlId = id; }
+      },
+    });
+  } catch (e) {}
+}
+
 function createPane(container) {
   let id = 'p' + (++paneCounter);
   let el = document.createElement('div');
@@ -509,6 +550,7 @@ function createPane(container) {
     allowProposedApi:true, scrollback:50000,
     linkHandler: termLinkHandler(() => term)
   });
+  dropImplicitLinkUnderline(term);   // invariant O8, see the function
   term.loadAddon(fit);
   term.loadAddon(new WebLinksAddon.WebLinksAddon((ev, uri) => openLinkSafely(uri)));
   // A hovered link's tooltip goes with its terminal (see showLinkTip).
