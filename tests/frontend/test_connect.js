@@ -8500,8 +8500,26 @@ test('UI chrome: one icon set, dark scrollbars, a quiet accent on the active pan
   ok(/\*::-webkit-scrollbar\{/.test(code), 'scrollbars styled app-wide');
   ok(!/scrollbar-color/.test(code),
      'no inherited scrollbar-color (it overrides the webkit rules in Chromium)');
-  ok(/\.pane\.active>\.pane-bar>\.pane-label\{color:var\(--ac\)\}/.test(code),
-     'active pane is marked on its name only');
+  // Behaviour, not selector text (the label may sit in a wrapper): the
+  // accent-colour rules for the active pane hit its label, nothing else
+  // in its bar, and nothing at all when the pane is not active.
+  {
+    const acc = [];
+    Array.from(win.document.styleSheets).forEach(sh => Array.from(sh.cssRules || []).forEach(r => {
+      if (r.selectorText && r.style && /var\(--ac\)/.test(r.style.getPropertyValue('color')) && /\.pane\.active/.test(r.selectorText)) acc.push(r.selectorText);
+    }));
+    const hit = el => !!el && acc.some(sel => { try { return el.matches(sel); } catch (e) { return false; } });
+    const lab = p.el.querySelector('.pane-bar [data-pane-label]');
+    const others = Array.from(p.el.querySelectorAll('.pane-bar *')).filter(e => e !== lab && !lab.contains(e) && hit(e));
+    const wasActive = p.el.classList.contains('active');
+    p.el.classList.add('active');
+    const onActive = hit(lab);
+    p.el.classList.remove('active');
+    const onInactive = hit(lab);
+    if (wasActive) p.el.classList.add('active');
+    ok(onActive && !onInactive && others.length === 0,
+       'active pane is marked on its name only (active: ' + onActive + ', inactive: ' + onInactive + ', others: ' + others.length + ')');
+  }
   const symbols = (code.match(/<symbol id="i-/g) || []).length;
   ok(symbols >= 15, 'icon sprite present (' + symbols + ' symbols)');
   // The gear must be a cog, not the "circle + straight rays" that reads as a
@@ -8546,16 +8564,25 @@ test('status bars float over the terminal instead of resizing it', async () => {
      'clicks pass through the stack, but not through the bars themselves');
   ok(!/\.reconnect-bar\{[^}]*flex-shrink/.test(code) || !/\.pane>\s*\.reconnect-bar/.test(code),
      'reconnect bar no longer participates in the pane column');
-  // All three bars end up in the stack, in DOM order, none in the column.
+  // The tmux and retry banners end up in the stack, none in the column.
+  // The Reconnect control no longer does (owner, 2026-10-05): it lives in
+  // the pane's bar row - the pane bar in a split, an overlaid strip of
+  // the same look for a lone pane ("reconnect in the bar" / "reconnect
+  // strip" tests below).
   win.showReconnectBar(p);
   win.showTmuxBar(p, 'tmux missing');
   p.firstFailureAt = Date.now();
   win.setReconnecting(p, true);
-  const inStack = ['[data-reconnect]', '[data-tmux-bar]', '.pane-reconnect']
+  const inStack = ['[data-tmux-bar]', '.pane-reconnect']
     .map(sel => { const el = p.el.querySelector(sel); return !!el && el.parentElement === stack; });
-  ok(inStack.every(Boolean), 'reconnect, tmux and retry banners all live in the stack; got ' + JSON.stringify(inStack));
-  ok(p.el.querySelector('.pane-bar').nextElementSibling.classList.contains('pane-term'),
-     'nothing sits between the pane bar and the terminal');
+  ok(inStack.every(Boolean), 'tmux and retry banners live in the stack; got ' + JSON.stringify(inStack));
+  const rc = p.el.querySelector('[data-reconnect]');
+  ok(!!rc && !stack.contains(rc), 'the Reconnect control is not a card in the stack over the terminal');
+  let between = [];
+  for (let e = p.el.querySelector('.pane-bar').nextElementSibling; e && !e.classList.contains('pane-term'); e = e.nextElementSibling)
+    if (!e.classList.contains('reconnect-strip')) between.push(e.className);
+  ok(between.length === 0,
+     'nothing but the (overlaid) reconnect strip sits between the pane bar and the terminal; got ' + JSON.stringify(between));
   win.setReconnecting(p, false);
   cleanup(env);
 });
@@ -8675,6 +8702,10 @@ function installLayoutModel(win) {
   // `display` declarations ourselves: !important, then specificity,
   // then source order; inline style over sheet rules.
   let displayRules = null;
+  // Same cascade for any other property (the model asks for `position`:
+  // a pane bar taken out of flow - drawn over the terminal - takes no
+  // rows from it).
+  const propRules = {};
   const specificity = sel => {
     const s = sel.replace(/::?[a-z-]+\([^)]*\)/g, m => /^:not\(/.test(m) ? m.slice(5, -1) : ':x');
     const a = (s.match(/#[\w-]+/g) || []).length;
@@ -8682,15 +8713,16 @@ function installLayoutModel(win) {
     const c = (s.replace(/#[\w-]+|\.[\w-]+|\[[^\]]*\]|::?[\w-]+/g, ' ').match(/[a-z][\w-]*/gi) || []).length;
     return a * 10000 + b * 100 + c;
   };
-  const collectRules = () => {
+  const collectRules = (prop) => {
+    prop = prop || 'display';
     const out = [];
     let order = 0;
     const walk = rules => Array.from(rules || []).forEach(r => {
       if (r.cssRules && !r.selectorText) { walk(r.cssRules); return; }
       if (!r.selectorText || !r.style) return;
-      const v = r.style.getPropertyValue('display');
+      const v = r.style.getPropertyValue(prop);
       if (!v) return;
-      const imp = r.style.getPropertyPriority('display') === 'important';
+      const imp = r.style.getPropertyPriority(prop) === 'important';
       r.selectorText.split(',').forEach(sel => out.push({sel: sel.trim(), v: v.trim(), imp, spec: specificity(sel), order: order++}));
     });
     Array.from(win.document.styleSheets).forEach(sh => { try { walk(sh.cssRules); } catch (e) {} });
@@ -8710,6 +8742,27 @@ function installLayoutModel(win) {
     return best ? best.v : '';
   };
   lay.displayOf = displayOf;
+  const propOf = (el, prop) => {
+    if (!propRules[prop]) propRules[prop] = collectRules(prop);
+    let best = null;
+    for (const r of propRules[prop]) {
+      let m = false;
+      try { m = el.matches(r.sel); } catch (e) {}
+      if (!m) continue;
+      if (!best || (r.imp !== best.imp ? r.imp : (r.spec !== best.spec ? r.spec > best.spec : r.order > best.order))) best = r;
+    }
+    const inl = el.style && el.style.getPropertyValue(prop);
+    if (inl && !(best && best.imp)) return inl;
+    return best ? best.v : '';
+  };
+  lay.propOf = propOf;
+  // Out of flow: absolute/fixed itself (an element inside an out-of-flow
+  // box below `upTo` is covered by that box's own check).
+  lay.outOfFlow = (el, upTo) => {
+    for (let e = el; e && e.nodeType === 1 && e !== upTo; e = e.parentElement)
+      if (/^(absolute|fixed)$/.test(propOf(e, 'position'))) return true;
+    return false;
+  };
   lay.hidden = hiddenEl;
   const barOver = el => {
     if (!lay.barRows || !el || !el.closest) return 0;
@@ -8717,7 +8770,7 @@ function installLayoutModel(win) {
     const pane = term && term.closest('.pane');
     if (!pane) return 0;
     const bar = Array.from(pane.children).find(c => c.classList.contains('pane-bar'));
-    return bar && !hiddenEl(bar) ? lay.barRows : 0;
+    return bar && !hiddenEl(bar) && !/^(absolute|fixed)$/.test(propOf(bar, 'position')) ? lay.barRows : 0;
   };
   lay.barOver = barOver;
   const sizeOf = el => hiddenEl(el) ? {width: 0, height: 0}
@@ -13146,6 +13199,253 @@ test('pane menu: "Move to tab" in a pane bar, and in the top bar for a lone pane
   ok(tabId(activeTab(win)) === tA && win.activeId === b1.id, 'A shown, b1 active');
   ok(spy.length === 0 && sessionCalls(env, mark).length === 0, 'no reconnect, no restart; got ' + show(spy.concat(sessionCalls(env, mark))));
   ok(show(savedShapes(win).tabs) === show(shapesNow(win)), 'saved at once');
+  cleanup(env);
+});
+
+// =====================================================================
+// Reconnect in the pane's bar row (owner, 2026-10-05): "the Reconnect
+// button is almost right, in the middle, but it is on the terminal; it
+// must be in the row where 'persistent' is written, in the middle".
+// Written from the decided behaviour, before the change.
+//
+// DOM contract these tests rely on:
+//   [data-reconnect=ID]      pane ID's Reconnect control, as today: a
+//                            <span> message, input.reconnect-pw
+//                            [data-reconnect-pw=ID] (Enter reconnects),
+//                            a "Reconnect" button; .sev-err / .sev-warn /
+//                            .bare on it as today; hidden while connected
+//   split pane (2+ in tab)   the control is inside that pane's own
+//                            .pane-bar (not over the terminal)
+//   lone pane                the control is inside a strip at the top of
+//                            the pane: an element .reconnect-strip, or the
+//                            pane's .pane-bar itself shown as an overlay;
+//                            out of flow (position absolute/fixed on it or
+//                            an ancestor inside the pane), so the terminal
+//                            keeps its size; hidden once connected
+// Centring and overlap are geometry: tests/e2e/scenarios/reconnectbar.mjs.
+// =====================================================================
+const rcCtl = (win, p) => win.document.querySelector('[data-reconnect="' + p.id + '"]');
+const rcPw = (win, p) => win.document.querySelector('[data-reconnect-pw="' + p.id + '"]');
+const rcStrip = (win, p) => { const c = rcCtl(win, p); return c && (c.closest('.reconnect-strip') || c.closest('.pane-bar')); };
+const rcShown = (env, el) => !!el && !env.lay.hidden(el);
+// Every visible "Reconnect" button on the page that acts on pane p.
+const rcButtons = (env, p) => Array.from(env.win.document.querySelectorAll('button'))
+  .filter(b => b.textContent.trim() === 'Reconnect' && !env.lay.hidden(b) &&
+               (p.el.contains(b) || (b.getAttribute('onclick') || '').indexOf("'" + p.id + "'") >= 0 ||
+                (b.closest('[data-reconnect]') && b.closest('[data-reconnect]').getAttribute('data-reconnect') === p.id)));
+// A disconnect the way the transport ends one (transportFatal).
+function rcDrop(win, p, reason, noCreds) {
+  if (noCreds) { p.password = ''; p.key = ''; }
+  win.eval(`(() => { const p = panes['${p.id}']; endSession(p, {save: true}); showReconnectBar(p${reason ? ", '" + reason + "'" : ''}); updatePaneBadge(p); })()`);
+}
+function rcWhere(win, p) {
+  const c = rcCtl(win, p);
+  if (!c) return 'no control';
+  const parts = [];
+  for (let e = c.parentElement; e && e !== p.el.parentElement; e = e.parentElement)
+    parts.push(e.tagName.toLowerCase() + (e.className && typeof e.className === 'string' ? '.' + e.className.trim().split(/\s+/).join('.') : ''));
+  return parts.join(' < ');
+}
+
+test('reconnect in the bar: a split pane\'s Reconnect sits in its own pane bar, the bar stays whole', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host', {persistent: true});
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const b = await tSplit(win, a, 'h', 'b.host');
+  ok(!!b && tabOfPane(b) === tabOfPane(a), 'two panes in one tab');
+  if (!b) { cleanup(env); return; }
+  await settled(win, a); await settled(win, b);
+  const mark = env.log.length;
+  const sizeA = a.term.cols + 'x' + a.term.rows, nA = a.term._resizes.length;
+  rcDrop(win, a);
+  await sleep(250);
+  const c = rcCtl(win, a), bar = barOf(a);
+  ok(rcShown(env, c), 'the Reconnect control is shown');
+  ok(!!c && c.closest('.pane-bar') === bar, 'it is inside the pane\'s own .pane-bar; it is in: ' + rcWhere(win, a));
+  ok(!!c && !c.closest('.pane-term') && !c.closest('.pane-overlays'), 'not over the terminal (.pane-term / .pane-overlays)');
+  ok(barShown(env, a), 'the bar is shown');
+  const keep = [['badge', '[data-pane-badge]'], ['label', '[data-pane-label]'], ['persistent tag', '.pane-tag.persistent'],
+                ['split', '[title="Split horizontal"]'], ['close', '[title="Close pane"]'], ['move to tab', '[data-act="move-to"]']];
+  const gone = keep.filter(([, sel]) => !rcShown(env, bar && bar.querySelector(sel))).map(([n]) => n);
+  ok(gone.length === 0, 'badge, label, persistent tag and the buttons stay in the bar; missing: ' + JSON.stringify(gone));
+  ok(rcButtons(env, a).length === 1, 'exactly one Reconnect button for the pane; got ' + rcButtons(env, a).length);
+  ok(!rcShown(env, rcCtl(win, b)) && rcButtons(env, b).length === 0, 'the connected neighbour shows none');
+  ok(a.term.cols + 'x' + a.term.rows === sizeA && a.term._resizes.length === nA && resizesFor(env, 'sid-a.host', mark).length === 0,
+     'the terminal keeps its size, no /api/resize; ' + sizeA + ' -> ' + a.term.cols + 'x' + a.term.rows);
+  // With a message and the password input: also in the bar.
+  rcDrop(win, a, 'auth_failed', true);
+  await sleep(30);
+  const pw = rcPw(win, a);
+  ok(rcShown(env, pw) && pw.closest('.pane-bar') === bar, 'the password input is in the bar too; in: ' + (pw ? (pw.closest('.pane-bar') ? 'bar' : 'elsewhere') : 'missing'));
+  const msg = c && c.querySelector('span');
+  ok(rcShown(env, msg) && msg.closest('.pane-bar') === bar && /Authentication failed — type password/.test(msg.textContent),
+     'the message is in the bar; got ' + JSON.stringify(msg && msg.textContent));
+  ok(c.classList.contains('sev-err'), 'auth failure is still red (.sev-err)');
+  ok(win.document.activeElement === pw, 'the password input has focus');
+  // Enter with a typed password reconnects with it; the control goes.
+  pw.value = 'typed-a';
+  const kd = new win.KeyboardEvent('keydown', {key: 'Enter', bubbles: true, cancelable: true});
+  const code = pw.getAttribute('onkeydown');
+  if (code) win.eval('(function(event){' + code + '})').call(pw, kd); else pw.dispatchEvent(kd);
+  await until(() => !!a.sid, 1500);
+  const cn = env.log.slice(mark).filter(e => e.action === 'connect' && e.body && e.body.host === 'a.host');
+  ok(cn.length === 1 && cn[0].body.password === 'typed-a', 'Enter reconnects with the typed password; got ' + JSON.stringify(cn.map(e => e.body.password)));
+  ok(!rcShown(env, rcCtl(win, a)) && rcButtons(env, a).length === 0, 'the control is hidden once reconnected');
+  ok(barShown(env, a) && rcShown(env, bar.querySelector('[data-pane-label]')), 'the bar is back to its usual contents');
+  cleanup(env);
+});
+
+test('reconnect strip: a lone pane gets a strip at its top with Reconnect; the terminal keeps its size', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  ok(!barShown(env, a), 'lone pane: no pane bar');
+  const mark = env.log.length;
+  const size0 = a.term.cols + 'x' + a.term.rows, n0 = a.term._resizes.length;
+  rcDrop(win, a);
+  await sleep(250);
+  const c = rcCtl(win, a), strip = rcStrip(win, a);
+  ok(rcShown(env, c), 'the Reconnect control is shown');
+  ok(!!strip && a.el.contains(strip) && rcShown(env, strip),
+     'it sits in a strip of the pane (.reconnect-strip or the pane bar as an overlay); it is in: ' + rcWhere(win, a));
+  ok(!!strip && env.lay.outOfFlow(strip, a.el), 'the strip is drawn over the terminal (position absolute/fixed), not in the pane column');
+  ok(!(c && c.classList.contains('reconnect-strip')) || !!(strip && strip !== c), 'the strip is a strip, not the card renamed');
+  ok(rcButtons(env, a).length === 1, 'exactly one Reconnect button for the pane (none in the top bar); got ' + rcButtons(env, a).length);
+  ok(a.term.cols + 'x' + a.term.rows === size0 && a.term._resizes.length === n0,
+     'the terminal keeps its size when the strip appears: ' + size0 + ' -> ' + a.term.cols + 'x' + a.term.rows);
+  ok(resizesFor(env, 'sid-a.host', mark).length === 0, 'no /api/resize');
+  ok(toolsShown(env), 'the pane actions (with the persistent/short-lived tag) stay in the top bar');
+  // Message and password input ride in the strip.
+  rcDrop(win, a, 'auth_failed', true);
+  await sleep(30);
+  const pw = rcPw(win, a);
+  ok(rcShown(env, pw) && !!strip && strip.contains(pw), 'the password input is in the strip');
+  ok(win.document.activeElement === pw, 'and has focus');
+  const msg = c && c.querySelector('span');
+  ok(!!msg && !!strip && strip.contains(msg) && /Authentication failed — type password/.test(msg.textContent) && c.classList.contains('sev-err'),
+     'the auth message is in the strip, red; got ' + JSON.stringify(msg && msg.textContent));
+  rcDrop(win, a, 'no_vault_key');
+  ok(/Vault key missing/.test(msg.textContent) && c.classList.contains('sev-warn') && !rcShown(env, rcPw(win, a)),
+     'vault: warning, no password input');
+  // Reconnect by the button: the strip goes, the size never moved.
+  a.password = 'pw-a.host';
+  rcDrop(win, a);
+  await sleep(30);
+  win.eval(`reconnectPane('${a.id}')`);
+  await until(() => !!a.sid, 1500);
+  await sleep(250);
+  ok(!!a.sid, 'reconnected');
+  ok(!rcShown(env, rcCtl(win, a)) && !rcShown(env, rcStrip(win, a)) && rcButtons(env, a).length === 0,
+     'strip and control are gone once connected');
+  ok(!barShown(env, a), 'and the lone pane still has no pane bar');
+  ok(a.term.cols + 'x' + a.term.rows === size0 && a.term._resizes.length === n0,
+     'the terminal never changed size: ' + size0 + ' -> ' + a.term.cols + 'x' + a.term.rows + ', refits ' + (a.term._resizes.length - n0));
+  const odd = sizesSent(env, 'sid-a.host', mark).filter(s => s !== size0);
+  ok(odd.length === 0, 'no other size sent to the server; got ' + JSON.stringify(odd));
+  cleanup(env);
+});
+
+test('reconnect strip <-> bar: a disconnected pane going lone / split / to a new tab keeps one control, the typed password and focus', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  const tA = tabOfPane(a);
+  const b = await tNewTab(win, 'b.host');
+  ok(!!b && tabOfPane(b) !== tA, 'b in a second tab');
+  if (!b) { cleanup(env); return; }
+  win.showTab(tA);
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  rcDrop(win, a, 'auth_failed', true);
+  await sleep(30);
+  const pw = rcPw(win, a);
+  ok(rcShown(env, pw), 'lone: password input shown');
+  pw.value = 'half-typed';
+  pw.focus();
+  // 'bar': in the pane's own bar, shown in the pane column (split);
+  // 'strip': in a shown strip drawn over the terminal (lone).
+  const whereNow = () => {
+    const c = rcCtl(win, a), s = rcStrip(win, a), bar = barOf(a);
+    if (!rcShown(env, c)) return 'hidden';
+    if (s && s === bar && barShown(env, a) && !env.lay.outOfFlow(bar, a.el)) return 'bar';
+    if (s && rcShown(env, s) && env.lay.outOfFlow(s, a.el)) return 'strip';
+    return rcWhere(win, a);
+  };
+  const state = (label, wantIn) => {
+    const p = rcPw(win, a);
+    ok(whereNow() === wantIn, label + ': the control is in the ' + wantIn + '; it is in: ' + whereNow());
+    ok(rcButtons(env, a).length === 1, label + ': one Reconnect button; got ' + rcButtons(env, a).length);
+    ok(!!p && p.value === 'half-typed' && rcShown(env, p), label + ': the typed password is kept; got ' + JSON.stringify(p && p.value));
+  };
+  state('lone', 'strip');
+  // b joins a's tab: a is split now (b, the moved pane, takes focus).
+  win.movePaneToTab(b.id, tA);
+  await sleep(60);
+  ok(panesOfTab(win, tA).length === 2, 'b moved into a\'s tab');
+  state('split (b moved in)', 'bar');
+  // b closes: a is lone again; the input keeps focus.
+  rcPw(win, a).focus();
+  ok(win.document.activeElement === rcPw(win, a), '(the password input took focus before the close)');
+  win.closePane(b.id);
+  await until(() => !win.panes[b.id], 500);
+  await sleep(60);
+  state('lone again (neighbour closed)', 'strip');
+  ok(win.document.activeElement === rcPw(win, a), 'the password input still has focus; active: ' +
+     (win.document.activeElement && (win.document.activeElement.className || win.document.activeElement.tagName)));
+  // Split again, then a goes to a tab of its own.
+  const c2 = await tSplit(win, a, 'v', 'c.host');
+  ok(!!c2 && tabOfPane(c2) === tA, 'c split into a\'s tab');
+  if (!c2) { cleanup(env); return; }
+  await sleep(60);
+  state('split (new pane)', 'bar');
+  rcPw(win, a).focus();
+  win.movePaneToNewTab(a.id);
+  await sleep(60);
+  ok(tabOfPane(a) !== tA, 'a is in a new tab');
+  state('lone in a new tab', 'strip');
+  ok(win.document.activeElement === rcPw(win, a), 'the moved pane\'s password input has focus, not its dead terminal; active: ' +
+     (win.document.activeElement && (win.document.activeElement.className || win.document.activeElement.tagName)));
+  // Hidden tab: nothing of it shows.
+  const tNew = tabOfPane(a);
+  win.showTab(tA);
+  await until(() => tabId(activeTab(win)) === tA, 500);
+  ok(!rcShown(env, rcCtl(win, a)) && !rcShown(env, rcStrip(win, a)) && rcButtons(env, a).length === 0,
+     'a in a hidden tab: its Reconnect is not shown');
+  ok(visibleAll(env, '[data-reconnect], .reconnect-strip').length === 0,
+     'no Reconnect anywhere on screen; got ' + visibleAll(env, '[data-reconnect], .reconnect-strip').length);
+  win.showTab(tNew);
+  await until(() => tabId(activeTab(win)) === tNew, 500);
+  state('shown again', 'strip');
+  // And the kept password is what reconnects.
+  const mark = env.log.length;
+  win.eval(`reconnectPane('${a.id}')`);
+  await until(() => !!a.sid, 1500);
+  const cn = env.log.slice(mark).filter(e => e.action === 'connect' && e.body && e.body.host === 'a.host');
+  ok(cn.length === 1 && cn[0].body.password === 'half-typed', 'reconnects with the password typed before the moves; got ' + JSON.stringify(cn.map(e => e.body.password)));
+  ok(!rcShown(env, rcCtl(win, a)) && !rcShown(env, rcStrip(win, a)), 'and the control is gone');
+  cleanup(env);
+});
+
+test('reconnect strip: a lone pane\'s transfer progress still shows next to the strip', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S2); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { cleanup(env); return; }
+  await settled(win, a);
+  const st = hangingXhr(win);
+  const inp = a.el.querySelector('[data-upload-input]');
+  Object.defineProperty(inp, 'files', {value: [{name: 'f.txt', size: 4}], configurable: true});
+  fireChange(win, inp);
+  await until(() => st.xhrs.length > 0, 1000);
+  const prog = () => visibleAll(env, '.upload-progress').filter(e => a.el.contains(e));
+  ok(prog().length === 1, 'the upload progress is shown for the lone pane; got ' + prog().length);
+  rcDrop(win, a);
+  await sleep(60);
+  const strip = rcStrip(win, a);
+  ok(rcShown(env, rcCtl(win, a)) && rcShown(env, strip), 'the Reconnect strip is shown');
+  ok(prog().length === 1 || !a.upload, 'a running transfer keeps its progress visible (or the transfer was ended); progress shown: ' + prog().length + ', upload: ' + !!a.upload);
+  ok(!(strip && prog().some(e => strip.contains(e) || e.contains(strip))), 'progress and strip are separate (neither inside the other)');
+  ok(rcButtons(env, a).length === 1, 'one Reconnect button');
+  if (a.upload) win.cancelTransfer(a.id);
   cleanup(env);
 });
 

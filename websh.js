@@ -453,6 +453,7 @@ function createPane(container) {
   el.setAttribute('data-pane', id);
   el.innerHTML =
     `<div class="pane-bar">` +
+      `<div class="pane-bar-l">` +
       `<span class="pane-badge s-off" data-pane-badge="${id}"></span>` +
       `<span class="pane-label" data-pane-label="${id}"></span>` +
       `<div class="upload-progress h" data-upload-progress="${id}">` +
@@ -460,6 +461,13 @@ function createPane(container) {
         `<div class="upload-progress-text"></div></div>` +
         `<button class="upload-progress-cancel" onclick="cancelTransfer('${id}')" title="Cancel" aria-label="Cancel transfer">${ic('close')}</button>` +
       `</div>` +
+      `</div>` +
+      `<div class="reconnect-bar h" data-reconnect="${id}">` +
+        `<span style="font-size:12px;color:var(--dim)"></span>` +
+        `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
+        `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
+      `</div>` +
+      `<div class="pane-bar-r">` +
       `<button class="pane-btn" onclick="triggerUpload('${id}')" title="Upload file" aria-label="Upload file" data-upload-btn="${id}" disabled>${ic('upload')}</button>` +
       `<input type="file" class="h" data-upload-input="${id}" multiple onchange="handleUpload('${id}',this)">` +
       `<button class="pane-btn" onclick="triggerDownload('${id}')" title="Download file" aria-label="Download file" data-download-btn="${id}" disabled>${ic('download')}</button>` +
@@ -468,15 +476,11 @@ function createPane(container) {
       `<button class="pane-btn" onclick="splitPane('${id}','h')" title="Split horizontal" aria-label="Split horizontal">${ic('split-h')}</button>` +
       `<button class="pane-btn" onclick="splitPane('${id}','v')" title="Split vertical" aria-label="Split vertical">${ic('split-v')}</button>` +
       `<button class="pane-btn close" onclick="closePane('${id}')" title="Close pane" aria-label="Close pane">${ic('close')}</button>` +
-    `</div>` +
-    `<div class="pane-term">` +
-      `<div class="pane-overlays" data-overlays="${id}">` +
-        `<div class="reconnect-bar h" data-reconnect="${id}">` +
-          `<span style="font-size:12px;color:var(--dim)"></span>` +
-          `<input type="password" class="reconnect-pw h" data-reconnect-pw="${id}" placeholder="password" autocomplete="off" data-lpignore="true" data-1p-ignore="true" onkeydown="if(event.key==='Enter'){event.preventDefault();reconnectPane('${id}')}">` +
-          `<button class="btn btn-p" onclick="reconnectPane('${id}')">Reconnect</button>` +
-        `</div>` +
       `</div>` +
+    `</div>` +
+    `<div class="reconnect-strip h" data-reconnect-strip="${id}"></div>` +
+    `<div class="pane-term">` +
+      `<div class="pane-overlays" data-overlays="${id}"></div>` +
     `</div>` +
     `<div class="search-bar h" data-search="${id}">` +
       `<input type="text" placeholder="Search...">` +
@@ -1521,22 +1525,151 @@ function startTabRename(id) {
 // everywhere (U1); showTab fits it.
 //
 // A transfer's progress lives in the bar; for a lone pane it is moved
-// into the pane's overlay stack (a card over the terminal, like the
-// Reconnect card) so it and its cancel button stay visible, and only
-// while that tab is on screen.
+// into the pane's overlay stack (a card over the terminal) so it and its
+// cancel button stay visible, and only while that tab is on screen.
+//
+// The Reconnect control lives in the bar too, centred between the
+// label side and the buttons; for a lone pane it moves into the pane's
+// reconnect strip (placeReconnect).
 function syncTabSolo(t, ps) {
   let solo = ps.length === 1;
   if (t.root.classList.contains('solo') !== solo) t.root.classList.toggle('solo', solo);
-  ps.forEach(p => { if (p._progSolo !== solo) placeTransferProgress(p, solo); });
+  ps.forEach(p => {
+    if (p._progSolo !== solo) placeTransferProgress(p, solo);
+    placeReconnect(p);
+  });
 }
 function placeTransferProgress(p, solo) {
   let prog = p.el.querySelector('[data-upload-progress]');
-  let bar = p.el.querySelector('.pane-bar');
+  let side = p.el.querySelector('.pane-bar-l');
   let ovl = p.el.querySelector('.pane-overlays');
-  if (!prog || !bar || !ovl) return;
+  if (!prog || !side || !ovl) return;
   p._progSolo = solo;
   if (solo) { if (prog.parentNode !== ovl) ovl.appendChild(prog); }
-  else if (prog.parentNode !== bar) bar.insertBefore(prog, bar.querySelector('[data-upload-btn]'));
+  else if (prog.parentNode !== side) side.appendChild(prog);
+}
+// Where a pane's Reconnect control is, and whether it shows. The owner
+// wants it in the row that carries the pane's name and its persistent /
+// short-lived tag, in the middle - not as a card over the terminal.
+//   - Pane with its own bar (2+ panes in the tab): in the bar, between
+//     .pane-bar-l (badge, label, tag, progress) and .pane-bar-r (the
+//     buttons). .has-rc gives both sides the same flex share, which
+//     centres the control; on a narrow pane the sides keep their
+//     content and the control's message ellipsizes first, so it never
+//     covers a button and the Reconnect button stays in view.
+//   - Lone pane (bar hidden, see syncTabSolo): in .reconnect-strip, a
+//     bar-high strip at the top of the pane, shown only while the
+//     control is. It is position:absolute over the terminal, NOT in the
+//     pane's flex column: in the column it would shrink the terminal,
+//     refit it and resize the PTY on every disconnect and again on
+//     reconnect (the reason the status bars live in .pane-overlays).
+//     The overlay stack moves down below it in CSS.
+// Called from syncTabSolo (every renderTab) and from show/hide. The
+// control is one element moved between the two places, so a typed
+// password stays; moving a focused input blurs it, so focus is put
+// back when it was there.
+function placeReconnect(p) {
+  let ctrl = p.el.querySelector('[data-reconnect]');
+  let strip = p.el.querySelector('.reconnect-strip');
+  let bar = p.el.querySelector('.pane-bar');
+  if (!ctrl || !strip || !bar) return;
+  let root = p.el.closest('.tab-root');
+  let solo = !!root && root.classList.contains('solo');
+  let shown = !ctrl.classList.contains('h');
+  if (solo) {
+    if (ctrl.parentNode !== strip) _keepRcFocus(() => strip.appendChild(ctrl));
+  } else if (ctrl.parentNode !== bar) {
+    _keepRcFocus(() => bar.insertBefore(ctrl, bar.querySelector('.pane-bar-r')));
+  }
+  if (strip.classList.contains('h') !== !(solo && shown)) strip.classList.toggle('h', !(solo && shown));
+  if (bar.classList.contains('has-rc') !== (!solo && shown)) bar.classList.toggle('has-rc', !solo && shown);
+  if (shown && !solo) _measureReconnect(p, ctrl, bar);
+}
+// The widths the bar's CSS (.has-rc) needs to centre the control and
+// still fit a narrow pane, as custom properties: --rc-lc the name side's
+// badge + tag (--rc-lf: the least they take shrunk), --rc-rc the buttons, --rc-cc the least the control can
+// be (its button, plus a short password input when one shows). The
+// message has no floor: it is what gives way. Content widths only - they
+// do not depend on the pane's width, so a resize needs no JS; they are
+// measured again when what is shown changes (key), not on every call
+// (syncTabSolo runs on every output frame of the tab). Only while the
+// control is in the bar: a lone pane's bar is hidden and measures 0, as
+// does a pane in a hidden tab - nothing is stored then, and it is
+// measured when the bar is on screen.
+function _measureReconnect(p, ctrl, bar) {
+  let L = bar.querySelector('.pane-bar-l'), R = bar.querySelector('.pane-bar-r');
+  let btn = ctrl.querySelector('.btn'), pw = ctrl.querySelector('input');
+  let msg = ctrl.querySelector('span');
+  let tag = L && L.querySelector('.pane-tag');
+  let badge = L && L.querySelector('.pane-badge');
+  let key = [ctrl.className, pw && pw.className, msg && msg.textContent,
+             badge && badge.textContent, tag && tag.className].join('\u0001');
+  if (p._rcMeasured === key) return;
+  if (!btn || !btn.offsetWidth) return;
+  // Natural widths: .has-rc lets badge and tag shrink, so measure
+  // without it (one extra layout, only when the key changed).
+  let had = bar.classList.contains('has-rc');
+  if (had) bar.classList.remove('has-rc');
+  let px = el => { let cs = getComputedStyle(el); return el.offsetWidth + (parseFloat(cs.marginLeft) || 0) + (parseFloat(cs.marginRight) || 0); };
+  // The least a shrunk badge or tag still takes: the badge its dot, the
+  // tag its padding.
+  let floor = el => {
+    if (el.classList.contains('pane-badge')) return 6;
+    let cs = getComputedStyle(el);
+    return (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.paddingRight) || 0) +
+           (parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.borderRightWidth) || 0);
+  };
+  let side = (box, skip, least) => {
+    let w = 0, n = 0;
+    if (!box) return 0;
+    for (let i = 0; i < box.children.length; i++) {
+      let ch = box.children[i];
+      if (!ch.getClientRects().length) continue;
+      n++;
+      if (skip(ch)) continue;
+      w += least ? floor(ch) + px(ch) - ch.offsetWidth : px(ch);
+    }
+    return w + Math.max(0, n - 1) * 6;
+  };
+  // Label and a transfer's progress stretch; they have no floor either.
+  let stretch = ch => ch.classList.contains('pane-label') || ch.classList.contains('upload-progress');
+  let lc = side(L, stretch, false);
+  let lf = side(L, stretch, true);
+  let rc = side(R, () => false, false);
+  let cs = getComputedStyle(ctrl);
+  let cc = btn.offsetWidth + (parseFloat(cs.paddingLeft) || 0) + (parseFloat(cs.borderLeftWidth) || 0) +
+           (parseFloat(cs.paddingRight) || 0) + (parseFloat(cs.borderRightWidth) || 0);
+  if (pw && !pw.classList.contains('h')) cc += 48 + 6;
+  if (msg && msg.textContent) cc += 6;
+  if (had) bar.classList.add('has-rc');
+  bar.style.setProperty('--rc-lc', lc + 'px');
+  bar.style.setProperty('--rc-lf', lf + 'px');
+  bar.style.setProperty('--rc-rc', rc + 'px');
+  bar.style.setProperty('--rc-cc', cc + 'px');
+  ctrl.style.setProperty('--rc-cc', cc + 'px');
+  p._rcMeasured = key;
+}
+// The reconnect password input that has the focus, if one has.
+function _focusedRcInput() {
+  let a = document.activeElement;
+  return (a && a.hasAttribute && a.hasAttribute('data-reconnect-pw')) ? a : null;
+}
+// Run fn (which moves panes or the control around) and give the focus
+// back to the reconnect password input that had it before, if that
+// input is still in the page and shown. Re-parenting an element drops
+// its focus to <body>, and the pane moves end in term.focus(). `had`
+// names that input when it was taken before the DOM changed
+// (_destroyPane).
+function _keepRcFocus(fn, had) {
+  let inp = had || _focusedRcInput();
+  try { return fn(); }
+  finally {
+    let ctrl = inp && inp.closest('[data-reconnect]');
+    if (inp && document.body.contains(inp) && document.activeElement !== inp &&
+        !inp.classList.contains('h') && ctrl && !ctrl.classList.contains('h')) {
+      try { inp.focus(); } catch (e) {}
+    }
+  }
 }
 
 // The top-bar copy of the pane actions, for the active pane of the
@@ -1775,10 +1908,12 @@ function movePaneToNewTab(id) {
   if (!p) return;
   let from = tabOfPane(p);
   if (!from || panesInTab(from).length < 2) return;
-  _detachPane(p);
-  let t = createTab();
-  t.root.appendChild(p.el);
-  _showAfterMove(t, id, [p]);
+  _keepRcFocus(() => {
+    _detachPane(p);
+    let t = createTab();
+    t.root.appendChild(p.el);
+    _showAfterMove(t, id, [p]);
+  });
   saveSessions();
 }
 
@@ -1804,12 +1939,14 @@ function movePaneToTab(id, tabId, anchorId, side) {
   let anchor = anchorId ? panes[anchorId] : null;
   if (!anchor || tabOfPane(anchor) !== to) anchor = _tabAnchor(to);
   if (['left', 'right', 'top', 'bottom'].indexOf(side) < 0) side = 'right';
-  _detachPane(p);
-  if (anchor) _placeBeside(anchor.el, p.el, (side === 'left' || side === 'right') ? 'h' : 'v',
-                           side === 'left' || side === 'top');
-  else to.root.appendChild(p.el);
-  _dropEmptyTab(from);
-  _showAfterMove(to, id, [p].concat(_panesUnder(anchor ? anchor.el : null)));
+  _keepRcFocus(() => {
+    _detachPane(p);
+    if (anchor) _placeBeside(anchor.el, p.el, (side === 'left' || side === 'right') ? 'h' : 'v',
+                             side === 'left' || side === 'top');
+    else to.root.appendChild(p.el);
+    _dropEmptyTab(from);
+    _showAfterMove(to, id, [p].concat(_panesUnder(anchor ? anchor.el : null)));
+  });
   saveSessions();
 }
 
@@ -1830,11 +1967,13 @@ function mergeTabInto(tabId, paneId, side) {
   let srcPanes = panesInTab(src);
   let focusId = (src.lastActive && srcPanes.indexOf(panes[src.lastActive]) >= 0)
     ? src.lastActive : (srcPanes[0] ? srcPanes[0].id : q.id);
-  src.root.removeChild(node);
-  _placeBeside(q.el, node, (side === 'left' || side === 'right') ? 'h' : 'v',
-               side === 'left' || side === 'top');
-  _dropEmptyTab(src);
-  _showAfterMove(dst, focusId, _panesUnder(node).concat([q]));
+  _keepRcFocus(() => {
+    src.root.removeChild(node);
+    _placeBeside(q.el, node, (side === 'left' || side === 'right') ? 'h' : 'v',
+                 side === 'left' || side === 'top');
+    _dropEmptyTab(src);
+    _showAfterMove(dst, focusId, _panesUnder(node).concat([q]));
+  });
   saveSessions();
 }
 // Tab `srcId`'s whole layout joins tab `dstId`, to the right of its
@@ -2341,7 +2480,10 @@ function _destroyPane(id, terminate) {
     return;
   }
 
-  // Unwrap: replace split container with the remaining child
+  // Unwrap: replace split container with the remaining child. The
+  // remaining pane is re-parented: a focused reconnect password input
+  // in it would drop its focus to <body> (_keepRcFocus puts it back).
+  let rcInp = _focusedRcInput();
   let sibling = null;
   for (let i=0; i<wrap.children.length; i++) {
     let ch = wrap.children[i];
@@ -2368,6 +2510,7 @@ function _destroyPane(id, terminate) {
 
   // Refit the terminals on screen after the layout change
   fitVisiblePanes();
+  if (rcInp) _keepRcFocus(() => {}, rcInp);
   saveSessions();
 }
 
@@ -2442,7 +2585,8 @@ function _deletePaneSecret(uuid) {
 // For manual / named panes whose in-memory password was lost (fresh-tab
 // F5 with empty sessionStorage, or _maybeAutoDropLegacy on the source
 // saved card before they cliked reconnect), we expose an inline password
-// input on the bar so the user can recover in place without opening the
+// input in the Reconnect control (in the pane's bar, or a lone pane's
+// strip - placeReconnect) so the user can recover in place without opening the
 // full connect form. Vault-backed panes follow the "no_vault_key" path
 // instead (their fix is sign-in, not a typed password). Key-auth panes
 // fall back to "Reconnect" only (a multi-line key blob doesn't fit a bar
@@ -2460,7 +2604,7 @@ function showReconnectBar(p, reason) {
   let msg = bar.querySelector('span');
   let pwInput = bar.querySelector('input[type=password]');
   let showInput = _needsReconnectPwInput(p, reason);
-  // Severity drives the card's coloured edge; a plain drop gets none.
+  // Severity drives the control's coloured edge; a plain drop gets none.
   bar.classList.remove('sev-err', 'sev-warn');
   if (msg) {
     if (reason === 'auth_failed') {
@@ -2478,8 +2622,8 @@ function showReconnectBar(p, reason) {
       bar.classList.add('sev-warn');
     } else {
       // The pane badge already says "Disconnected"; repeating it here in
-      // red just doubled the alarm. Say only what the card adds - what to
-      // do next - and let the lone Reconnect button speak for itself.
+      // red just doubled the alarm. Say only what the control adds - what
+      // to do next - and let the lone Reconnect button speak for itself.
       msg.textContent = showInput ? 'Type the password to reconnect' : '';
       msg.style.color = 'var(--dim)';
     }
@@ -2493,17 +2637,18 @@ function showReconnectBar(p, reason) {
       setTimeout(() => { try { pwInput.focus(); } catch(e){} }, 0);
     }
   }
-  // Nothing but the button left? Then the card is a box drawn around a
-  // button that already has its own edges - drop the chrome and show
-  // the button alone. The card comes back as soon as it has to carry
-  // text or the password input.
+  // Nothing but the button left? Then it is the bare button (.bare);
+  // the message and the password input come back as soon as there is
+  // something to say or type. Then put the control where it belongs
+  // (bar or strip) - after the classes, which decide its width.
   bar.classList.toggle('bare',
     !(msg && msg.textContent) && !(pwInput && !pwInput.classList.contains('h')));
   bar.classList.remove('h');
+  placeReconnect(p);
 }
 function hideReconnectBar(p) {
   let bar = p.el.querySelector('[data-reconnect]');
-  if (bar) bar.classList.add('h');
+  if (bar) { bar.classList.add('h'); placeReconnect(p); }
 }
 function reconnectPane(id) {
   let p = panes[id]; if (!p || (!p.host && !p.connection)) return;

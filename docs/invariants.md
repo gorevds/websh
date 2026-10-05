@@ -225,6 +225,28 @@ would have. `tabKeyHandled()`. Guard:
 frontend `tabs keys: …`; e2e `tabkeys` (real key events, Mac platform
 included).
 
+**U8. Reconnect is in the pane's bar row and never resizes the
+terminal.** A disconnected pane has exactly one Reconnect control
+(`[data-reconnect]`: message, password input, button). In a split it
+is inside that pane's `.pane-bar`, centred when the centred control
+clears the badge/tag and the buttons, otherwise right next to the
+buttons - never over a button, the Reconnect button always in view and
+clickable; the message gives way first. A lone pane has no bar (U4):
+the control sits in `.reconnect-strip`, a bar-high strip drawn over
+the top of the terminal (`position:absolute`), so it appearing and
+going away is no refit and no `/api/resize`; the overlay stack moves
+below it. It is one element moved between bar and strip
+(`placeReconnect`, on every `syncTabSolo`), so a pane going split /
+lone / to another tab while disconnected keeps the typed password, and
+a focused password input gets its focus back (re-parenting drops it to
+`<body>`). The owner asked for this place on 2026-10-05 ("in the row
+where 'persistent' is written, in the middle"); a card over the
+terminal is what it replaced. Guard: frontend `reconnect in the bar:
+…`, `reconnect strip: …`, `reconnect strip <-> bar: …`, `status bars
+float over the terminal…`; e2e `reconnectbar`, `reconnectbreak`
+(geometry: measured in Chromium at several widths, DPR 1.5, font
+zoom, tab switches).
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

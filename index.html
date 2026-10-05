@@ -280,11 +280,17 @@
        instead of dim grey. The bar tint alone was invisible with three
        or four panes open; a badge or dot would have eaten width from
        the label, which is already the first thing to be truncated. */
-    .pane.active>.pane-bar>.pane-label{color:var(--ac)}
+    .pane.active>.pane-bar>.pane-bar-l>.pane-label{color:var(--ac)}
     .pane-bar{display:flex;align-items:center;gap:6px;padding:2px 8px;background:var(--bg);border-bottom:1px solid var(--bd);flex-shrink:0}
+    /* The bar's two sides: name side (badge, label, tag, a transfer's
+       progress) and the buttons. Between them the Reconnect control when
+       the pane is disconnected (.has-rc, see the Reconnect bar below). */
+    .pane-bar-l{display:flex;align-items:center;gap:6px;flex:1;min-width:0}
+    .pane-bar-r{display:flex;align-items:center;gap:6px;flex:none}
+    .pane-bar .pane-badge,.pane-bar .pane-tag{flex-shrink:0;white-space:nowrap}
     /* A dot carries the state; the word stays dim. The filled pill put a
-       block of red in the pane bar for every disconnect, and the floating
-       card below already shouts. */
+       block of red in the pane bar for every disconnect, and the Reconnect
+       control in the same row already says it. */
     .pane-badge{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:500}
     .pane-badge.s-on,.pane-badge.s-wait,.pane-badge.s-off{background:none;padding:0;color:var(--dim)}
     .pane-badge::before{content:'';width:6px;height:6px;border-radius:50%;flex-shrink:0;background:var(--dim)}
@@ -306,18 +312,19 @@
     .upload-progress-cancel{background:none;border:none;color:var(--dim);cursor:pointer;font-size:12px;padding:2px 4px;border-radius:3px;transition:.15s;flex-shrink:0}
     .upload-progress-cancel:hover{color:var(--dg);background:rgba(248,81,73,.1)}
     .pane-term{flex:1;overflow:hidden;position:relative}
-    /* Status bars (reconnect, tmux, transport-retry) live HERE, over the
-       terminal, instead of in the pane's flex column. In the column each
-       one shrank the terminal: the text jumped, xterm refit and the PTY
-       was resized mid-disconnect - twice, since hiding the bar resized it
-       back. The stack is anchored to the terminal area, so it needs no
-       knowledge of the pane bar's height.
+    /* Status bars (tmux, transport-retry) and a lone pane's transfer
+       progress live HERE, over the terminal, instead of in the pane's
+       flex column. In the column each one shrank the terminal: the text
+       jumped, xterm refit and the PTY was resized mid-disconnect - twice,
+       since hiding the bar resized it back. The stack is anchored to the
+       terminal area, so it needs no knowledge of the pane bar's height;
+       only a shown .reconnect-strip (a lone pane's Reconnect, see the
+       Reconnect bar below) pushes it down to start under the strip.
 
-       Top-centre: that is where the owner finds the Reconnect card most
-       convenient - it is the first thing seen when a pane goes dead. The
-       price is known and accepted: the card covers the first rows of
-       output while it is up. Each card is only as wide as its content,
-       so the rest of those rows stays visible on both sides. */
+       Top-centre, each card only as wide as its content, so the rest of
+       the rows it covers stays visible on both sides. The Reconnect
+       control was a card here too; the owner moved it into the pane's
+       bar row, see the Reconnect bar below. */
     .pane-overlays{position:absolute;top:0;left:0;right:0;z-index:16;display:flex;flex-direction:column;align-items:center;gap:4px;padding:6px;pointer-events:none}
     .pane-overlays>*{max-width:100%}
     .pane-overlays>*{pointer-events:auto}
@@ -350,20 +357,46 @@
     body.resizing-v{cursor:row-resize!important;user-select:none!important}
 
     /* ── Reconnect bar ── */
-    /* Plain "the link dropped" is not an error: the card is neutral and the
-       coloured edge is kept for states the user has to act on. */
-    .reconnect-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:5px 10px;background:var(--sf);border:1px solid var(--bd);border-radius:6px;flex-shrink:0;box-shadow:0 4px 14px rgba(0,0,0,.35)}
-    /* A lone Reconnect button needs no card around it: the button is
-       already a shape. The shadow moves onto the button so it still
-       lifts off busy output. */
+    /* The Reconnect control sits in the row that carries the pane's name
+       and tag, in the middle: the pane's own bar (between .pane-bar-l and
+       .pane-bar-r, which .has-rc gives equal shares so the control is
+       centred), or for a lone pane, whose bar is hidden, the
+       .reconnect-strip - a bar-high strip over the top of the terminal,
+       absolutely placed so the terminal never changes size for it. The
+       overlay stack moves down below the strip. websh.js: placeReconnect.
+       In a row it is no card: no box, no shadow, and nothing taller than
+       the bar's own buttons, so the bar keeps its height. Plain "the link
+       dropped" is not an error: the coloured edge is kept for states the
+       user has to act on. */
+    .reconnect-bar{display:flex;align-items:center;justify-content:center;gap:6px;flex:0 1 auto;min-width:var(--rc-cc,0px);padding:0;background:none;border:none}
+    /* The edge is balanced by as much room on the right, so what the
+       control shows stays centred. */
+    .reconnect-bar.sev-err{border-left:3px solid var(--dg);padding:0 9px 0 6px}
+    .reconnect-bar.sev-warn{border-left:3px solid var(--wn);padding:0 9px 0 6px}
+    /* On a narrow pane the message gives way first, then the input; the
+       button never shrinks, so it stays in view and clickable. */
+    .reconnect-bar span{flex:0 1 auto;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    /* A lone Reconnect button needs nothing around it: the button is
+       already a shape. */
     .reconnect-bar.bare{background:none;border:none;box-shadow:none;padding:0}
-    .reconnect-bar.bare .btn{box-shadow:0 4px 14px rgba(0,0,0,.45)}
-    .reconnect-bar.sev-err{border-left:3px solid var(--dg)}
-    .reconnect-bar.sev-warn{border-left:3px solid var(--wn)}
     .reconnect-bar span:empty{display:none}
-    .reconnect-bar .btn{font-size:11px;padding:3px 12px}
-    .reconnect-bar .reconnect-pw{font-size:11px;padding:3px 8px;border-radius:4px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);min-width:180px;outline:none}
+    .reconnect-bar .btn{flex:none;font-size:11px;padding:1px 12px}
+    .reconnect-bar .reconnect-pw{flex:0 1 180px;width:180px;min-width:48px;font-size:11px;padding:1px 8px;border-radius:4px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);outline:none}
     .reconnect-bar .reconnect-pw:focus{border-color:var(--ac)}
+    /* Centring in the bar: both sides take the same share, at least the
+       wider side's content (--rc-lc / --rc-rc), and the control gets the
+       middle, down to its floor (--rc-cc; its message ellipsizes on the
+       way). When even that does not fit, the buttons keep their width,
+       the control its floor, and the name side gives way (badge and tag
+       clip down to the dot and the tag's padding, --rc-lf): the control
+       is then off-centre, next to the buttons, but never under one.
+       websh.js: _measureReconnect sets the widths. */
+    .pane-bar.has-rc>.pane-bar-l{flex:1 1 0;min-width:max(var(--rc-lf,0px),min(max(var(--rc-lc,0px),var(--rc-rc,0px)),calc((100% - 12px - var(--rc-cc,0px)) / 2),calc(100% - 12px - var(--rc-rc,0px) - var(--rc-cc,0px))))}
+    .pane-bar.has-rc>.pane-bar-r{flex:1 1 0;justify-content:flex-end;min-width:max(var(--rc-rc,0px),min(max(var(--rc-lc,0px),var(--rc-rc,0px)),calc((100% - 12px - var(--rc-cc,0px)) / 2)))}
+    .pane-bar.has-rc .pane-badge,.pane-bar.has-rc .pane-tag{flex-shrink:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+    .pane-bar.has-rc .pane-badge{min-width:6px}
+    .reconnect-strip{position:absolute;top:0;left:0;right:0;z-index:21;height:24px;box-sizing:border-box;display:flex;align-items:center;justify-content:center;padding:2px 8px;background:var(--sf);border-bottom:1px solid var(--bd);overflow:hidden}
+    .reconnect-strip:not(.h)+.pane-term>.pane-overlays{top:24px}
 
     /* ── tmux-failed fallback bar ── */
     .tmux-bar{display:flex;align-items:center;justify-content:center;gap:8px;padding:5px 10px;background:var(--sf);border:1px solid var(--bd);border-left:3px solid var(--wn);border-radius:6px;flex-shrink:0;font-size:12px;color:var(--wn);box-shadow:0 4px 14px rgba(0,0,0,.35)}
