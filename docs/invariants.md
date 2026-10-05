@@ -262,6 +262,19 @@ float over the terminal…`; e2e `reconnectbar`, `reconnectbreak`
 (geometry: measured in Chromium at several widths, DPR 1.5, font
 zoom, tab switches).
 
+**U9. A split or a close moves no other divider.** Splitting a pane
+puts the new split where the pane was, with the pane's share of its
+parent (`flex`), and halves it; closing a pane gives the sibling the
+split's share. Before, a split made the wrapper `flex:1` and a close
+cleared the sibling's `flex`: with A | B dragged to 70/30, splitting B
+threw A to about 41%, and closing a pane of a nested split moved the
+outer divider. The saved layout carries the ratios, so a reload shows
+the same. The tab's miniature draws these proportions too (from the
+flex values, not by measuring; redrawn only when a box's whole-pixel
+size changes). Guard: frontend `divider share: …`, `marker ratio: …`;
+e2e `tabback` (a real handle drag, then a split and a close, measured
+in pixels).
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

@@ -12806,6 +12806,443 @@ test('marker: not redrawn on output frames, only when the layout or the active p
 });
 
 // =====================================================================
+// The marker follows the split proportions (a dragged handle, a restored
+// layout), not only the arrangement.
+//
+// Hooks / assumptions:
+//   - the real proportion of a split is its two children's flex-grow
+//     (style.flex as the handle drag and the layout restore write it;
+//     '' = the CSS default 1). The test layout model gives every box the
+//     same size, so a marker that measured the panes would see 50/50:
+//     the marker must read the proportions from the flex values.
+//   - for each split the rects of the panes under its first child and
+//     under its second child span a 1 px gap; the first child's span is
+//     ratio * (span of both - 1) +- 1 px; every rect >= 1x1 px, inside
+//     the viewBox; the rects together still fill the viewBox.
+//   - a drag is a real mousedown on .split-handle, mousemoves, a mouseup
+//     (the drag maps clientX/Y over the wrapper's box to the ratio).
+// =====================================================================
+const flexGrow = el => { const g = parseFloat(el.style.flexGrow); return isFinite(g) ? g : 1; };
+const layoutKids = el => Array.from(el.children).filter(c => c.classList.contains('pane') || c.classList.contains('split-h') || c.classList.contains('split-v'));
+const panesIn = el => el.classList.contains('pane') ? [el.getAttribute('data-pane')]
+  : Array.from(el.querySelectorAll('.pane')).map(e => e.getAttribute('data-pane'));
+// The fewest pixels a subtree needs along an axis (1 px per pane, 1 px gaps).
+function minNeed(el, horiz) {
+  if (el.classList.contains('pane')) return 1;
+  const k = layoutKids(el);
+  if (k.length < 2) return k.length ? minNeed(k[0], horiz) : 1;
+  const same = el.classList.contains(horiz ? 'split-h' : 'split-v');
+  return same ? minNeed(k[0], horiz) + 1 + minNeed(k[1], horiz) : Math.max(minNeed(k[0], horiz), minNeed(k[1], horiz));
+}
+const nameOf = (win, el) => el.classList.contains('pane')
+  ? ((win.panes[el.getAttribute('data-pane')] || {}).host || el.getAttribute('data-pane'))
+  : (el.classList.contains('split-h') ? 'h(' : 'v(') + layoutKids(el).map(c => nameOf(win, c)).join(',') + ')';
+// Everything wrong with the proportions drawn in tab element tEl's marker.
+function miniRatioProblems(env, tEl) {
+  const win = env.win;
+  const tid = tabId(tEl);
+  if (panesOfTab(win, tid).length < 2) return [];
+  const rs = miniRects(tEl);
+  if (!rs || !rs.length) return ['no miniature'];
+  const by = {}; rs.forEach(r => { by[r.pane] = r; });
+  const out = [];
+  const svg = tEl.querySelector('.tab-split svg');
+  const vb = (svg.getAttribute('viewBox') || '').trim().split(/[\s,]+/).map(Number);
+  rs.forEach(r => {
+    if (!(r.w >= 1 && r.h >= 1)) out.push('rect ' + r.pane + ' is ' + r.w + 'x' + r.h + ' px (each pane at least 1 px)');
+    if (vb.length === 4 && (r.x < vb[0] - 0.01 || r.y < vb[1] - 0.01 || r.x + r.w > vb[0] + vb[2] + 0.01 || r.y + r.h > vb[1] + vb[3] + 0.01))
+      out.push('rect ' + r.pane + ' outside the viewBox');
+  });
+  const span = (el, horiz) => {
+    const ids = panesIn(el).filter(id => by[id]);
+    if (!ids.length) return null;
+    const s = Math.min.apply(null, ids.map(id => horiz ? by[id].x : by[id].y));
+    const e = Math.max.apply(null, ids.map(id => horiz ? by[id].x + by[id].w : by[id].y + by[id].h));
+    return {s, e, len: e - s};
+  };
+  const root = tabRootById(win, tid);
+  const top = root && layoutKids(root)[0];
+  if (top && vb.length === 4) {
+    const sx = span(top, true), sy = span(top, false);
+    if (sx && sy && (sx.s > vb[0] + 0.01 || sx.e < vb[0] + vb[2] - 0.01 || sy.s > vb[1] + 0.01 || sy.e < vb[1] + vb[3] - 0.01))
+      out.push('the rects do not fill the miniature: x ' + sx.s + '..' + sx.e + ', y ' + sy.s + '..' + sy.e + ' of ' + vb.join(' '));
+  }
+  const walk = el => {
+    if (!el || el.classList.contains('pane')) return;
+    const k = layoutKids(el);
+    k.forEach(walk);
+    if (k.length < 2) return;
+    const horiz = el.classList.contains('split-h');
+    const A = span(k[0], horiz), B = span(k[1], horiz);
+    if (!A || !B) return;
+    const ratio = flexGrow(k[0]) / (flexGrow(k[0]) + flexGrow(k[1]));
+    const drawable = B.e - A.s - 1;
+    const ideal = ratio * drawable;
+    // Where a 1 px minimum must win over the proportion, only the minimum is asked for.
+    if (ideal < minNeed(k[0], horiz) + 0.5 || drawable - ideal < minNeed(k[1], horiz) + 0.5) return;
+    const what = nameOf(win, el) + ' at ' + Math.round(ratio * 100) + '/' + Math.round((1 - ratio) * 100);
+    if (Math.abs(A.len - ideal) > 1.0001)
+      out.push(what + ': first part drawn ' + A.len + ' of ' + drawable + ' px, want ~' + ideal.toFixed(1) + ' (+-1)');
+    if (Math.abs(B.s - A.e - 1) > 0.01) out.push(what + ': gap ' + (B.s - A.e) + ' px, want 1');
+  };
+  walk(top);
+  return out;
+}
+const allMiniRatioProblems = env => tabEls(env.win).reduce((o, t) => o.concat(miniRatioProblems(env, t).map(x => tabId(t) + ': ' + x)), []);
+const handleOf = wrap => wrap && Array.from(wrap.children).find(c => c.classList.contains('split-handle'));
+const wrapOf = p => p.el.parentElement;
+// A real handle drag of split `wrap` to `ratio` (what the drag maps the pointer to).
+function dragSplit(win, wrap, ratio, o) {
+  o = o || {};
+  const h = handleOf(wrap);
+  if (!h) return null;
+  const horiz = wrap.classList.contains('split-h');
+  const r = wrap.getBoundingClientRect();
+  const at = q => horiz ? [r.left + q * r.width, r.top + r.height / 2] : [r.left + r.width / 2, r.top + q * r.height];
+  const from = flexGrow(layoutKids(wrap)[0]) / (flexGrow(layoutKids(wrap)[0]) + flexGrow(layoutKids(wrap)[1]));
+  const m = pointer(win);
+  let [x, y] = at(from);
+  m.down(h, x, y);
+  const n = o.steps || 8;
+  for (let i = 1; i <= n; i++) { [x, y] = at(from + (ratio - from) * i / n); m.move(h, x, y); }
+  if (!o.noUp) m.up(h, x, y);
+  return {m, h, at};
+}
+const ratioOf = el => flexGrow(el) / (flexGrow(el) + flexGrow(el.nextElementSibling && el.nextElementSibling.classList.contains('split-handle') ? el.nextElementSibling.nextElementSibling : el.nextElementSibling));
+// Wait (up to ms) until tab element t's marker draws the proportions; ms taken, or -1.
+async function ratiosShown(env, t, ms) {
+  const t0 = _now();
+  const got = await until(() => miniRatioProblems(env, t).length === 0, ms || 300);
+  return got ? Math.round(_now() - t0) : -1;
+}
+
+test('marker ratio: a dragged split handle (h and v, nested) is drawn in its proportions within 300 ms of release, each pane at least 1 px', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  ok(miniRatioProblems(env, t).length === 0, 'setup: 50/50 drawn as halves; ' + show(miniRatioProblems(env, t)));
+  const outer = wrapOf(a);
+  ok(!!handleOf(outer), 'setup: the split has a .split-handle');
+  if (!handleOf(outer)) { cleanup(env); return; }
+  // a | b dragged to 70/30.
+  dragSplit(win, outer, 0.7);
+  ok(Math.abs(ratioOf(a.el) - 0.7) < 0.01, 'setup: the drag set a to 70% (flex ' + show(a.el.style.flex) + ' / ' + show(b.el.style.flex) + ')');
+  let ms = await ratiosShown(env, t);
+  const r1 = miniRects(t) || [];
+  ok(ms >= 0, 'a | b dragged to 70/30: the left box takes ~70% (within 300 ms of release); ' +
+     show(miniRatioProblems(env, t)) + ' rects ' + show(r1.map(r => r.pane + ':' + r.x + '+' + r.w)));
+  // and back to 25/75.
+  dragSplit(win, outer, 0.25);
+  ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'dragged on to 25/75: redrawn; ' + show(miniRatioProblems(env, t)));
+  // b split under: c; the vertical handle dragged to 30/70; outer to 60/40.
+  const c = await tSplit(win, b, 'v', 'c.host');
+  if (!c) { ok(false, 'setup: c'); cleanup(env); return; }
+  dragSplit(win, wrapOf(c), 0.3);
+  ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'a | (b over c), b over c dragged to 30/70: the upper box ~30% of the height; ' + show(miniRatioProblems(env, t)));
+  dragSplit(win, wrapOf(a), 0.6);
+  ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'then the outer handle to 60/40: both proportions drawn; ' + show(miniRatioProblems(env, t)));
+  ok(miniProblems(env, t).length === 0, 'and still the right arrangement and active pane; ' + show(miniProblems(env, t)));
+  // Extremes: the drag's limits 10/90 and 90/10, nested.
+  const d = await tSplit(win, a, 'h', 'd.host');
+  if (!d) { ok(false, 'setup: d'); cleanup(env); return; }
+  dragSplit(win, wrapOf(d), 0.9);
+  dragSplit(win, wrapOf(d).parentElement, 0.1);
+  dragSplit(win, wrapOf(c), 0.9);
+  await sleep(350);
+  const small = (miniRects(t) || []).filter(r => !(r.w >= 1 && r.h >= 1));
+  ok(miniRects(t) && miniRects(t).length === 4 && small.length === 0,
+     '(a | d) at 10% of the width, a | d 90/10, b over c 90/10: every pane still at least 1x1 px; ' +
+     show((miniRects(t) || []).map(r => r.pane + ':' + r.w + 'x' + r.h)));
+  ok(miniRatioProblems(env, t).length === 0, 'and where the pixels allow, the proportions; ' + show(miniRatioProblems(env, t)));
+  cleanup(env);
+});
+
+test('marker ratio: cheap - no DOM change while a drag stays within one pixel, none for 600 output frames or a window resize; correct after release', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const t = activeTab(win);
+  const sp = t.querySelector('.tab-split');
+  const wrap = wrapOf(a);
+  // Press, go to 65% (a ratio well inside a pixel at this size: 0.65 * 15 = 9.75)
+  // and stay pressed until any throttled update has run.
+  const g = dragSplit(win, wrap, 0.65, {noUp: true});
+  if (!g) { ok(false, 'setup: no handle'); cleanup(env); return; }
+  await sleep(350);
+  let muts = 0;
+  const mo = new win.MutationObserver(l => { muts += l.length; });
+  mo.observe(sp, {attributes: true, childList: true, subtree: true, characterData: true});
+  // 200 moves of +-1 px around 65% (720 px wide: +-0.0014).
+  for (let i = 0; i < 200; i++) { const [x, y] = g.at(0.65 + (i % 2 ? 1 : -1) / 720); g.m.move(g.h, x, y); }
+  await sleep(350);
+  ok(muts === 0, '200 mousemoves of +-1 px during the drag (no box changes size): the marker untouched; ' + muts + ' DOM changes');
+  // A sweep 65% -> 75% in 100 moves: the left box grows by ~1-2 px, so a few changes, not one per move.
+  muts = 0;
+  for (let i = 1; i <= 100; i++) { const [x, y] = g.at(0.65 + 0.1 * i / 100); g.m.move(g.h, x, y); }
+  await sleep(350);
+  ok(muts <= 20, 'a 100-move sweep 65% -> 75% (1-2 px in the miniature): at most a handful of DOM changes, not one per move; ' + muts);
+  const [ux, uy] = g.at(0.75);
+  g.m.up(g.h, ux, uy);
+  const ms = await ratiosShown(env, t);
+  ok(ms >= 0, 'released at 75/25: drawn so within 300 ms; ' + show(miniRatioProblems(env, t)));
+  await sleep(100);
+  // Output frames.
+  muts = 0;
+  for (let i = 0; i < 300; i++) { win.updatePaneBadge(a); win.updatePaneBadge(b); }
+  await sleep(250);
+  ok(muts === 0, '600 updatePaneBadge calls (output frames) with a 75/25 split: the marker untouched; ' + muts + ' DOM changes');
+  // A window resize: proportions unchanged.
+  muts = 0;
+  env.lay.box = {cols: 120, rows: 40};
+  win.dispatchEvent(new win.Event('resize'));
+  await sleep(400);
+  env.lay.box = {cols: 70, rows: 20};
+  win.dispatchEvent(new win.Event('resize'));
+  await sleep(400);
+  ok(muts === 0, 'two window resizes (proportions unchanged): the marker untouched; ' + muts + ' DOM changes');
+  ok(miniRatioProblems(env, t).length === 0, 'and it still draws 75/25; ' + show(miniRatioProblems(env, t)));
+  mo.disconnect();
+  cleanup(env);
+});
+
+test('marker ratio: proportions come back after a reload, and follow split / close / move / merge, also in hidden tabs', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !needMove(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const c = await tSplit(win, b, 'v', 'c.host');
+  if (!c) { ok(false, 'setup'); cleanup(env); return; }
+  dragSplit(win, wrapOf(a), 0.7);
+  dragSplit(win, wrapOf(c), 0.25);
+  const tA = tabOfPane(a);
+  // A second tab, its own split at 30/70, in front: A is hidden from here on.
+  const x = await tNewTab(win, 'x.host');
+  const y = x && await tSplit(win, x, 'h', 'y.host');
+  if (!y) { ok(false, 'setup'); cleanup(env); return; }
+  dragSplit(win, wrapOf(x), 0.3);
+  await sleep(350);
+  const steps = [];
+  const step = what => { const p = allMiniRatioProblems(env); if (p.length) steps.push(what + ': ' + p.join('; ')); };
+  step('A 70/30 with b over c 25/75 (hidden), X 30/70 in front');
+  ok(steps.length === 0, 'the drawn proportions match in both tabs; wrong: ' + show(steps));
+  // Reload.
+  const snap = snapshotStorage(win);
+  const n = paneList(win).length;
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S4); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === n, 2000);
+  await sleep(50);
+  const ra = paneList(w2).find(p => p.host === 'a.host');
+  ok(!!ra && Math.abs(ratioOf(ra.el) - 0.7) < 0.01, 'setup: the reload restored a at 70% (' + (ra ? show(ra.el.style.flex) : 'no a') + ')');
+  const p2 = allMiniRatioProblems(env2);
+  ok(p2.length === 0, 'after a reload every marker draws its saved proportions (the hidden tab too); wrong: ' + show(p2));
+  // Layout changes, each checked in every tab.
+  const P = h => paneList(w2).find(p => p.host === h);
+  const steps2 = [];
+  const step2 = what => { const p = allMiniRatioProblems(env2); if (p.length) steps2.push(what + ': ' + p.join('; ')); };
+  const tA2 = tabOfPane(P('a.host')), tX2 = tabOfPane(P('x.host'));
+  w2.movePaneToTab(P('y.host').id, tA2); step2('y moved into A');
+  w2.closePane(P('c.host').id); await sleep(30); step2('c closed');
+  w2.movePaneToNewTab(P('b.host').id); step2('b out to a new tab');
+  w2.mergeTabInto(tabOfPane(P('b.host')), P('a.host').id, 'bottom'); step2('b\'s tab merged under a');
+  const e = await tSplit(w2, P('x.host'), 'h', 'e.host'); step2('x split: e');
+  if (e) { dragSplit(w2, wrapOf(e), 0.8); await sleep(350); step2('x | e dragged to 80/20'); }
+  // Make X hidden, then change X's layout: its hidden marker must follow.
+  w2.activatePane(P('a.host').id); step2('A shown');
+  w2.movePaneToTab(P('b.host').id, tX2); step2('b moved into hidden X');
+  w2.closePane(P('e.host') ? P('e.host').id : ''); await sleep(30); step2('e closed in hidden X');
+  ok(steps2.length === 0, 'after every split / close / move / merge each marker drew its tab\'s proportions; wrong: ' + show(steps2));
+  cleanup(env2);
+});
+
+// =====================================================================
+// A split or a close leaves every other divider where it was.
+//
+// Splitting a pane: the new split takes the share that pane had in its
+// parent split and divides it 50/50. Closing (or cancelling the login
+// of) a pane: the remaining sibling takes the split's share. h and v,
+// nested, and the saved layout keeps the ratios across a reload.
+//
+// Hooks / assumptions: as above, a split's proportion is its two
+// children's flex-grow ('' = 1). paneBoxes() lays the tree out from
+// those values (handles ignored, as their 3 px are) to fractions of the
+// tab: "on screen" here is that layout; 1 px = 1/720 of the width,
+// 1/432 of the height. The tester's browser scenario measures real pixels.
+// =====================================================================
+function paneBoxes(win, tid) {
+  const root = tabRootById(win, tid);
+  const top = root && layoutKids(root)[0];
+  const out = {};
+  const walk = (el, x0, y0, x1, y1) => {
+    if (!el) return;
+    if (el.classList.contains('pane')) {
+      const p = win.panes[el.getAttribute('data-pane')];
+      out[p ? p.host : el.getAttribute('data-pane')] = {x0, y0, x1, y1};
+      return;
+    }
+    const k = layoutKids(el);
+    if (k.length < 2) { walk(k[0], x0, y0, x1, y1); return; }
+    const r = flexGrow(k[0]) / (flexGrow(k[0]) + flexGrow(k[1]));
+    if (el.classList.contains('split-h')) {
+      const m = x0 + (x1 - x0) * r; walk(k[0], x0, y0, m, y1); walk(k[1], m, y0, x1, y1);
+    } else {
+      const m = y0 + (y1 - y0) * r; walk(k[0], x0, y0, x1, m); walk(k[1], x0, m, x1, y1);
+    }
+  };
+  walk(top, 0, 0, 1, 1);
+  return out;
+}
+const PX_W = 1 / 720 + 1e-9, PX_H = 1 / 432 + 1e-9;
+const fmtBox = b => b ? [b.x0, b.x1, b.y0, b.y1].map(v => Math.round(v * 1000) / 10).join('/') : 'none';
+// Hosts whose box moved by more than a pixel between two paneBoxes() results.
+function movedBoxes(before, after, hosts) {
+  const out = [];
+  hosts.forEach(h => {
+    const a = before[h], b = after[h];
+    if (!a || !b) { out.push(h + ' missing'); return; }
+    if (Math.abs(a.x0 - b.x0) > PX_W || Math.abs(a.x1 - b.x1) > PX_W || Math.abs(a.y0 - b.y0) > PX_H || Math.abs(a.y1 - b.y1) > PX_H)
+      out.push(h + ' ' + fmtBox(a) + ' -> ' + fmtBox(b) + ' (% x0/x1/y0/y1)');
+  });
+  return out;
+}
+// Box b equals the expected fractions (each +-1 px).
+function boxIs(b, x0, x1, y0, y1) {
+  return !!b && Math.abs(b.x0 - x0) <= PX_W && Math.abs(b.x1 - x1) <= PX_W && Math.abs(b.y0 - y0) <= PX_H && Math.abs(b.y1 - y1) <= PX_H;
+}
+
+test('divider share: splitting a pane keeps its share - A | B at 70/30, B split (h or v): A stays 70%, B and the new pane halve B\'s 30%', async () => {
+  for (const dir of ['h', 'v']) {
+    const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+    const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+    if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+    const tid = tabOfPane(a);
+    dragSplit(win, wrapOf(a), 0.7);
+    let bx = paneBoxes(win, tid);
+    ok(boxIs(bx['a.host'], 0, 0.7, 0, 1), dir + ': setup: a at 70% (' + fmtBox(bx['a.host']) + ')');
+    const c = await tSplit(win, b, dir, 'c.host');
+    if (!c) { ok(false, 'setup: c'); cleanup(env); return; }
+    bx = paneBoxes(win, tid);
+    ok(boxIs(bx['a.host'], 0, 0.7, 0, 1), dir + ': b split: a still 0..70% of the width; a ' + fmtBox(bx['a.host']) +
+       ' (flex a ' + show(a.el.style.flex) + ', new split ' + show(wrapOf(c).style.flex) + ')');
+    const halves = dir === 'h'
+      ? boxIs(bx['b.host'], 0.7, 0.85, 0, 1) && boxIs(bx['c.host'], 0.85, 1, 0, 1)
+      : boxIs(bx['b.host'], 0.7, 1, 0, 0.5) && boxIs(bx['c.host'], 0.7, 1, 0.5, 1);
+    ok(halves, dir + ': b and c halve b\'s old 30%; b ' + fmtBox(bx['b.host']) + ', c ' + fmtBox(bx['c.host']) +
+       ' (flex b ' + show(b.el.style.flex) + ', c ' + show(c.el.style.flex) + ')');
+    // One level deeper: c (in a 50/50 split inside b's share) split again, the other way.
+    const d = await tSplit(win, c, dir === 'h' ? 'v' : 'h', 'd.host');
+    const bx2 = paneBoxes(win, tid);
+    const mv = movedBoxes(bx, bx2, ['a.host', 'b.host']);
+    ok(!!d && mv.length === 0, dir + ': c split again: a and b do not move; moved: ' + show(mv));
+    const cd = bx2['c.host'], dd = bx2['d.host'], old = bx['c.host'];
+    const covers = cd && dd && old && Math.abs(Math.min(cd.x0, dd.x0) - old.x0) <= PX_W && Math.abs(Math.max(cd.x1, dd.x1) - old.x1) <= PX_W &&
+      Math.abs(Math.min(cd.y0, dd.y0) - old.y0) <= PX_H && Math.abs(Math.max(cd.y1, dd.y1) - old.y1) <= PX_H &&
+      Math.abs((cd.x1 - cd.x0) * (cd.y1 - cd.y0) - (dd.x1 - dd.x0) * (dd.y1 - dd.y0)) < 0.004;
+    ok(!!covers, dir + ': c and d halve c\'s old box ' + fmtBox(old) + '; c ' + fmtBox(cd) + ', d ' + fmtBox(dd));
+    cleanup(env);
+  }
+});
+
+test('divider share: closing a pane of a nested split leaves every other divider where it was (h, v, nested; a split login cancelled in flight moves nothing)', async () => {
+  const env = await mkTabEnv(TAB_PLAN([{action: 'connect', match: b => b.host === 'z.host',
+    response: {session_id: 'sid-z', alive: true}, delay: 300, once: true}]), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tid = tabOfPane(a);
+  const c = await tSplit(win, b, 'v', 'c.host');
+  const d = c && await tSplit(win, a, 'v', 'd.host');
+  if (!d) { ok(false, 'setup'); cleanup(env); return; }
+  // (a over d) | (b over c), outer 70/30, a over d 40/60, b over c 25/75.
+  dragSplit(win, wrapOf(a).parentElement, 0.7);
+  dragSplit(win, wrapOf(a), 0.4);
+  dragSplit(win, wrapOf(b), 0.25);
+  let bx = paneBoxes(win, tid);
+  ok(boxIs(bx['a.host'], 0, 0.7, 0, 0.4) && boxIs(bx['b.host'], 0.7, 1, 0, 0.25), 'setup: (a over d 40/60) | (b over c 25/75) at 70/30; ' +
+     show(Object.keys(bx).map(h => h + ' ' + fmtBox(bx[h]))));
+  const fails = [];
+  const check = (what, keep) => {
+    const now = paneBoxes(win, tid);
+    const mv = movedBoxes(bx, now, keep);
+    if (mv.length) fails.push(what + ': ' + mv.join('; '));
+    bx = now;
+  };
+  // A split started from c, Connect pressed, cancelled while it is in flight: nothing moves.
+  win.splitPane(c.id, 'h');
+  await until(() => !hidden($(win, 'ov')), 1000);
+  $(win, 'iH').value = 'z.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'p';
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await sleep(50);
+  win.cancelConnect();
+  await until(() => hidden($(win, 'ov')), 1000);
+  await sleep(30);
+  check('a split of c, login cancelled', ['a.host', 'b.host', 'c.host', 'd.host']);
+  // c closed: b takes the whole right column; a and d stay.
+  win.closePane(c.id); await sleep(30);
+  const nb = paneBoxes(win, tid)['b.host'];
+  if (!boxIs(nb, 0.7, 1, 0, 1)) fails.push('c closed: b should fill 70..100% x 0..100%, is ' + fmtBox(nb));
+  check('c closed', ['a.host', 'd.host']);
+  // a closed: d takes the left column; b stays.
+  win.closePane(a.id); await sleep(30);
+  const nd = paneBoxes(win, tid)['d.host'];
+  if (!boxIs(nd, 0, 0.7, 0, 1)) fails.push('a closed: d should fill 0..70% x 0..100%, is ' + fmtBox(nd));
+  check('a closed', ['b.host']);
+  ok(fails.length === 0, 'every close left the other dividers where they were; wrong: ' + show(fails));
+  cleanup(env);
+});
+
+test('divider share: a deeper close keeps outer dividers, and the saved layout keeps every ratio across a reload', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const [a, b] = await splitTabEnv(win, ['a.host', 'b.host']);
+  if (!needTabs(win) || !a || !b) { ok(false, 'setup'); cleanup(env); return; }
+  const tid = tabOfPane(a);
+  // a | (b over (c | e)): outer 30/70, b over (c|e) 60/40, c | e 20/80.
+  const c = await tSplit(win, b, 'v', 'c.host');
+  const e = c && await tSplit(win, c, 'h', 'e.host');
+  if (!e) { ok(false, 'setup'); cleanup(env); return; }
+  dragSplit(win, wrapOf(a), 0.3);
+  dragSplit(win, wrapOf(b), 0.6);
+  dragSplit(win, wrapOf(c), 0.2);
+  const before = paneBoxes(win, tid);
+  ok(boxIs(before['a.host'], 0, 0.3, 0, 1) && boxIs(before['b.host'], 0.3, 1, 0, 0.6) && boxIs(before['c.host'], 0.3, 0.44, 0.6, 1),
+     'setup: a | (b over (c | e)) at 30/70, 60/40, 20/80; ' + show(Object.keys(before).map(h => h + ' ' + fmtBox(before[h]))));
+  // Reload: every box comes back.
+  const snap = snapshotStorage(win);
+  cleanup(env);
+  const env2 = await mkTabEnv(TAB_PLAN(), snap, S4); const w2 = env2.win;
+  await until(() => paneList(w2).filter(p => p.sid).length === 4, 2000);
+  await sleep(50);
+  const P = h => paneList(w2).find(p => p.host === h);
+  const tid2 = tabOfPane(P('a.host'));
+  const after = paneBoxes(w2, tid2);
+  const mv = movedBoxes(before, after, ['a.host', 'b.host', 'c.host', 'e.host']);
+  ok(mv.length === 0, 'after a reload every pane is where it was; moved: ' + show(mv));
+  // Close c (deepest): e takes c | e's box; a and b stay.
+  w2.closePane(P('c.host').id); await sleep(30);
+  const x = paneBoxes(w2, tid2);
+  ok(movedBoxes(after, x, ['a.host', 'b.host']).length === 0 && boxIs(x['e.host'], 0.3, 1, 0.6, 1),
+     'c closed: a and b stay, e fills c | e\'s box (30..100% x 60..100%); moved ' + show(movedBoxes(after, x, ['a.host', 'b.host'])) +
+     ', e ' + fmtBox(x['e.host']));
+  // A split after the reload keeps the share too, and that is saved.
+  const f = await tSplit(w2, P('a.host'), 'v', 'f.host');
+  const y = paneBoxes(w2, tid2);
+  ok(!!f && boxIs(y['a.host'], 0, 0.3, 0, 0.5) && boxIs(y['f.host'], 0, 0.3, 0.5, 1) && movedBoxes(x, y, ['b.host', 'e.host']).length === 0,
+     'a split under after the reload: a and f halve a\'s 30% column, b and e stay; a ' + fmtBox(y['a.host']) + ', f ' + fmtBox(y['f.host']));
+  const snap2 = snapshotStorage(w2);
+  cleanup(env2);
+  const env3 = await mkTabEnv(TAB_PLAN(), snap2, S4); const w3 = env3.win;
+  await until(() => paneList(w3).filter(p => p.sid).length === 4, 2000);
+  await sleep(50);
+  const z = paneBoxes(w3, tabOfPane(paneList(w3).find(p => p.host === 'a.host')));
+  const mv3 = movedBoxes(y, z, ['a.host', 'b.host', 'e.host', 'f.host']);
+  ok(mv3.length === 0, 'and that layout comes back the same after a second reload; moved: ' + show(mv3));
+  cleanup(env3);
+});
+
+// =====================================================================
 // Feature 3a: spring-loaded tabs
 // =====================================================================
 test('spring: the tab on screen, dragged and held over another tab, brings that tab forward; dropped on a pane edge it merges there', async () => {

@@ -1342,9 +1342,11 @@ function removeAllTabs() {
 // Dot (worst pane state), label (the tab's name, else its active pane's
 // label), split marker and activity mark. Memoized: it runs from
 // updatePaneBadge, which runs on every output frame - the key holds only
-// strings that are cheap to build (the split shape is a walk of the
-// split wrappers, not of the terminals), so an output frame changes no
-// DOM here.
+// strings that are cheap to build (the split marker's key is a walk of
+// the split wrappers and their inline flex values, not of the terminals,
+// and holds whole-pixel boxes, so a drag that does not move a box by a
+// pixel and a window resize leave it equal), so an output frame changes
+// no DOM here.
 function _paneDotState(p) {
   if (p.sid) return p.reconnecting ? 'wait' : 'on';
   return p.connecting ? 'wait' : 'off';
@@ -1360,7 +1362,7 @@ function renderTab(t) {
   let ap = panes[t.lastActive];
   if (!ap || ps.indexOf(ap) < 0) ap = ps[0];
   let label = t.name || (ap ? (ap.label || '') : '');
-  let shape = ps.length > 1 ? _splitShape(_layoutNode(t.root)) : '';
+  let shape = ps.length > 1 ? _miniKey(_layoutNode(t.root)) : '';
   let active = t.id === activeTabId;
   let act = !!t.activity && !active;
   // Tabs 1..8 carry their shortcut; the number follows the strip order,
@@ -1388,9 +1390,12 @@ function renderTab(t) {
 }
 
 // The split marker: a 16x12 miniature of the tab's layout, one box per
-// pane, side by side or stacked as the real splits are (halves, not the
-// dragged proportions: at this size only the arrangement reads), the
-// tab's active pane lit. Whole-pixel boxes with a 1px gap, so it is
+// pane, side by side or stacked as the real splits are, in the splits'
+// proportions, the tab's active pane lit. The proportion is read from the
+// flex-grow of the split's two children - what the handle drag and the
+// restore write, empty meaning 1 (index.html: `.pane`, `.split-*` are
+// flex:1) - never measured: a hidden tab has no boxes, and measuring
+// would redraw on every window resize. Whole-pixel boxes with a 1px gap, so it is
 // sharp at 1x and 2x; colours come from the theme through CSS
 // (index.html `.tab-split`), none are written here.
 const MINI_W = 16, MINI_H = 12;
@@ -1420,6 +1425,23 @@ function _splitShape(el) {
   return (el.classList.contains('split-h') ? 'h(' : 'v(')
     + _splitKids(el).map(_splitShape).join(',') + ')';
 }
+// An element's share in its split: its inline flex-grow (style.flex may
+// read back as "0.7 1 0%"), 1 when none is set.
+function _flexGrow(el) {
+  let st = el && el.style;
+  if (!st) return 1;
+  let g = st.flexGrow;
+  if (g === undefined || g === null || g === '') g = st.flex;
+  let v = parseFloat(g);
+  return v > 0 ? v : 1;
+}
+// The first part takes ratio x (size - 1) whole pixels, the second the
+// rest after a 1px gap; each keeps at least 1px while there is room.
+function _miniSplit(size, ratio) {
+  let n = size - 1;
+  if (n < 2) return Math.max(1, Math.floor(n / 2));
+  return Math.max(1, Math.min(n - 1, Math.round(ratio * n)));
+}
 function _miniRects(el, x, y, w, h, out) {
   if (!el) return;
   if (el.classList.contains('pane')) {
@@ -1428,15 +1450,25 @@ function _miniRects(el, x, y, w, h, out) {
   }
   let kids = _splitKids(el);
   if (kids.length < 2) { _miniRects(kids[0], x, y, w, h, out); return; }
+  let ga = _flexGrow(kids[0]), gb = _flexGrow(kids[1]);
+  let ratio = ga / (ga + gb);
   if (el.classList.contains('split-h')) {
-    let w1 = Math.max(1, Math.floor((w - 1) / 2));
+    let w1 = _miniSplit(w, ratio);
     _miniRects(kids[0], x, y, w1, h, out);
     _miniRects(kids[1], x + w1 + 1, y, Math.max(1, w - w1 - 1), h, out);
   } else {
-    let h1 = Math.max(1, Math.floor((h - 1) / 2));
+    let h1 = _miniSplit(h, ratio);
     _miniRects(kids[0], x, y, w, h1, out);
     _miniRects(kids[1], x, y + h1 + 1, w, Math.max(1, h - h1 - 1), out);
   }
+}
+// renderTab's memo for the marker: the arrangement and every box in
+// whole pixels - it changes exactly when the drawing would.
+function _miniKey(node) {
+  if (!node) return '';
+  let rects = [];
+  _miniRects(node, 0, 0, MINI_W, MINI_H, rects);
+  return _splitShape(node) + '|' + rects.map(r => r.x + ',' + r.y + ',' + r.w + ',' + r.h).join(';');
 }
 const SVG_NS = 'http://www.w3.org/2000/svg';
 function _drawSplitMarker(sp, node, ap) {
@@ -1886,9 +1918,7 @@ function _detachPane(p) {
       if (ch !== p.el && !ch.classList.contains('split-handle')) { sibling = ch; break; }
     }
     if (sibling && wrap.parentNode) {
-      // The sibling inherits the wrapper's share of ITS parent.
-      sibling.style.flex = wrap.style.flex || '';
-      wrap.parentNode.replaceChild(sibling, wrap);
+      _unwrapSplit(wrap, sibling);
       _panesUnder(sibling).forEach(_resyncScroll);
     }
   }
@@ -1908,21 +1938,38 @@ function _panesUnder(el) {
   list.forEach(e => { let p = panes[e.getAttribute('data-pane')]; if (p) out.push(p); });
   return out;
 }
-// Put `el` beside `anchor` in a new split ('h' or 'v'); `first` puts it
-// before the anchor (left / top). The wrapper takes the anchor's place
-// and its share of the parent.
-function _placeBeside(anchor, el, dir, first) {
+// The two halves of "a split or a close moves no other divider"
+// (docs/invariants.md U9), shared by split, close, cancel and moves.
+// A split wrapper replacing `anchor` takes the anchor's place and its
+// share of the parent (inline flex); the anchor starts at an even half
+// inside it. Returns the wrapper holding the anchor and the handle; the
+// caller adds the other child.
+function _wrapInSplit(anchor, dir) {
   let wrap = document.createElement('div');
   wrap.className = 'split-' + dir;
   wrap.style.flex = anchor.style.flex || '';
   anchor.style.flex = '';
-  el.style.flex = '';
   let handle = document.createElement('div');
   handle.className = 'split-handle';
   anchor.parentNode.replaceChild(wrap, anchor);
-  wrap.appendChild(first ? el : anchor);
+  wrap.appendChild(anchor);
   wrap.appendChild(handle);
-  wrap.appendChild(first ? anchor : el);
+  return wrap;
+}
+// A split collapsing to one child: the child takes the wrapper's place
+// and inherits the wrapper's share of ITS parent.
+function _unwrapSplit(wrap, sibling) {
+  sibling.style.flex = wrap.style.flex || '';
+  wrap.parentNode.replaceChild(sibling, wrap);
+}
+// Put `el` beside `anchor` in a new split ('h' or 'v'); `first` puts it
+// before the anchor (left / top). The wrapper takes the anchor's place
+// and its share of the parent.
+function _placeBeside(anchor, el, dir, first) {
+  let wrap = _wrapInSplit(anchor, dir);
+  el.style.flex = '';
+  if (first) wrap.insertBefore(el, wrap.firstChild);
+  else wrap.appendChild(el);
 }
 // Show `t` with pane `id` active; the moved pane takes the focus. The
 // element was out of the document for a moment, which blurs a focused
@@ -2357,15 +2404,8 @@ function materializeTarget() {
   if (overlayMode === 'split' && pendingSplit) {
     let from = panes[pendingSplit.fromId];
     if (!from) { pendingSplit = null; return targetPane(); }
-    let dir = pendingSplit.dir;
-    let parent = from.el.parentNode;
-    let wrap = document.createElement('div');
-    wrap.className = 'split-' + dir;
-    let handle = document.createElement('div');
-    handle.className = 'split-handle';
-    parent.replaceChild(wrap, from.el);
-    wrap.appendChild(from.el);
-    wrap.appendChild(handle);
+    // The new split keeps the pane's share of its parent (U9).
+    let wrap = _wrapInSplit(from.el, pendingSplit.dir);
     let np = createPane(wrap);
     activatePane(np.id);
     connectingFor = np.id;
@@ -2413,10 +2453,7 @@ function cancelConnect() {
       }
       np.term.dispose();
       delete panes[np.id];
-      if (sibling && parent) {
-        sibling.style.flex = '';
-        parent.replaceChild(sibling, wrap);
-      }
+      if (sibling && parent) _unwrapSplit(wrap, sibling);   // keeps its share (U9)
       renderTab(t);   // back to one pane: its bar goes again
     }
     saveSessions();
@@ -2532,8 +2569,7 @@ function _destroyPane(id, terminate) {
     if (ch !== p.el && !ch.classList.contains('split-handle')) { sibling = ch; break; }
   }
   if (sibling && wrap.parentNode) {
-    sibling.style.flex = '';
-    wrap.parentNode.replaceChild(sibling, wrap);
+    _unwrapSplit(wrap, sibling);   // takes the split's share (U9)
   } else {
     p.el.remove();
   }
@@ -8343,13 +8379,22 @@ function toggleFullscreen(){
     dragging.a.style.flex=ratio+'';
     dragging.b.style.flex=(1-ratio)+'';
     fitVisiblePanes();
+    // The tab's miniature follows the proportion; renderTab's memo holds
+    // whole-pixel boxes, so only a move that changes one redraws it.
+    renderTab(dragTab());
+  }
+  function dragTab() {
+    let root=dragging&&dragging.wrap.closest?dragging.wrap.closest('.tab-root'):null;
+    return root?tabById(root.getAttribute('data-tab')):null;
   }
   function endDrag() {
     if(!dragging) return;
     dragging.handle.classList.remove('dragging');
     document.body.classList.remove('resizing','resizing-v');
+    let t=dragTab();
     dragging=null;
     fitVisiblePanes();
+    renderTab(t);
     saveSessions();
   }
   // Mouse events

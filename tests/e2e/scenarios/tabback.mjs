@@ -4,6 +4,10 @@
 //  - a tab renamed by a real double-click and typed text (Input.insertText)
 //    shows the name; it survives a reload;
 //  - the split marker is a miniature: one box per pane, at real size;
+//    the split handle dragged with the real mouse: the boxes follow the
+//    real proportion within ~300 ms of release, a window resize changes
+//    nothing in the marker; splitting the dragged pane keeps the other
+//    divider (+-1 px), closing the new pane puts both back;
 //  - spring-loaded tabs: the tab on screen (B) is pressed and moved onto
 //    tab A in the strip and held still - in a real strip the reorder
 //    moves B under the pointer, which must not stop A from coming
@@ -148,6 +152,73 @@ export async function run({ b, t }) {
     return {w: q.width, h: q.height, n: s.querySelectorAll('rect[data-pane]').length, on: s.querySelectorAll('rect[data-pane].on').length}; })()`);
   t.ok(!!mini && mini.n === 2 && mini.on === 1 && mini.w >= 12 && mini.w <= 24 && mini.h >= 8 && mini.h <= 18,
        `A's marker is a small miniature with two boxes, one lit (${J(mini)})`);
+  // 2b. The split handle dragged with the real mouse to ~70%: the
+  // miniature follows within ~300 ms of release, in the proportions the
+  // panes really have on screen; few DOM changes during the drag; a
+  // window resize (same proportions) changes nothing in it.
+  const rootSel = `#panes .tab-root[data-tab="${tA}"]`;
+  const miniVsReal = () => b.ev(`(() => {
+    const s = document.querySelector('${tabSel(tA)} .tab-split svg');
+    const pa = document.querySelector('${rootSel} .pane[data-pane="${A}"]'), pb = document.querySelector('${rootSel} .pane[data-pane="${A2}"]');
+    if (!s || !pa || !pb) return null;
+    const r = id => s.querySelector('rect[data-pane="' + id + '"]');
+    const ra = r(${J(A)}), rb = r(${J(A2)});
+    if (!ra || !rb) return null;
+    const wa = pa.getBoundingClientRect().width, wb = pb.getBoundingClientRect().width;
+    const xa = +ra.getAttribute('x'), la = +ra.getAttribute('width'), xb = +rb.getAttribute('x'), lb = +rb.getAttribute('width');
+    const drawable = xb + lb - xa - 1, want = wa / (wa + wb) * drawable;
+    return {ratio: Math.round(wa / (wa + wb) * 100), drawn: la, of: drawable, want: Math.round(want * 10) / 10,
+            gap: xb - (xa + la), ok: Math.abs(la - want) <= 1 && xb - (xa + la) === 1}; })()`);
+  const hr = await rect(`${rootSel} .split-h > .split-handle`);
+  const wr = await rect(`${rootSel} .split-h`);
+  t.ok(!!hr && !!wr, 'A\'s split has a visible handle');
+  if (hr && wr) {
+    await b.ev(`(() => { window.__miniMuts = 0; const s = document.querySelector('${tabSel(tA)} .tab-split');
+      window.__miniMo = new MutationObserver(l => { window.__miniMuts += l.length; });
+      window.__miniMo.observe(s, {attributes: true, childList: true, subtree: true, characterData: true}); return 1; })()`);
+    // 66%: 0.66 * 15 px = 9.9, so +-1 screen px of jitter never crosses a rounding edge.
+    const h0 = mid(hr), h1 = { x: wr.x + wr.w * 0.66, y: h0.y };
+    await mouse('mouseMoved', h0, 0);
+    await mouse('mousePressed', h0, 1);
+    await moveTo(h0, h1, 40);
+    for (let i = 0; i < 20; i++) { await mouse('mouseMoved', { x: h1.x + (i % 2 ? 1 : -1), y: h1.y }, 1); await sleep(10); }
+    await mouse('mouseMoved', h1, 1);
+    const during = await b.ev('window.__miniMuts');
+    await mouse('mouseReleased', h1, 0);
+    const t0 = Date.now();
+    const got = await until(async () => { const g = await miniVsReal(); return !!g && g.ok; }, 2000, 20);
+    const took = Date.now() - t0;
+    const g = await miniVsReal();
+    t.ok(got >= 0 && took <= 400, `dragged to ~66%: A's box drawn in the real proportion within ~300 ms of release (${took} ms incl. CDP; ${J(g)})`);
+    t.ok(during <= 20, `60 mousemoves during the drag changed the marker's DOM ${during} times (only when a box's pixel size changes)`);
+    await b.ev('window.__miniMuts = 0');
+    await b.send('Emulation.setDeviceMetricsOverride', { width: 1000, height: 700, deviceScaleFactor: 1, mobile: false });
+    await sleep(500);
+    await b.send('Emulation.clearDeviceMetricsOverride');
+    await sleep(500);
+    const afterResize = await b.ev('(() => { const n = window.__miniMuts; window.__miniMo.disconnect(); return n; })()');
+    const g2 = await miniVsReal();
+    t.ok(afterResize === 0 && !!g2 && g2.ok, `window resized and back: the marker untouched (${afterResize} DOM changes) and still right (${J(g2)})`);
+  }
+  // 2c. Splitting the dragged pane keeps the divider: A stays where it
+  // was (+-1 px), A2 and the new pane halve A2's width; closing the new
+  // pane gives A2 its width back, A still unmoved.
+  const paneW = id => b.ev(`(() => { const e = document.querySelector('${rootSel} .pane[data-pane="${id}"]');
+    if (!e) return null; const q = e.getBoundingClientRect(); return {x: Math.round(q.x), w: Math.round(q.width)}; })()`);
+  const wA0 = await paneW(A), wA20 = await paneW(A2);
+  const A3 = await splitOf(A2, 'h');
+  await sleep(300);
+  const wA1 = await paneW(A), wA21 = await paneW(A2), wA31 = await paneW(A3);
+  t.ok(!!wA0 && !!wA1 && Math.abs(wA1.w - wA0.w) <= 1,
+       `A2 split: A keeps its width (${J(wA0)} -> ${J(wA1)})`);
+  t.ok(!!wA21 && !!wA31 && Math.abs(wA21.w - wA31.w) <= 4 && Math.abs(wA21.w + wA31.w - wA20.w) <= 6,
+       `A2 and the new pane halve A2's old ${J(wA20)}: ${J(wA21)} + ${J(wA31)}`);
+  await b.ev(`closePane(${J(A3)})`);
+  await until(async () => await shape(tA) === `(h ${A} ${A2})`, 3000);
+  await sleep(300);
+  const wA2 = await paneW(A), wA22 = await paneW(A2);
+  t.ok(!!wA2 && !!wA22 && Math.abs(wA2.w - wA0.w) <= 1 && Math.abs(wA22.w - wA20.w) <= 1,
+       `the new pane closed: A and A2 back where they were (A ${J(wA0)} -> ${J(wA2)}, A2 ${J(wA20)} -> ${J(wA22)})`);
   // Back to one pane in A for the merge below.
   await b.ev(`closePane(${J(A2)})`);
   await until(async () => await shape(tA) === A, 3000);
