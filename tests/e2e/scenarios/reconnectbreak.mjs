@@ -89,6 +89,8 @@ export async function run({ b, t }) {
           out.overlaps.push(pe.tagName + ' x ' + (o.getAttribute('title') || o.className));
       }
       out.buttonsAllShown = Rt.filter(e => e.classList.contains('pane-btn')).length;
+      // "Move to tab" is not shown with one tab (nowhere to move to).
+      out.buttonsWant = tabs.length > 1 ? 7 : 6;
       out.partsInBar = u.every(q => q.left >= out.bar.l - 1 && q.right <= out.bar.r + 1 && q.top >= out.bar.t - 1 && q.bottom <= out.bar.b + 1);
     }
     return out;
@@ -99,7 +101,7 @@ export async function run({ b, t }) {
     const cw = g.ctl.r - g.ctl.l, mid = (g.bar.l + g.bar.r) / 2, cl = mid - cw / 2, cr = mid + cw / 2, GAP = 2;
     t.ok(g.overlaps.length === 0, `${what}: nothing overlaps it ${J(g.overlaps)}`);
     t.ok(g.btnHit && g.btnInView, `${what}: Reconnect clickable (hit ${g.btnHit}, in view ${g.btnInView})`);
-    t.ok(g.buttonsAllShown >= 7, `${what}: all 7 pane buttons still shown (${g.buttonsAllShown})`);
+    t.ok(g.buttonsAllShown >= g.buttonsWant, `${what}: all ${g.buttonsWant} pane buttons still shown (${g.buttonsAllShown})`);
     if (cr <= g.btnsL - GAP && cl >= g.leftR + GAP)
       t.ok(centreOff(g, g.bar) <= 4, `${what}: room to centre - centred, off ${centreOff(g, g.bar).toFixed(1)} px (bar ${g.bar.l}..${g.bar.r}, ctl ${g.ctl.l}..${g.ctl.r}, badge/tag end ${Math.round(g.leftR)}, buttons from ${Math.round(g.btnsL)}, msg ${J(g.msg)})`);
     else if (cr > g.btnsL - GAP) {

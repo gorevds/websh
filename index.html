@@ -55,6 +55,8 @@
     .tab:hover{background:rgba(255,255,255,.05);color:var(--tx)}
     .tab.active{background:var(--bg);border-color:var(--bd);color:var(--tx)}
     .tab.dragging{opacity:.75;cursor:grabbing}
+    /* One tab: nowhere to move a pane to (renderPaneTools keeps the class) */
+    body.one-tab [data-act="move-to"]{display:none}
     .tab-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;background:var(--dim);padding:0}
     .tab-dot.s-on{background:var(--ok)}
     .tab-dot.s-wait{background:var(--wn)}

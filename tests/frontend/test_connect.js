@@ -13702,7 +13702,8 @@ test('reconnect in the bar: a split pane\'s Reconnect sits in its own pane bar, 
   ok(!!c && !c.closest('.pane-term') && !c.closest('.pane-overlays'), 'not over the terminal (.pane-term / .pane-overlays)');
   ok(barShown(env, a), 'the bar is shown');
   const keep = [['badge', '[data-pane-badge]'], ['label', '[data-pane-label]'], ['persistent tag', '.pane-tag.persistent'],
-                ['split', '[title="Split horizontal"]'], ['close', '[title="Close pane"]'], ['move to tab', '[data-act="move-to"]']];
+                ['split', '[title="Split horizontal"]'], ['close', '[title="Close pane"]'], ['move to new tab', '[data-act="to-tab"]']];
+  // (Not "Move to tab": with this one tab it is not shown at all - see hide:.)
   const gone = keep.filter(([, sel]) => !rcShown(env, bar && bar.querySelector(sel))).map(([n]) => n);
   ok(gone.length === 0, 'badge, label, persistent tag and the buttons stay in the bar; missing: ' + JSON.stringify(gone));
   ok(rcButtons(env, a).length === 1, 'exactly one Reconnect button for the pane; got ' + rcButtons(env, a).length);
@@ -13885,6 +13886,443 @@ test('reconnect strip: a lone pane\'s transfer progress still shows next to the 
   if (a.upload) win.cancelTransfer(a.id);
   cleanup(env);
 });
+
+// =====================================================================
+// A control whose action is impossible in the current layout is not
+// shown (owner, 2026-10-06: "the Move to tab button should be removed
+// when there are no other tabs"). Rule (coordinator): structurally
+// impossible -> HIDDEN, not disabled, and back as soon as it becomes
+// possible; transiently unavailable (upload/download while disconnected
+// or during a transfer) -> stays visible and disabled.
+// Written from the request, before the change.
+//
+// Structural cases found by the audit:
+//   [data-act="move-to"] in #paneTools (a lone pane) and in every pane
+//     bar (2+ panes in a tab): "Move to tab" with no other tab.
+//   The tab menu's "Move into tab": with no other tab.
+// Hidden means: .h / [hidden] / display:none on it or an ancestor (the
+// layout model's cascade), so a CSS rule keyed on a body/strip class is
+// as good as a class on the button.
+// =====================================================================
+const moveShown = env => visibleAll(env, '[data-act="move-to"]');
+const intoItem = env => findItem(env, /^Move into tab/i);
+function noMoveAnywhere(env, what) {
+  const v = moveShown(env);
+  ok(v.length === 0, what + ': no "Move to tab" button shown anywhere; shown: ' +
+     show(v.map(b => b.closest('#paneTools') ? '#paneTools' : 'bar of ' + (b.closest('.pane') || {getAttribute: () => '?'}).getAttribute('data-pane'))));
+}
+function tabMenuHasInto(env, tEl) {
+  tabMenu(env.win, tEl);
+  const it = intoItem(env);
+  const items = itemsShown(env).map(itemText);
+  const r = {into: !!it, disabled: !!it && it.getAttribute('aria-disabled') === 'true', items};
+  closeMenusNow(env);
+  return r;
+}
+function closeMenusNow(env) {
+  keyAt(env.win, 'Escape', 'Escape');
+  if (openMenus(env).length) env.win.closeMenus(false);
+}
+
+test('hide: with one tab "Move to tab" is not shown - not in the top bar of a lone pane, not in a pane bar, not in the tab menu', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needTools(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  ok(toolsShown(env), 'a lone pane: #paneTools shown');
+  const mt = toolBtn(win, 'move-to');
+  ok(!!mt, '#paneTools still has the [data-act="move-to"] button in the DOM (to come back)');
+  ok(!!mt && env.lay.hidden(mt), 'one tab: #paneTools "Move to tab" is hidden; it is ' +
+     (mt ? (mt.disabled ? 'shown, disabled' : 'shown and enabled') : 'missing'));
+  ACTS.forEach(act => ok(!env.lay.hidden(toolBtn(win, act)), 'the other pane actions stay: [data-act=' + act + '] shown'));
+  noMoveAnywhere(env, 'one tab, one pane');
+  const m1 = tabMenuHasInto(env, activeTab(win));
+  ok(!m1.into, 'one tab: the tab menu has no "Move into tab" item (not even a disabled one); items: ' + show(m1.items));
+  ok(m1.items.some(x => /^Rename/i.test(x)) && m1.items.some(x => /^Close/i.test(x)), 'Rename and Close are still in the menu; items: ' + show(m1.items));
+  // A split: two panes, still one tab.
+  const b = await tSplit(win, a, 'h', 'b.host');
+  if (!b) { ok(false, 'split'); cleanup(env); return; }
+  await sleep(30);
+  ok(barShown(env, a) && barShown(env, b), 'two panes: both bars shown');
+  [a, b].forEach(p => {
+    const bar = barOf(p);
+    const mv = bar && bar.querySelector('[data-act="move-to"]');
+    ok(!!mv && env.lay.hidden(mv), p.host + ': the bar\'s "Move to tab" is hidden with one tab; it is ' +
+       (mv ? (env.lay.hidden(mv) ? 'hidden' : (mv.disabled ? 'shown, disabled' : 'shown and enabled')) : 'missing'));
+    const keep = [['Move to new tab', '[data-act="to-tab"]'], ['split', '[title="Split horizontal"]'],
+                  ['split v', '[title="Split vertical"]'], ['close', '[title="Close pane"]'],
+                  ['upload', '[data-upload-btn]'], ['download', '[data-download-btn]']];
+    const gone = keep.filter(([, s]) => env.lay.hidden(bar.querySelector(s))).map(([n]) => n);
+    ok(gone.length === 0, p.host + ': the other bar buttons stay shown (Move to new tab is possible: the tab has 2 panes); hidden: ' + show(gone));
+  });
+  noMoveAnywhere(env, 'one tab, two panes');
+  const m2 = tabMenuHasInto(env, activeTab(win));
+  ok(!m2.into, 'one tab with a split: no "Move into tab" in its menu; items: ' + show(m2.items));
+  // Transient stays disabled, not hidden: a dropped pane's upload/download.
+  win.closePane(b.id);
+  await until(() => paneList(win).length === 1, 500);
+  await sleep(30);
+  rcDrop(win, a);
+  await sleep(50);
+  const up = toolBtn(win, 'upload'), dn = toolBtn(win, 'download');
+  ok(toolsShown(env) && !env.lay.hidden(up) && up.disabled && !env.lay.hidden(dn) && dn.disabled,
+     'disconnected (transient): upload/download stay shown and disabled; upload ' +
+     (env.lay.hidden(up) ? 'hidden' : (up.disabled ? 'disabled' : 'enabled')) + ', download ' + (env.lay.hidden(dn) ? 'hidden' : (dn.disabled ? 'disabled' : 'enabled')));
+  noMoveAnywhere(env, 'one tab, disconnected');
+  cleanup(env);
+});
+
+test('hide: a second tab brings "Move to tab" back at once; closing it again hides it at once (x, middle click, Alt+W)', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !needTools(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'second tab'); cleanup(env); return; }
+  await sleep(30);
+  const tA = tabElOfPane(win, a), tB = tabElOfPane(win, b);
+  const mt = () => toolBtn(win, 'move-to');
+  ok(activeTab(win) === tB && !env.lay.hidden(mt()) && !mt().disabled, 'two tabs, B (lone) in front: #paneTools "Move to tab" shown and enabled');
+  const mB = tabMenuHasInto(env, tB);
+  ok(mB.into && !mB.disabled, 'two tabs: B\'s menu has an enabled "Move into tab"; items: ' + show(mB.items));
+  clickTab(win, tA);
+  await until(() => activeTab(win) === tA, 500);
+  await sleep(20);
+  ok(!env.lay.hidden(mt()), 'A (lone) in front: "Move to tab" shown');
+  // B closes in the background: A in front never changes pane or tab.
+  closeTabX(win, tB);
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && activeTab(win) === tA, 'B closed by its x; A still in front');
+  ok(env.lay.hidden(mt()), 'the other tab closed in the background: A\'s "Move to tab" is hidden at once; it is shown' +
+     (mt().disabled ? ' (disabled)' : ' and enabled'));
+  const mA = tabMenuHasInto(env, tA);
+  ok(!mA.into, 'and A\'s menu lost "Move into tab"; items: ' + show(mA.items));
+  // A split tab in front, another tab closed by a middle click.
+  const a2 = await tSplit(win, a, 'h', 'a2.host');
+  const c = a2 && await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'split + third tab'); cleanup(env); return; }
+  clickTab(win, tA);
+  await until(() => activeTab(win) === tA, 500);
+  await sleep(20);
+  const barMv = p => barOf(p) && barOf(p).querySelector('[data-act="move-to"]');
+  ok([a, a2].every(p => !env.lay.hidden(barMv(p))), 'two tabs: both bars of A show "Move to tab"');
+  middleClick(win, tabElOfPane(win, c));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1, 'C closed by a middle click');
+  ok([a, a2].every(p => env.lay.hidden(barMv(p))), 'one tab left: the bars\' "Move to tab" are hidden at once; shown on: ' +
+     show([a, a2].filter(p => !env.lay.hidden(barMv(p))).map(p => p.host)));
+  // The split tab hidden behind a lone tab; the lone tab closed by Alt+W.
+  const d = await tNewTab(win, 'd.host');
+  if (!d) { ok(false, 'tab D'); cleanup(env); return; }
+  await sleep(20);
+  ok(!env.lay.hidden(mt()), 'D (lone) in front, two tabs: "Move to tab" shown');
+  typeIn(win, d, 'KeyW', 'w', {alt: true});
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && activeTab(win) === tA, 'Alt+W closed D; A (split) in front');
+  noMoveAnywhere(env, 'after Alt+W left one tab');
+  ok(!tabMenuHasInto(env, tA).into, 'and no "Move into tab" in A\'s menu');
+  cleanup(env);
+});
+
+test('hide: merging the last other tab away hides "Move to tab"; "Move to new tab" brings it back', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !needTools(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  const tA = tabOfPane(a);
+  // B's lone pane by its top-bar "Move to tab" into A.
+  const tb = toolBtn(win, 'move-to');
+  ok(!!tb && !env.lay.hidden(tb), 'two tabs: "Move to tab" shown in the top bar');
+  if (tb) press(win, tb);
+  const err = await chooseTarget(env, null, tabLabel(tabById(win, tA)));
+  ok(!err, 'moved b into A: ' + (err || 'ok'));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && panesOfTab(win, tA).length === 2, 'one tab, two panes');
+  noMoveAnywhere(env, 'after the last other tab was emptied by a move');
+  // "Move to new tab" from a bar: two tabs again.
+  const toTab = barOf(a) && barOf(a).querySelector('[data-act="to-tab"]');
+  if (toTab) press(win, toTab);
+  await until(() => tabEls(win).length === 2, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 2, '"Move to new tab": two tabs');
+  ok(!env.lay.hidden(toolBtn(win, 'move-to')), 'a pane moved to a new tab (lone, in front): "Move to tab" shown again');
+  clickTab(win, tabById(win, tabOfPane(b)));
+  await until(() => tabOfPane(b) === tabId(activeTab(win)), 500);
+  await sleep(20);
+  ok(!env.lay.hidden(toolBtn(win, 'move-to')), 'and in the other (lone) tab too');
+  // The tab menu's "Move into tab": the last merge.
+  const into = tabMenuHasInto(env, tabElOfPane(win, a));
+  ok(into.into && !into.disabled, 'two tabs: "Move into tab" in the menu; items: ' + show(into.items));
+  tabMenu(win, tabElOfPane(win, a));
+  const err2 = await chooseTarget(env, /^Move into tab/i, tabLabel(tabElOfPane(win, b)));
+  ok(!err2, 'merged a\'s tab into b\'s by the menu: ' + (err2 || 'ok'));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1, 'one tab after the merge');
+  noMoveAnywhere(env, 'after a merge by the tab menu');
+  ok(!tabMenuHasInto(env, activeTab(win)).into, 'no "Move into tab" left in the menu');
+  // A tab dragged onto a pane: the hook the drag ends in.
+  const c = await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'tab C'); cleanup(env); return; }
+  await sleep(20);
+  ok(visibleAll(env, '[data-act="move-to"]').length >= 1, 'C opened: "Move to tab" shown');
+  win.mergeTabInto(tabOfPane(c), a.id, 'left');
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  noMoveAnywhere(env, 'after a tab was dragged into the other one (mergeTabInto)');
+  cleanup(env);
+});
+
+test('hide: after a reload "Move to tab" follows the restored tabs - hidden with one, shown with two', async () => {
+  const env1 = await mkTabEnv(TAB_PLAN(), null, S4); const w1 = env1.win;
+  const a = await tConnect(w1, 'a.host');
+  if (!needTabs(w1) || !a) { ok(false, 'setup'); cleanup(env1); return; }
+  await sleep(50);
+  const snap1 = snapshotStorage(w1);
+  const a2 = await tSplit(w1, a, 'h', 'a2.host');
+  await sleep(50);
+  const snap2 = snapshotStorage(w1);
+  const c = a2 && await tNewTab(w1, 'c.host');
+  await sleep(50);
+  const snap3 = snapshotStorage(w1);
+  cleanup(env1);
+  if (!c) { ok(false, 'setup: split and a second tab'); return; }
+  // One tab, one pane.
+  let env = await mkTabEnv(TAB_PLAN(), snap1, S4); let win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 1, 2000);
+  await sleep(50);
+  ok(tabEls(win).length === 1 && toolsShown(env), 'reload, one tab with one pane: pane actions in the top bar');
+  noMoveAnywhere(env, 'reload, one tab with one pane');
+  cleanup(env);
+  // One tab, two panes.
+  env = await mkTabEnv(TAB_PLAN(), snap2, S4); win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 2, 2000);
+  await sleep(50);
+  ok(tabEls(win).length === 1 && paneList(win).every(p => barShown(env, p)), 'reload, one tab with a split: both bars shown');
+  noMoveAnywhere(env, 'reload, one tab with a split');
+  cleanup(env);
+  // Two tabs: shown in the lone tab's top bar and in the split tab's bars.
+  env = await mkTabEnv(TAB_PLAN(), snap3, S4); win = env.win;
+  await until(() => paneList(win).filter(p => p.sid).length === 3, 2000);
+  await sleep(50);
+  ok(tabEls(win).length === 2, 'reload, two tabs');
+  const pc = paneList(win).find(p => p.host === 'c.host');
+  ok(!!pc && tabOfPane(pc) === tabId(activeTab(win)), 'C (lone) in front');
+  ok(!env.lay.hidden(toolBtn(win, 'move-to')), 'reload, two tabs: "Move to tab" shown in the top bar');
+  const pa = paneList(win).find(p => p.host === 'a.host');
+  if (pa) {
+    clickTab(win, tabElOfPane(win, pa));
+    await until(() => tabOfPane(pa) === tabId(activeTab(win)), 500);
+    await sleep(30);
+  }
+  const shownBars = paneList(win).filter(p => p.host !== 'c.host')
+    .filter(p => { const m = barOf(p) && barOf(p).querySelector('[data-act="move-to"]'); return m && !env.lay.hidden(m); });
+  ok(shownBars.length === 2, 'reload, two tabs: both bars of the split tab show "Move to tab"; shown on ' + shownBars.length);
+  cleanup(env);
+});
+
+
+test('hide: the only tab has no drag - no dimmed tab, no strip change, the press stays a click; with two tabs a drag still reorders', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const a2 = a && await tSplit(win, a, 'h', 'a2.host');
+  if (!needTabs(win) || !a2) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  const tA = activeTab(win);
+  const strip0 = $(win, 'tabs').innerHTML, shape0 = show(shapesNow(win));
+  const m = pointer(win);
+  const [x0, y0] = centre(tA);
+  let look = false;
+  const mo = new win.MutationObserver(() => {
+    if (win.document.querySelector('.tab.dragging') || win.document.body.classList.contains('pane-moving')) look = true;
+  });
+  mo.observe(win.document.body, {attributes: true, subtree: true, attributeFilter: ['class']});
+  const lab = tA.querySelector('.tab-label');
+  m.down(lab, x0, y0);
+  m.move(lab, x0 + 30, y0);
+  m.move($(win, 'tabs'), x0 + 80, y0 + 2);
+  // Over its own pane's edge, then released there.
+  const [ex, ey] = edgePoint(a.el, 'left');
+  const into = a.el.querySelector('.pane-term') || a.el;
+  m.move(into, ex, ey);
+  await sleep(700);                       // past the spring delay
+  const zone = win.document.querySelector('.drop-zone-left,.drop-zone-right,.drop-zone-top,.drop-zone-bottom');
+  m.up(into, ex, ey);
+  await sleep(30);
+  mo.disconnect();
+  ok(!look, 'the only tab, pressed and moved: no drag look at any moment (.tab.dragging / body.pane-moving)');
+  ok(!zone, 'no drop zone shown on its own pane');
+  ok($(win, 'tabs').innerHTML === strip0 || tabEls(win).length === 1, 'the strip is as it was');
+  ok(show(shapesNow(win)) === shape0 && tabEls(win).length === 1, 'the layout is unchanged; got ' + show(shapesNow(win)));
+  ok(noDragLeft(win), 'nothing left in a drag state');
+  // The press is still a click: a following click on a pane button is
+  // not swallowed (no "click after drag" block), and a double-click renames.
+  // websh swallows the first click within 400 ms after a real drag.
+  let got = false;
+  const probe = () => { got = true; };
+  lab.addEventListener('click', probe);
+  lab.dispatchEvent(new win.MouseEvent('click', {bubbles: true, cancelable: true, button: 0}));
+  lab.removeEventListener('click', probe);
+  ok(got, 'the next click right after the press-and-move is not swallowed as a "click after a drag"');
+  ok(needRename(env, tA), 'a double-click on the only tab still renames it');
+  // Two tabs: the same gesture drags and reorders.
+  const b = await tNewTab(win, 'b.host');
+  if (!b) { ok(false, 'second tab'); cleanup(env); return; }
+  await sleep(30);
+  const tB = tabElOfPane(win, b);
+  const m2 = pointer(win);
+  const [bx, by] = centre(tB);
+  const [ax] = centre(tA);
+  m2.down(tB.querySelector('.tab-label'), bx, by);
+  m2.move(tB.querySelector('.tab-label'), bx - 10, by);
+  const dragging = !!win.document.querySelector('.tab.dragging');
+  m2.move(tA.querySelector('.tab-label'), ax - (tA.getBoundingClientRect().width / 2) + 2, by);
+  m2.up(tA.querySelector('.tab-label'), ax - (tA.getBoundingClientRect().width / 2) + 2, by);
+  await sleep(30);
+  ok(dragging, 'two tabs: the drag look is there');
+  ok(tabEls(win)[0] === tB, 'two tabs: B dragged before A is now first; order ' + show(tabEls(win).map(t => tabLabel(t))));
+  cleanup(env);
+});
+
+test('hide (break): a "Move to tab" menu open when the last other tab goes is closed, and the button is gone', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  // b in front (lone): open its top-bar menu, then A closes by another path.
+  press(win, toolBtn(win, 'move-to'));
+  await until(() => targetItems(env).length >= 1, 300);
+  ok(targetItems(env).length === 1, 'the menu lists A');
+  win.closeTab(tabOfPane(a));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(openMenus(env).length === 0, 'A closed while the menu was open: the menu is gone (not left listing a dead tab or "No other tabs"); menus: ' + show(itemsShown(env).map(itemText)));
+  noMoveAnywhere(env, 'after the other tab closed under an open menu');
+  // The tab menu open when the other tab goes.
+  const c = await tNewTab(win, 'c.host');
+  if (!c) { ok(false, 'tab C'); cleanup(env); return; }
+  await sleep(20);
+  tabMenu(win, tabElOfPane(win, b));
+  ok(!!intoItem(env), 'two tabs: "Move into tab" in B\'s menu');
+  win.closeTab(tabOfPane(c));
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(20);
+  ok(openMenus(env).length === 0, 'C closed while B\'s menu was open: the menu is gone');
+  ok(!tabMenuHasInto(env, activeTab(win)).into, 'reopened: no "Move into tab"');
+  cleanup(env);
+});
+
+test('hide (break): "+" then Escape (and a failed connect) creates no tab and never shows "Move to tab"', async () => {
+  const plan = TAB_PLAN();
+  // The third connect fails: c.host is refused.
+  plan.splice(1, 0, {action: 'connect', match: bd => bd && bd.host === 'bad.host', response: {error: 'Authentication failed'}});
+  const env = await mkTabEnv(plan, null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  await sleep(30);
+  let flick = [];
+  const mt = toolBtn(win, 'move-to');
+  const watch = () => { if (mt && !env.lay.hidden(mt)) flick.push(tabEls(win).length + ' tabs'); };
+  const mo = new win.MutationObserver(watch);
+  mo.observe(win.document.body, {attributes: true, subtree: true, childList: true});
+  for (let i = 0; i < 3; i++) {
+    press(win, $(win, 'tabNew'));
+    await until(() => !hidden($(win, 'ov')), 500);
+    watch();
+    keyAt(win, 'Escape', 'Escape');
+    await until(() => hidden($(win, 'ov')), 500);
+  }
+  // Alt+T from the terminal, Escape.
+  typeIn(win, a, 'KeyT', 't', {alt: true});
+  await until(() => !hidden($(win, 'ov')), 500);
+  watch();
+  keyAt(win, 'Escape', 'Escape');
+  await until(() => hidden($(win, 'ov')), 500);
+  // A connect that fails.
+  press(win, $(win, 'tabNew'));
+  await until(() => !hidden($(win, 'ov')), 500);
+  $(win, 'iH').value = 'bad.host'; $(win, 'iU').value = 'u'; $(win, 'iPw').value = 'x';
+  win.doConnect();
+  await sleep(300);
+  watch();
+  mo.disconnect();
+  ok(tabEls(win).length === 1, 'still one tab; got ' + tabEls(win).length);
+  ok(flick.length === 0, '"Move to tab" was never shown while no second tab existed; seen with: ' + show(flick.slice(0, 5)));
+  noMoveAnywhere(env, 'after "+"/Escape, Alt+T/Escape and a failed connect');
+  if (!hidden($(win, 'ov'))) { keyAt(win, 'Escape', 'Escape'); win.cancelConnect && win.cancelConnect(); }
+  cleanup(env);
+});
+
+test('hide (break): tabs opened and closed fast, by every path - the button always matches the tab count', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  if (!needTabs(win) || !a) { ok(false, 'setup'); cleanup(env); return; }
+  const bad = [];
+  const check = (what) => {
+    const n = tabEls(win).length;
+    const shown = moveShown(env).length;
+    const t = activeTab(win), ps = t ? panesOfTab(win, tabId(t)) : [];
+    const want = n < 2 ? 0 : ps.length;      // lone: 1 in the top bar; split: one per bar
+    if (shown !== want) bad.push(what + ': ' + n + ' tabs, ' + ps.length + ' panes in front, ' + shown + ' shown (want ' + want + ')');
+    const into = tabMenuHasInto(env, t).into;
+    if (into !== (n > 1)) bad.push(what + ': "Move into tab" ' + (into ? 'listed' : 'missing') + ' with ' + n + ' tabs');
+  };
+  const HOW = ['x', 'middle', 'closeTab', 'closePane', 'Alt+W'];
+  let anchor = a;
+  for (let i = 0; i < 10; i++) {
+    const p = await tNewTab(win, 'n' + i + '.host');
+    if (!p) { bad.push('round ' + i + ': no tab'); break; }
+    check('round ' + i + ' opened');
+    if (i % 3 === 1) { await tSplit(win, p, 'v', 's' + i + '.host'); check('round ' + i + ' split'); }
+    // Even rounds close the old tab (from the new one in front), odd the new one (in front).
+    const victim = i % 2 ? tabElOfPane(win, p) : tabElOfPane(win, anchor);
+    const how = HOW[i % HOW.length];
+    if (how === 'x') closeTabX(win, victim);
+    else if (how === 'middle') middleClick(win, victim);
+    else if (how === 'closeTab') win.closeTab(tabId(victim));
+    else if (how === 'closePane') panesOfTab(win, tabId(victim)).forEach(q => win.closePane(q.id));
+    else { if (activeTab(win) !== victim) { clickTab(win, victim); await until(() => activeTab(win) === victim, 300); }
+           typeIn(win, panesOfTab(win, tabId(victim))[0], 'KeyW', 'w', {alt: true}); }
+    await until(() => tabEls(win).length === 1, 500);
+    check('round ' + i + ' closed by ' + how);
+    anchor = paneList(win).find(q => tabOfPane(q) === tabId(tabEls(win)[0]));
+    if (!anchor) { bad.push('round ' + i + ': no pane left'); break; }
+  }
+  ok(bad.length === 0, 'the button and the menu item followed the tab count at every step; wrong: ' + show(bad.slice(0, 6)));
+  cleanup(env);
+});
+
+test('hide (break): a tab dragged onto a pane of the last other tab merges, and the button goes with it', async () => {
+  const env = await mkTabEnv(TAB_PLAN(), null, S4); const win = env.win;
+  const a = await tConnect(win, 'a.host');
+  const b = a && await tNewTab(win, 'b.host');
+  if (!needTabs(win) || !b) { ok(false, 'setup'); cleanup(env); return; }
+  clickTab(win, tabElOfPane(win, a));
+  await until(() => tabOfPane(a) === tabId(activeTab(win)), 500);
+  await sleep(30);
+  ok(moveShown(env).length === 1, 'two tabs, A in front: "Move to tab" in the top bar');
+  const m = grabTab(win, tabElOfPane(win, b));
+  const release = overEdge(m, a, 'right');
+  release();
+  await until(() => tabEls(win).length === 1, 500);
+  await sleep(30);
+  ok(tabEls(win).length === 1 && panesOfTab(win, tabOfPane(a)).length === 2, 'B dragged onto A\'s right edge: one tab, two panes; got ' + show(shapesNow(win)));
+  noMoveAnywhere(env, 'after the second-to-last tab was dragged into the last');
+  ok(!tabMenuHasInto(env, activeTab(win)).into, 'no "Move into tab" in the menu');
+  // And the merged-into tab can no longer be dragged (one tab).
+  const tA = activeTab(win);
+  const m2 = pointer(win); const [x, y] = centre(tA);
+  m2.down(tA.querySelector('.tab-label'), x, y); m2.move(tA.querySelector('.tab-label'), x + 40, y);
+  ok(!win.document.querySelector('.tab.dragging'), 'the now only tab shows no drag look');
+  m2.up(tA.querySelector('.tab-label'), x + 40, y);
+  cleanup(env);
+});
+
 
 // =====================================================================
 // A stray rejection used to take node down mid-run with no summary, so

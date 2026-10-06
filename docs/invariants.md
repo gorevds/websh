@@ -275,6 +275,28 @@ size changes). Guard: frontend `divider share: …`, `marker ratio: …`;
 e2e `tabback` (a real handle drag, then a split and a close, measured
 in pixels).
 
+**U10. An impossible action is not shown; a briefly unavailable one is
+disabled.** With one tab there is nowhere to move a pane: every "Move
+to tab" button (`[data-act=move-to]`, the top bar of a lone pane and
+every pane bar) is hidden, the tab menu has no "Move into tab", and
+the only tab cannot be dragged (no dimmed tab, no grabbing cursor; the
+release is a click and the next click is not swallowed). They come
+back the moment a second tab exists, and go the moment it is gone by
+any path: its x, a middle click, Alt+W, its last pane closed, its pane
+moved away, a merge by menu or drag; and after a reload. `+` then
+Escape, or a failed connect, makes no tab and shows nothing. Upload /
+download while disconnected or during a transfer stay visible and
+disabled: hiding them would make the bars jump on every drop. The
+owner asked on 2026-10-06 ("remove Move to tab when there are no other
+tabs"); before, the button opened a menu saying "No other tabs" and
+the tab menu showed a greyed item. The tab count is part of
+`renderPaneTools`' memo (body `one-tab`): without it, a background
+tab closing left the button up. A bar's button set changing also
+changes the width the Reconnect control must leave free (U8): its
+measurement must follow it. Guard: frontend `hide: …`, `hide (break):
+…`; e2e `tabhide` (hit-tested, 560 px), `reconnectbreak` (a second tab
+opened while a split pane is disconnected).
+
 ## Server lifecycle
 
 **S1. A websh restart is not the end of a session.** While shutting

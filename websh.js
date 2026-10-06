@@ -968,6 +968,7 @@ function createTab() {
   tabs.push(t);
   wireTab(t);
   document.body.classList.add('has-tabs');
+  renderPaneTools();   // a second tab: "Move to tab" appears
   return t;
 }
 
@@ -1094,6 +1095,9 @@ document.addEventListener('mousemove', e => {
   let d = _tabDrag;
   if (!d) return;
   if ((e.buttons & 1) === 0) { endTabDrag(null); return; }
+  // The only tab can go nowhere (no place in the strip, no other tab to
+  // merge into): no drag look; the release is a click, as before.
+  if (tabs.length < 2) return;
   if (!d.moved && Math.abs(e.clientX - d.x0) < DRAG_START_PX
       && Math.abs(e.clientY - d.y0) < DRAG_START_PX) return;
   if (!d.moved) { d.moved = true; d.t.el.classList.add('dragging'); }
@@ -1326,6 +1330,7 @@ function removeTab(t) {
     showTab(next.id);
   }
   tabs.forEach(renderTab);   // the numbers in the tooltips shift
+  renderPaneTools();         // back to one tab: "Move to tab" goes
 }
 
 function removeAllTabs() {
@@ -1676,8 +1681,10 @@ function _measureReconnect(p, ctrl, bar) {
   let msg = ctrl.querySelector('span');
   let tag = L && L.querySelector('.pane-tag');
   let badge = L && L.querySelector('.pane-badge');
+  // one-tab: the bar's "Move to tab" button comes and goes with it.
   let key = [ctrl.className, pw && pw.className, msg && msg.textContent,
-             badge && badge.textContent, tag && tag.className].join('\u0001');
+             badge && badge.textContent, tag && tag.className,
+             document.body.classList.contains('one-tab') ? 1 : 0].join('\u0001');
   if (p._rcMeasured === key) return;
   if (!btn || !btn.offsetWidth) return;
   // Natural widths: .has-rc lets badge and tag shrink, so measure
@@ -1750,6 +1757,12 @@ function _keepRcFocus(fn, had) {
 // active tab when that tab is solo. Hidden with 2+ panes (each pane has
 // its bar) and with no tab at all. Upload/download are disabled by the
 // same rule as the pane's own buttons (updatePaneBadge).
+//
+// It also keeps body.one-tab, which hides every "Move to tab" button
+// (here and in all pane bars, by CSS): with one tab there is nowhere to
+// move to, and an impossible action is hidden, not disabled. So it must
+// run whenever the number of tabs changes: createTab, removeTab,
+// removeAllTabs (and showTab, which every move ends in).
 function renderPaneTools() {
   let box = $('paneTools');
   if (!box) return;
@@ -1758,7 +1771,9 @@ function renderPaneTools() {
   let show = !!(t && p && tabOfPane(p) === t && panesInTab(t).length === 1);
   let busy = !!(p && (p.upload || p.download));
   let tag = p && (p.host || p.connection) ? (p.persistent ? 'persistent' : 'ephemeral') : '';
-  let key = show ? [p.id, p.sid ? 1 : 0, busy ? 1 : 0, tag].join('\u0001') : '';
+  let one = tabs.length < 2;
+  let key = (one ? '1' : '2') + '\u0002'
+    + (show ? [p.id, p.sid ? 1 : 0, busy ? 1 : 0, tag].join('\u0001') : '');
   if (box._key === key) return;
   box._key = key;
   // The group takes width from the tab strip, and its width changes
@@ -1766,9 +1781,15 @@ function renderPaneTools() {
   // before its pane exists; the marker appears at connect). Scroll again
   // when it did. Runs only when the key changes, so the reflow is rare.
   let w0 = box.offsetWidth;
+  let flip = document.body.classList.contains('one-tab') !== one;
+  document.body.classList.toggle('one-tab', one);
   box.classList.toggle('h', !show);
   if (show) fillPaneTools(box, p, busy, tag);
   if (t && box.offsetWidth !== w0) scrollTabIntoView(t);
+  // The pane bars lost or gained a button: a Reconnect control centred
+  // in a bar on screen is measured again (_measureReconnect keys on
+  // one-tab); the hidden tabs' bars are measured when shown.
+  if (flip && t) panesInTab(t).forEach(placeReconnect);
 }
 function fillPaneTools(box, p, busy, tag) {
   let off = !p.sid || busy;
@@ -2328,18 +2349,21 @@ window.addEventListener('blur', () => closeMenus(false));
 // A tab's menu: rename it, put its whole layout into another tab (to
 // the right of that tab's active pane, as the pane move does), close it.
 function openTabMenu(t, x, y) {
-  openMenu([
-    {label: 'Rename', icon: 'pencil', act: () => startTabRename(t.id)},
-    {label: 'Move into tab', icon: 'move-to', disabled: tabs.length < 2,
+  // With one tab there is no tab to move into: the item is left out.
+  let items = [{label: 'Rename', icon: 'pencil', act: () => startTabRename(t.id)}];
+  if (tabs.length > 1) items.push(
+    {label: 'Move into tab', icon: 'move-to',
      sub: () => tabs.filter(o => o !== t).map(o => ({
        label: tabTitle(o) || 'Tab ' + (tabs.indexOf(o) + 1),
-       act: () => { if (tabs.indexOf(t) >= 0) mergeTabIntoTab(t.id, o.id); }}))},
-    {label: 'Close tab', icon: 'close', danger: true,
-     act: () => { if (tabs.indexOf(t) >= 0) closeTab(t.id); }},
-  ], x, y, 'Tab');
+       act: () => { if (tabs.indexOf(t) >= 0) mergeTabIntoTab(t.id, o.id); }}))});
+  items.push({label: 'Close tab', icon: 'close', danger: true,
+     act: () => { if (tabs.indexOf(t) >= 0) closeTab(t.id); }});
+  openMenu(items, x, y, 'Tab');
 }
 // The pane's move button (its bar, or #paneTools for a lone pane): the
 // other tabs; the pane goes to the right of the chosen tab's active pane.
+// The button is hidden with one tab (body.one-tab, renderPaneTools);
+// "No other tabs" is only a guard.
 function openPaneMoveMenu(id, btn) {
   let p = panes[id];
   if (!p) return;
