@@ -149,10 +149,16 @@ truncates and writes, `offset>0` appends - but only if the remote file
 is exactly N bytes long; otherwise `409 {"error": "offset mismatch",
 "size": <actual>}` and the client resumes from `size`. `size` in the
 `ok` reply is the file's length after the piece. The client sends
-pieces (4 MB, smaller after failures, each retried on its own) only
-when `/api/config` says `upload_chunks: true`, because an older server
-would overwrite the file with every piece. Pieces are what let an
-upload cross a proxy or VPN that cuts long or large requests.
+pieces (4 MB, each retried on its own) only when `/api/config` says
+`upload_chunks: true`, because an older server would overwrite the file
+with every piece. Pieces are what let an upload cross a proxy or VPN
+that cuts long or large requests: a cut piece — nginx `400 "client sent
+fewer bytes than Content-Length"`, a dropped connection, or our own
+short-body `502` — halves the piece size from the first failure down to
+256 KB, so a size the proxy passes is found and the file still lands
+whole. A truncation never reaches the server as a final error; the
+client only gives up (fast, with a "blocked or cut short" banner) when
+no piece lands within its wall-clock budget.
 
 ### POST /api/upload_finalize
 Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`

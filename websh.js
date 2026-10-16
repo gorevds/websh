@@ -6275,15 +6275,39 @@ function describeUploadError(xhr, resp, u) {
 // A file goes up in pieces (UPLOAD_CHUNK_BYTES each, its own short POST
 // with ?offset=) when the server appends them (config.upload_chunks).
 // One long POST of the whole file was cut mid-body by corporate proxies
-// and VPNs - the owner had to switch networks to upload anything. A
-// piece that fails is retried, after two failures with smaller pieces;
-// the server refuses a piece that does not start where the file ends
-// (409 + the real size) so a retry can never duplicate or skip bytes.
+// and VPNs - the owner had to switch networks to upload anything.
+//
+// The piece size is ADAPTIVE. A proxy that truncates the body answers
+// 400 (sometimes 499) with "client sent fewer bytes than Content-Length"
+// before our server is reached, drops the connection outright, or - the
+// owner's real case - cuts by size while HOLDING the connection open, so
+// the body stalls with no reply; our own short-body reply carries the
+// same text. Every such cut - truncation body, dropped connection, a
+// mid-body stall (the watchdog in sendUploadPiece), or a timeout - is a
+// size/duration the proxy enforces, so it HALVES the piece from the
+// FIRST failure (down toward UPLOAD_CHUNK_MIN): a small file already
+// gets through, so shrinking reaches a size that passes and the file
+// still lands whole. A plain 5xx with no such body is a transient server
+// blip, retried at the SAME size. Forward progress (a piece that lands)
+// resets the failure/try budget and the wall-clock clock but KEEPS the
+// shrunk size. The server refuses a piece that does not start where the
+// file ends (409 + the real size) so a retry can never duplicate or skip
+// bytes; 429 means slow down, not a failure, and keeps the size.
+//
+// Fast, visible failure when it truly cannot get through: give up within
+// UPLOAD_WALLCLOCK_MS of no landed piece (not tries x the 120 s per-piece
+// timeout), and once shrunk to the floor with the first piece still not
+// landed, stop after ~2 more attempts. The give-up banner then names the
+// probable proxy/firewall cause.
 let UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024;
 const UPLOAD_CHUNK_MIN = 256 * 1024;
 const UPLOAD_CHUNK_TRIES = 8;
 let UPLOAD_CHUNK_TIMEOUT_MS = 120000;
 let UPLOAD_RETRY_BASE_MS = 500;
+// No piece has landed for this long (across retries) - end the upload
+// with the "blocked or cut short" banner instead of tries x 120 s. Any
+// landed piece resets the clock. A `let` so tests can shrink it.
+let UPLOAD_WALLCLOCK_MS = 35000;
 
 function uploadNextFile(p) {
   let u = p.upload;
@@ -6299,6 +6323,9 @@ function uploadNextFile(p) {
     Date.now().toString(36);
   u.chunkSize = UPLOAD_CHUNK_BYTES;
   u.chunkFails = 0;
+  u.floorFails = 0;
+  u.cutSeen = false;
+  u.lastAdvance = Date.now();
   if (serverConfig && serverConfig.upload_chunks && file.size > 0) {
     sendUploadPiece(p, u, file, 0);
   } else {
@@ -6338,6 +6365,18 @@ function uploadFileDone(p, u, file) {
   });
 }
 
+// A truncated request body: nginx or another proxy answers "client sent
+// fewer bytes than Content-Length" (status 400, sometimes 499) before
+// our server is reached, and our own short-body reply carries the same
+// text as {error:...}. Match either the JSON error or a plain/HTML proxy
+// body - that is the signal to shrink and retry, not to give up.
+function uploadBodyTruncated(xhr, resp) {
+  let re = /client sent fewer bytes than content-length/i;
+  if (resp && typeof resp.error === 'string' && re.test(resp.error)) return true;
+  let t = xhr && xhr.responseText;
+  return typeof t === 'string' && re.test(t);
+}
+
 function sendUploadPiece(p, u, file, offset) {
   if (!u || u.cancelled || p.upload !== u) return;
   let end = Math.min(file.size, offset + u.chunkSize);
@@ -6346,20 +6385,85 @@ function sendUploadPiece(p, u, file, offset) {
   xhr.open('POST', uploadUrl(p, u, offset), true);
   xhr.setRequestHeader('Content-Type', 'application/octet-stream');
   xhr.timeout = UPLOAD_CHUNK_TIMEOUT_MS;
+
+  // Mid-body stall watchdog. The owner's proxy cut uploads by SIZE while
+  // HOLDING the connection open: the body stalls partway (the bar froze
+  // at some %), onprogress stops ADVANCING, and nothing ends until the
+  // 120 s xhr.timeout - a piece was retried only every ~2 min. So if the
+  // uploaded byte count does not advance for a whole UPLOAD_WALLCLOCK_MS,
+  // abort the piece and treat it as a cut. A real advance (see below)
+  // re-arms it, so a slow-but-progressing upload (bytes still moving,
+  // however slowly) is never killed by the cap - only a genuine stall,
+  // with no byte of progress for the full budget, is. It stays armed
+  // through the response wait too, since a proxy can hold the connection
+  // after taking the body; xhr.onload (a landed piece) clears it.
+  let stallMs = UPLOAD_WALLCLOCK_MS;
+  let watchdog = null;
+  let clearWatchdog = () => { if (watchdog !== null) { clearTimeout(watchdog); watchdog = null; } };
+  let armWatchdog = () => {
+    clearWatchdog();
+    watchdog = setTimeout(() => {
+      if (!u || u.cancelled || p.upload !== u) return;
+      watchdog = null;
+      xhr.onload = xhr.onerror = xhr.ontimeout = null;   // the abort must not re-enter
+      try { xhr.abort(); } catch (e) {}
+      u.xhr = null;
+      retry('stalled - no data moved for ' + Math.round(stallMs / 1000) + ' s', true);
+    }, stallMs);
+  };
+
+  // Re-arm the stall watchdog only on a real ADVANCE of the byte count,
+  // not on every onprogress event: a proxy that stops forwarding mid-body
+  // but holds the connection open can keep firing onprogress with the
+  // SAME e.loaded, and re-arming on those would keep the watchdog alive
+  // forever (the bar froze at 67% of the piece with no failure). Only
+  // bytes actually moving keep a slow-but-live upload alive.
+  let lastLoaded = 0;
   xhr.upload.onprogress = e => {
     if (!u || u.cancelled) return;
     u.fileOffset = offset + e.loaded;
     updateUploadProgress(p);
+    if (e.loaded > lastLoaded) { lastLoaded = e.loaded; armWatchdog(); }
   };
-  let retry = why => {
+  // The watchdog is NOT disarmed when the body finishes uploading: the
+  // proxy can hold the connection open AFTER taking the body and never
+  // answer, so the response wait is bounded by the same timer - no piece
+  // has LANDED until xhr.onload runs, which clears it. (A server append
+  // slower than UPLOAD_WALLCLOCK_MS is then treated as a stall too; the
+  // budget is the whole no-forward-progress window, not just body bytes.)
+
+  // Give up now. Once a cut has been seen (a proxy/nginx body truncation,
+  // a dropped connection, or a mid-body stall / timeout) name the
+  // probable cause and an action; otherwise fall back to the specific
+  // reason the caller computed.
+  let giveUp = fallback => {
+    finishUpload(p, false, u.cutSeen
+      ? 'blocked or cut short — a proxy or firewall on this network is' +
+        ' likely limiting uploads; a smaller file may still go through'
+      : fallback);
+  };
+
+  let retry = (why, cut) => {
     if (!u || u.cancelled || p.upload !== u) return;
+    clearWatchdog();
+    if (cut) u.cutSeen = true;
     u.chunkFails++;
-    if (u.chunkFails >= UPLOAD_CHUNK_TRIES) {
-      finishUpload(p, false, why); return;
+    // Halve from the first cut (down toward the floor); a non-cut
+    // failure (a plain 5xx server blip) keeps the size - the piece is
+    // not known to be too big.
+    if (cut) u.chunkSize = Math.max(UPLOAD_CHUNK_MIN, u.chunkSize >> 1);
+    // Wall-clock budget: no piece has landed for this long - stop now
+    // (with the cut banner if cuts were seen) rather than tries x 120 s.
+    if (Date.now() - u.lastAdvance >= UPLOAD_WALLCLOCK_MS) { giveUp(why); return; }
+    // This attempt was already at the floor and the first piece still
+    // has not landed: shrinking is exhausted, so stop after ~2 such
+    // attempts instead of the whole try budget. (end - offset is the
+    // size we just sent, before the halving above takes effect.)
+    if (cut && offset === 0 && (end - offset) <= UPLOAD_CHUNK_MIN) {
+      u.floorFails = (u.floorFails || 0) + 1;
+      if (u.floorFails >= 2) { giveUp(why); return; }
     }
-    // Smaller pieces after the second failure: what a proxy cuts is
-    // usually a size or a duration.
-    if (u.chunkFails >= 2) u.chunkSize = Math.max(UPLOAD_CHUNK_MIN, u.chunkSize >> 1);
+    if (u.chunkFails >= UPLOAD_CHUNK_TRIES) { giveUp(why); return; }
     let delay = Math.min(16 * UPLOAD_RETRY_BASE_MS, UPLOAD_RETRY_BASE_MS * Math.pow(2, u.chunkFails - 1));
     console.log('upload: piece at', offset, 'failed (' + why + '), retry', u.chunkFails,
                 'in', delay, 'ms, piece size', u.chunkSize);
@@ -6367,6 +6471,7 @@ function sendUploadPiece(p, u, file, offset) {
   };
   xhr.onload = () => {
     if (!u || u.cancelled) return;
+    clearWatchdog();
     let resp = null;
     try { resp = JSON.parse(xhr.responseText); } catch (e) {}
     if (xhr.status === 409 && resp && typeof resp.size === 'number' && resp.size >= 0) {
@@ -6391,22 +6496,40 @@ function sendUploadPiece(p, u, file, offset) {
       return;
     }
     if (xhr.status !== 200 || !resp || !resp.ok) {
-      // A session or file problem is final; a proxy's 5xx / 408 is
-      // worth another try.
-      let transient = xhr.status === 408 || xhr.status >= 500;
+      // nginx or a proxy that truncated the body answers 400 (sometimes
+      // 499) with "client sent fewer bytes than Content-Length" before
+      // our server is reached, and our own short-body reply carries the
+      // same text: that is a cut - retry AND shrink. A plain 408/5xx is
+      // transient too, but retried at the SAME size (a server blip, not
+      // a size limit). Everything else - 413, invalid path, a session
+      // error, a plain 400 - is the server's final verdict and stops.
+      let cut = uploadBodyTruncated(xhr, resp);
+      let transient = cut || xhr.status === 408 || xhr.status >= 500;
       if (!transient) { finishUpload(p, false, describeUploadError(xhr, resp, u)); return; }
-      retry(describeUploadError(xhr, resp, u));
+      retry(describeUploadError(xhr, resp, u), cut);
       return;
     }
+    // A piece landed: forward progress. Reset the failure/try budget,
+    // the wall-clock clock and the cut flag, but KEEP the shrunk size.
     u.chunkFails = 0;
     u.throttled = 0;
+    u.floorFails = 0;
+    u.cutSeen = false;
+    u.lastAdvance = Date.now();
     u.fileOffset = end;
     updateUploadProgress(p);
     if (end < file.size) sendUploadPiece(p, u, file, end);
     else uploadFileDone(p, u, file);
   };
-  xhr.onerror = () => retry(describeUploadError(xhr, null, u));
-  xhr.ontimeout = () => retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s');
+  // A dropped connection (status 0, no HTTP reply) and a timeout are both
+  // how a proxy/VPN that cuts the body by size/duration shows up when no
+  // usable reply reaches us: treat each as a cut - shrink and retry, and
+  // name the proxy cause on give-up - not a final "could not start"
+  // (describeUploadError keeps that reason for its own callers and the
+  // log line here).
+  xhr.onerror = () => { clearWatchdog(); retry(describeUploadError(xhr, null, u), true); };
+  xhr.ontimeout = () => { clearWatchdog(); retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s', true); };
+  armWatchdog();
   xhr.send(file.slice(offset, end));
 }
 

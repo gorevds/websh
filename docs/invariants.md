@@ -84,6 +84,39 @@ Guard: backend `test_upload_in_pieces_appends_at_the_right_offset`,
 frontend `upload in pieces: …`; e2e `upload` (two connection resets
 under a 12 MB upload, sha256 compared on disk).
 
+**O7b. A proxy that truncates uploads by size/duration must not freeze
+the bar or lose the file.** On a corporate network every upload POST
+over a size/duration was cut while a couple-of-KB file passed; nginx
+logged the first 4 MB piece as 400 "client sent fewer bytes than
+Content-Length" (sometimes 499, or a dropped connection), retried ~6×
+over minutes, then gave up - the progress bar sat at 0% with no message
+for many minutes and the file never arrived (download of the same size
+worked) (2026-10). What must hold: a truncation signal - that 400/499,
+our own short-body 502, a dropped connection (status 0), or a mid-body
+stall - is treated as transient, and the piece size HALVES from the
+FIRST cut down to `UPLOAD_CHUNK_MIN`, so a small-enough piece gets
+through and the file still lands whole and byte-identical. Forward
+progress (a landed piece) resets the try/wall-clock budget but KEEPS the
+shrunk size. When it truly cannot get through, the upload fails FAST -
+within `UPLOAD_WALLCLOCK_MS` of no forward progress, and ~2 attempts
+once shrunk to the floor, not `UPLOAD_CHUNK_TRIES` × the 120 s per-piece
+timeout - with a visible banner that names the probable cause ("Upload
+blocked or cut short — a proxy or firewall on this network is likely
+limiting uploads; a smaller file may still go through"). A genuinely
+final reply (413, invalid path) still stops at once with its own
+message, never the proxy text; a slow-but-progressing upload is never
+killed by the wall-clock cap (onprogress re-arms it).
+Guard: frontend `upload in pieces: a truncated piece shrinks on the next
+try`, `a 400 "fewer bytes" truncation … completes whole`, `forward
+progress resets the try budget and keeps the shrunk size`, `an
+unpassable truncation fails with a proxy/size cause named`, `no forward
+progress is stopped fast`, `repeated timeouts give up fast with the
+proxy-named banner`, `a stalled body fails fast on the wall-clock
+budget`, `a slow but progressing upload is not killed`, `a final 400
+(invalid path) stops at once`, `cancel during a shrink stops cleanly`;
+e2e `proxytrunc` (a size-limiting middlebox: the upload completes by
+shrinking; a stall surfaces a failure within the wall-clock bound).
+
 **O7. A hyperlink a program prints (OSC 8) is a link in the browser,
 in a plain pane and in a tmux pane.** Claude Code, `ls --hyperlink`,
 gcc print `ESC ] 8 ; ; URL ESC \ text ESC ] 8 ; ; ESC \`; the owner
