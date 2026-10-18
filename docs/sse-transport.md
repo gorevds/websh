@@ -64,7 +64,14 @@ invalidates the previous loop's ticket (`p.outGen`).
    buffering us. Close the EventSource, set `p.sseDisabled = true`,
    fall back. Exception: a timer that fired late (the page was frozen
    or the machine asleep) or while the browser is offline proves
-   nothing - the stream is simply started over.
+   nothing - the stream is simply started over. So does silence within
+   60 s of a network failure (an `/api/input` or a poll that got no
+   reply at all, `p.netFailAt`), and, up to 3 times in a row, silence on
+   a pane whose stream has delivered before: when an HTTP/2 connection
+   dies without a FIN, Chrome keeps putting new requests on it until it
+   notices, and the restarted stream got nothing in 5 s - that is the
+   network, not a buffering proxy, and it used to put the pane on
+   long-polling for 2 minutes.
 5. If `onerror` fires *before* any body event, check the session over
    plain HTTP and open the stream again; three such failures in a row
    fall back to long-poll. Once SSE has delivered at least one body
@@ -100,11 +107,54 @@ One `/api/input` per pane is in flight at a time; keys typed meanwhile
 form the next batch. Requests fired without waiting overtook each
 other (HTTP/2 multiplexing, then one backend thread per request) and
 text arrived scrambled. A reply that proves the bytes never reached
-the PTY (503, 429, 502) resends the same batch first; a network error
-is not retried - the write may have landed, and a doubled key is worse
-than a lost one. `404` means the session is gone: the pane reconnects,
-and for a persistent pane the batch is held for the re-attach (see
-`docs/persistent-sessions.md`, "Coming back after an absence").
+the PTY (503, 429, 502) resends the same batch first. A batch that got
+no reply (10 s timeout, network error) may or may not have landed; it
+is resent - same batch, same `seq`, still ahead of anything typed since,
+after 0.3, 1, 2, 3, then every 5 s - until it is answered or the session
+is gone, but only to a server that de-duplicates input (`input_seq`,
+`docs/protocol.md`): it writes each `(writer, seq)` once, so a resend,
+or the original turning up late, never doubles a key. Against an older
+server such a batch is not resent (a doubled key is worse than a lost
+one). A batch whose session ends while it is being resent is not
+replayed into the re-attached shell: it may have landed in the old one.
+Measured before: a key typed a few seconds after an HTTP/2 connection
+died without a FIN was lost, 6 of 6 tries. `404` means the session is
+gone: the pane reconnects, and for a persistent pane the batch is held
+for the re-attach (see `docs/persistent-sessions.md`, "Coming back
+after an absence").
+
+### Paint guard
+
+Output that reached the page must be on screen. Users (Chrome on macOS,
+Yandex Browser on Windows) came back to a hidden tab, typed, saw
+nothing, and a reload showed it all; the server had the keys and the
+echo, and the pane never fell behind the server's output offset - the
+terminal had the bytes and did not repaint. xterm 5.5 (DOM renderer)
+draws on `requestAnimationFrame` and pauses itself while an
+IntersectionObserver says the terminal is off screen; a pause never
+lifted or a frame never run freezes the screen like that. Not
+reproduced in headless Chromium, so websh heals it instead:
+
+- a pane coming back on screen - the page shown again
+  (`visibilitychange`, any absence), the window focused, `pageshow`, its
+  tab shown (which also covers a pane moved or merged) - is repainted
+  in full, refitted first if its box changed;
+- after output is written into a pane on screen, xterm must render (its
+  `onRender`) within 1 s; if not, a full refresh; if still not, the
+  renderer is reset by hand (pause lifted, stuck frame dropped, glyph
+  cache cleared, rows rendered at once); if still not, it is left alone
+  for 10 s. Each step is a `console.warn` (`paint: ...`).
+
+No timer runs unless something was written or a repaint asked for; a
+hidden page or a pane in a hidden tab is not watched (it is repainted
+when shown).
+
+When the page goes away (`pagehide`) while some pane looks stuck -
+output written on screen but not rendered, behind the server's output
+offset for over 2 s, a paint recovery or an input resend happened - one
+`navigator.sendBeacon` to `client_diag` (`docs/protocol.md`) puts the
+pane's numbers in the server log, so the next occurrence can be read
+there. Nothing is sent otherwise.
 
 The `'open'` event (HTTP headers received) is deliberately **not**
 listened to. Headers traverse a buffering proxy fine while the body

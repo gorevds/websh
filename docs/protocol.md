@@ -63,11 +63,25 @@ non-persistent sessions. Errors: `429` rate limit / session caps,
 connection / saved entry, `400` validation, `500` spawn failure.
 
 ### POST /api/input
-Body: `session_id`, `data` (UTF-8 keystrokes). Reply:
-`{"ok": bool, "alive": bool, "cursor": int}`. `cursor` is the offset of
-the end of the session's output so far: a client still behind it a
-couple of seconds later knows its output channel is not delivering and
-restarts it (see `docs/sse-transport.md`, "Silent connection death").
+Body: `session_id`, `data` (UTF-8 keystrokes), and optionally `writer`
+(1-40 characters of `A-Za-z0-9_-`, random per client pane) with `seq`
+(a positive integer, increasing per batch). Reply:
+`{"ok": bool, "alive": bool, "cursor": int}`, plus `"input_seq": true`
+when the request carried `writer` + `seq`.
+`cursor` is the offset of the end of the session's output so far: a
+client still behind it a couple of seconds later knows its output
+channel is not delivering and restarts it (see `docs/sse-transport.md`,
+"Silent connection death").
+
+`writer` + `seq` make a resend safe: the server remembers, per session,
+the highest `seq` it wrote for each writer (the last 32 writers), and a
+batch whose `seq` is not above it is answered `{"ok": true, "dup": true,
+...}` without being written. A client resends a batch that got no reply
+(timeout, network error) with the same pair, and only to a server that
+says `input_seq` (`/api/config`, or a reply to a sequenced request): an older server ignores the
+fields and would write a resend twice. Requests without the pair (old
+clients, the keepalive's empty input) are written as before. Malformed
+values are ignored, not refused.
 
 ### GET /api/output?session_id=
 Long-poll: waits up to ~10 s for PTY output. Reply:
@@ -275,9 +289,26 @@ not exist; `400` invalid ids.
 ### GET /api/config
 Public configuration for the client. Reply: `{"connections": [...],
 "restrict_hosts": bool, "isolate_storage": bool, "session_timeout":
-int, "version": str, "proto": int, "vault_enabled": bool}`
-(connection entries carry no secrets; deployments may extend this with
-additive fields).
+int, "version": str, "proto": int, "vault_enabled": bool,
+"upload_chunks": true, "input_seq": true}` (connection entries carry no
+secrets; deployments may extend this with additive fields).
+`input_seq`: `/api/input` honours `writer` + `seq` (above).
+
+### POST /api/client_diag
+A page's diagnostics beacon (`navigator.sendBeacon` on `pagehide`, sent
+only when some pane looked stuck; see `docs/sse-transport.md`, "Paint
+guard"). Body: a JSON object - the beacon sends it as `text/plain`, so
+this action reads JSON whatever the media type (max 16 KB):
+`{"vis": str, "recoveries": int, "panes": [{"sid": first 8 chars,
+"got": int, "srv": int, "write_ago": ms, "render_ago": ms, "cols",
+"rows", "w", "h", "mode": "sse"|"long-poll"|"none", "tab_hidden": bool,
+"recoveries": int, "resends": int, "unpainted": bool, "behind": bool}]}`.
+No terminal content. The server writes one log line, `[WARN]` when a
+pane is `unpainted` or `behind`, `[INFO]` otherwise; numbers are clamped
+and words limited to 16 characters of `A-Za-z0-9_.-`. Reply `{"ok":
+true}`; `400` not a JSON object, `413` too large, `429` more than 10 per
+IP in 10 minutes. A server without the action answers `404`, which a
+beacon ignores. Through `api.php` it is an ordinary JSON action.
 
 ### GET /api/ping
 Liveness (also used by the PHP shim's auto-start probe). Reply:
