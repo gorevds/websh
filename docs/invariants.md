@@ -81,8 +81,8 @@ connection Chrome is still using, and it put panes on long-polling for
 2 minutes.
 Guard: frontend `SSE refused before its first event…`, `a long-polling
 pane tries the stream NEXT TO the poll loop…`, `first-message timer
-firing late…`; the restart after a network failure: to be named by the
-tester.
+firing late…`; the restart after a network failure: browser scenario
+`echoback` (action `wifi`, HTTP/2 front).
 
 **O5. The newest `/api/stream` for a session wins.** The old holder may
 be writing into a dead connection for minutes; it steps aside.
