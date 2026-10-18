@@ -18,20 +18,12 @@ scrambled - "ecoh" for "echo". Keys typed meanwhile form the next batch.
 Guard: frontend `input: keystrokes reach the PTY in the order typed`;
 e2e `typing`.
 
-**I2. A key is written exactly once: never doubled, and not lost to a
-dead connection.** A reply that proves the bytes never reached the PTY
-(503, 429, 502) resends the batch. A batch with no reply (timeout,
-network error) may have landed: it is resent with the same
-`(writer, seq)` until answered or the session is gone, and the server
-writes each pair once (`input_seq`). Against a server without
-`input_seq` it is not resent - a doubled key (`rm` then Enter, twice) is
-worse than a lost one - and a batch whose session ended mid-resend is
-never replayed into the re-attached shell. Resends keep the in-flight
-slot, so I1 holds. Before (2026-10): a key typed a few seconds after an
-HTTP/2 connection died without a FIN was lost, 6 of 6 tries.
+**I2. A failed input is resent only when the reply proves it never
+reached the PTY** (503, 429, 502). A network error is not retried: the
+write may have landed and only the reply was lost, and a doubled key
+(`rm` then Enter, twice) is worse than a lost one.
 Guard: frontend `input: a busy (503) reply…`, `input: a network error is
-not retried` (old server); the resend and the server's de-duplication:
-browser scenario `echoback` (actions `wifi`, `burst-wifi`, HTTP/2 front).
+not retried`.
 
 **I3. Keys are never replayed into a different shell, and never stale.**
 Held keys go out only when a *persistent* pane re-attaches to its tmux
@@ -74,15 +66,9 @@ the pane's cursor…`, `network back (online event)…`; backend
 stream, or the first-message timer firing late after a sleep, used to
 put a pane on long-polling until reload (20 000 requests a day per
 client). Long-polling panes probe the stream *next to* the poll loop.
-A stream silent for 5 s right after a network failure (within 60 s of
-an input or poll with no reply), or on a pane whose stream has worked
-(3 times in a row), is restarted, not given up: that is a dead HTTP/2
-connection Chrome is still using, and it put panes on long-polling for
-2 minutes.
 Guard: frontend `SSE refused before its first event…`, `a long-polling
 pane tries the stream NEXT TO the poll loop…`, `first-message timer
-firing late…`; the restart after a network failure: browser scenario
-`echoback` (action `wifi`, HTTP/2 front).
+firing late…`.
 
 **O5. The newest `/api/stream` for a session wins.** The old holder may
 be writing into a dead connection for minutes; it steps aside.
@@ -171,20 +157,27 @@ blanket CSS that hides `xterm-underline-5`. Guard: e2e `linkstyle`
 computed decoration of the DOM renderer's spans).
 
 **O9. Output that reached the page is on screen.** Users came back to
-a hidden tab, typed, saw nothing; a reload showed it. The server had
-the keys and the echo and the pane was not behind its output offset:
-xterm had the bytes and did not repaint. Not reproduced in headless
-Chromium, so it heals rather than prevents: a pane coming back on
-screen (page shown, window focus, `pageshow`, its tab shown) is
-repainted in full (refitted if its box changed); output written into a
-pane on screen must be followed by an xterm render within 1 s, or a
-full refresh, then a renderer reset (`renderHard`: xterm 5.5 private
-names, each step guarded) are forced, each with a `console.warn`. No
-timer when nothing is written; hidden pages and hidden tabs are not
-watched (U1, U2). A page leaving with a stuck-looking pane sends one
-`client_diag` beacon, which the server logs as one line (no content).
-Guard: none yet - the freeze was never reproduced in a browser; the
-`client_diag` lines in the journal are how the next one is caught.
+a hidden tab, typed, saw nothing; a reload showed it. A beacon caught
+one: visible page, output written 5 ms before the reload, no render
+for 18 s, and the first guard (timer only, off whenever the page said
+hidden) never fired. xterm 5.5 stops drawing for good if anything
+throws while it parses (no try/catch in its write loop or event
+emitter: the queue is never resumed), or if its renderer stays paused /
+its frame never runs. What must hold: the check runs on every write and
+from a timer, counts from the first unrendered write (a trickle of
+output cannot postpone it; a cursor-blink render while chunks wait
+unparsed does not count), treats a focused page as on screen; recovery
+resumes a stuck parse (skipping a throwing chunk), refreshes, then
+resets the renderer, each with a `console.warn`. A pane coming back on
+screen is repainted, refitted only if its box changed (no
+`/api/resize` otherwise). Hidden tabs are not watched (U1, U2). A page
+leaving with a stuck-looking pane sends one `client_diag` beacon (no
+content), logged as one line.
+Guard: e2e `wedge` (a parser hook throws once while a plain pane
+prints: typed text back on screen in ~0.2 s, output keeps flowing to
+its last line, 3 rounds; on the code before the fix the pane froze at
+the throw and nothing typed appeared in 15 s; and a 15 s spinner
+triggers no `paint:` recovery).
 
 ## Layout and tabs
 

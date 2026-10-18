@@ -884,13 +884,6 @@ def _access_log_emit(event, ip, **fields):
         _log("WARN", "access log write failed: {}".format(e))
 
 
-# ─── Input de-duplication ───────────────────────────────────────────
-# /api/input's optional (writer, seq) pair; see Handler._input.
-_INPUT_WRITER_RE = re.compile(r"[A-Za-z0-9_-]{1,40}")
-_INPUT_WRITERS_MAX = 32      # writers remembered per session (tabs, reloads)
-_input_dedup_lock = Lock()   # for a session built without __init__
-
-
 # ─── Client diagnostics (/api/client_diag) ───────────────────────────
 # A page that goes away with a pane that looked stuck sends one beacon;
 # it becomes one log line. Small, rate-limited per IP, numbers and short
@@ -920,10 +913,19 @@ def _diag_word(v):
     return "?"
 
 
+def _diag_text(v):
+    """A free-text field of a diagnostics beacon (an error message): at
+    most 80 characters, anything outside a plain set replaced by '_'."""
+    if not isinstance(v, str):
+        return "-"
+    v = re.sub(r"[^A-Za-z0-9 _.,:;'()\[\]/-]", "_", v[:80]).strip()
+    return v or "-"
+
+
 def format_client_diag(body):
     """(level, text) for a diagnostics beacon body (a dict). WARN when a
-    pane had output written but not rendered, or was behind the server's
-    output offset; INFO otherwise."""
+    pane had output written but not rendered, xterm's parse queue was
+    stuck, or it was behind the server's output offset; INFO otherwise."""
     panes = body.get("panes")
     if not isinstance(panes, list):
         panes = []
@@ -932,22 +934,30 @@ def format_client_diag(body):
     for d in panes[:CLIENT_DIAG_MAX_PANES]:
         if not isinstance(d, dict):
             continue
-        flags = [k for k in ("unpainted", "behind") if d.get(k) is True]
-        if d.get("tab_hidden") is True:
-            flags.append("tab_hidden")
-        warn = warn or "unpainted" in flags or "behind" in flags
+        flags = [k for k in ("unpainted", "wedged", "behind", "tab_hidden")
+                 if d.get(k) is True]
+        warn = warn or any(k in flags for k in ("unpainted", "wedged", "behind"))
         parts.append(
-            "[sid={} got={} srv={} write_ago={}ms render_ago={}ms "
-            "term={}x{} box={}x{} mode={} recoveries={} resends={}{}]".format(
+            "[sid={} got={} srv={} write_ago={}ms parse_ago={}ms "
+            "render_ago={}ms unrendered={}ms pend={} pend_ms={} paused={} "
+            "frame={} term={}x{} box={}x{} mode={} recoveries={} resumes={} "
+            "hidden_skips={}{}]".format(
                 _diag_word(d.get("sid")), _diag_int(d.get("got")),
                 _diag_int(d.get("srv")), _diag_int(d.get("write_ago")),
-                _diag_int(d.get("render_ago")), _diag_int(d.get("cols")),
+                _diag_int(d.get("parse_ago")), _diag_int(d.get("render_ago")),
+                _diag_int(d.get("unrendered")), _diag_int(d.get("pend")),
+                _diag_int(d.get("pend_ms")), _diag_int(d.get("paused")),
+                _diag_int(d.get("frame")), _diag_int(d.get("cols")),
                 _diag_int(d.get("rows")), _diag_int(d.get("w")),
                 _diag_int(d.get("h")), _diag_word(d.get("mode")),
-                _diag_int(d.get("recoveries")), _diag_int(d.get("resends")),
+                _diag_int(d.get("recoveries")), _diag_int(d.get("resumes")),
+                _diag_int(d.get("hidden_skips")),
                 (" " + ",".join(flags)) if flags else ""))
-    text = "vis={} paint_recoveries={} panes={} {}".format(
-        _diag_word(body.get("vis")), _diag_int(body.get("recoveries")),
+    text = ("vis={} focus={} vis_ago={}ms paint_recoveries={} err_ago={}ms "
+            "err={!r} panes={} {}").format(
+        _diag_word(body.get("vis")), _diag_int(body.get("focus")),
+        _diag_int(body.get("vis_ago")), _diag_int(body.get("recoveries")),
+        _diag_int(body.get("err_ago")), _diag_text(body.get("err")),
         len(parts), " ".join(parts)).rstrip()
     return ("WARN" if warn else "INFO"), text
 
@@ -1745,9 +1755,6 @@ def config_public():
         # that appends them; an older one would overwrite the file with
         # each piece.
         "upload_chunks": True,
-        # /api/input honours (writer, seq): a resent batch is never
-        # written twice, so the client may retry one that timed out.
-        "input_seq": True,
     }
     # Optional connect-form prefill (websh.json "form_defaults"): lets a
     # deployment seed host/port/username in the manual form without
@@ -2028,9 +2035,6 @@ class SSHSession(object):
     # sees its generation is stale and steps aside (see _stream).
     _stream_gen = 0
     _stream_taken_at = 0.0
-    # Input de-duplication state; per instance once __init__ runs.
-    _input_seen = None
-    _input_lock = None
     # Invariant: master_fd ∈ {a valid open fd, -1}. The sentinel -1 (rather
     # than None) means "closed / never opened" and lets master_fd-touching
     # methods early-return via `if self.master_fd < 0: return` instead of
@@ -2073,12 +2077,6 @@ class SSHSession(object):
         # from a single blocking select instead of polling in slices.
         self._waiters = set()
         self._waiters_lock = Lock()
-        # Input de-duplication (see Handler._input): writer id -> the
-        # highest `seq` already written to the PTY. The lock makes the
-        # check and the write one step, so a late original and its retry
-        # can never both land.
-        self._input_seen = OrderedDict()
-        self._input_lock = Lock()
         self.alive = True
         self.last_activity = time.time()
         # At most one /api/stream consumer per session. SSHSession.read()
@@ -4877,39 +4875,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, str):
                 self._json({"error": "data must be a string"}, 400)
                 return
-            # Exactly-once input. A client whose request timed out or
-            # failed on the network cannot know whether the bytes reached
-            # the PTY (the connection may have died after the write, before
-            # the reply). It resends the same batch with the same
-            # (writer, seq); a seq at or below the highest one already
-            # written for that writer is answered without writing again.
-            # `writer` is random per client pane, so two tabs on one
-            # session never shadow each other. Requests without the pair
-            # (old clients, the keepalive) are written as before.
-            writer, seq = body.get("writer"), body.get("seq")
-            if not (isinstance(writer, str) and _INPUT_WRITER_RE.fullmatch(writer)
-                    and isinstance(seq, int) and not isinstance(seq, bool)
-                    and 0 < seq < 2 ** 53):
-                writer = seq = None
-            dup = False
-            if writer is not None:
-                lock = session._input_lock or _input_dedup_lock
-                with lock:
-                    seen = session._input_seen
-                    if seen is None:
-                        seen = session._input_seen = OrderedDict()
-                    if seen.get(writer, 0) >= seq:
-                        dup = True
-                        ok = bool(session.alive)
-                    else:
-                        ok = session.write(data.encode("utf-8"))
-                        if ok:
-                            seen[writer] = seq
-                            seen.move_to_end(writer)
-                            while len(seen) > _INPUT_WRITERS_MAX:
-                                seen.popitem(last=False)
-            else:
-                ok = session.write(data.encode("utf-8"))
+            ok = session.write(data.encode("utf-8"))
             if ok and session.alive and not session.auth_failed \
                     and data.strip():
                 # A real keystroke into a session that did not fail auth
@@ -4917,12 +4883,6 @@ class Handler(BaseHTTPRequestHandler):
                 # detector forgives on (see _forgive_scan_for_ip).
                 _forgive_scan_for_ip(self._client_ip())
             reply = {"ok": ok, "alive": session.alive}
-            if writer is not None:
-                # This server honours (writer, seq): the client resends a
-                # timed-out batch only to such a server (also in /api/config).
-                reply["input_seq"] = True
-                if dup:
-                    reply["dup"] = True
             # Where the session's output stands. A client whose output
             # channel died quietly (Wi-Fi switched, laptop slept: no FIN,
             # no error) sees its own cursor fall behind this and restarts

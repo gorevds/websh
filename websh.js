@@ -280,18 +280,6 @@ let SSE_STALL_MS = 40000;
 let POLL_STALL_MS = 25000;      // server answers a long-poll within 10 s
 let OUTPUT_LAG_MS = 2000;
 let KICK_MIN_GAP_MS = 3000;
-// A stream that stays silent past SSE_FIRST_MSG_TIMEOUT_MS within this
-// long of a network failure (p.netFailAt: an input or a poll got no
-// reply) is restarted, not given up for long-polling; a pane whose stream
-// has worked before gets SSE_NET_RESTART_LIMIT restarts in a row anyway.
-let SSE_NET_GRACE_MS = 60000;
-const SSE_NET_RESTART_LIMIT = 3;
-
-// A fetch that got no reply at all (rejected by the network, or aborted
-// by our own stall timer) - not a reply that said "busy".
-function isNetworkFailure(e) {
-  return !!e && (e.name === 'TypeError' || e.name === 'AbortError');
-}
 
 function disableSse(p, reason) {
   p.sseDisabled = true;
@@ -604,6 +592,9 @@ function createPane(container) {
   if (typeof term.onRender === 'function') {
     term.onRender(() => notePaneRendered(p));
     p.paintWatchable = true;
+  }
+  if (typeof term.onWriteParsed === 'function') {
+    term.onWriteParsed(() => notePaneParsed(p));
   }
   // Schedule a font-load-aware settle-loop refit after registration so
   // the helper can guard its RAFs against pane teardown via panes[id].
@@ -2643,10 +2634,7 @@ function startKeepalive(p) {
   p.keepaliveTimer = setInterval(() => {
     let sid = p.sid;
     if (sid) api('input', {body: {session_id: sid, data: ''}})
-      .then(r => {
-        if (inputSaysSessionGone(p, r, sid)) return;
-        noteServerCursor(p, r, sid);
-      })
+      .then(r => { if (!inputSaysSessionGone(p, r, sid)) noteServerCursor(p, r, sid); })
       .catch(() => {});
   }, 30000);
 }
@@ -3439,75 +3427,177 @@ window.addEventListener('pageshow', (e) => {
 // ── Paint guard: output that reached the page is on screen ──────────
 // Reported by several users (Chrome on macOS, Yandex Browser on Windows):
 // back in a tab that had been hidden, they typed and nothing appeared;
-// a reload showed it all. The server's log had the keys and the echo, and
-// the pane never fell behind the server's output offset - the bytes were
-// in the terminal, it just was not repainted. Not reproduced in headless
-// Chromium, so this is a self-healing guard rather than a one-line fix:
-//  - a pane coming back on screen (page shown, window focused, its tab
-//    shown, a pane moved or merged) is repainted in full, and refitted
-//    first if its box changed size;
-//  - after output is written into a pane on screen, xterm must render
-//    (its onRender) within PAINT_WATCH_MS. If it does not: a full
-//    refresh; if still nothing: the renderer is reset (renderHard); if
-//    still nothing, give up for PAINT_QUIET_MS (a console line each step).
-// xterm 5.5's DOM renderer pauses itself while an IntersectionObserver
-// says the terminal is off screen, and draws on requestAnimationFrame; a
-// pause that is never lifted, or a frame that never runs, freezes the
-// screen exactly like this. renderHard() lifts both by hand.
-// Cheap: no timer unless something was written or a repaint asked for,
-// nothing for a hidden page or a pane in a hidden tab (U1/U2: those are
-// repainted when shown).
+// a reload showed it all. The server's log had the keys and the echo.
+// The diagnostics beacon (below) caught one (2026-10-18): a pane on a
+// visible page had output written 5 ms before the reload and xterm had
+// not rendered it for 18 s - and the first version of this guard, which
+// only checked from a timer and stood down whenever the page said it
+// was hidden, never fired. So:
+//  - the check runs on every write (output arrives on network events,
+//    which run even when timers do not) and from a timer for when the
+//    writes stop; it measures from the FIRST write not rendered since
+//    the last render (p.unrenderedSince), so a steady trickle of output
+//    (a spinner, a status line) cannot keep postponing it;
+//  - "on screen" is the pane's tab shown and the page visible - or the
+//    page focused: a page the user is typing into is being looked at,
+//    whatever visibilityState says;
+//  - a pane coming back on screen (page shown, window focused,
+//    pageshow, its tab shown - which covers a pane moved or merged) is
+//    repainted in full, refitted first only if its box no longer
+//    matches its cols/rows (no /api/resize otherwise: flushPaneResize
+//    dedups, and a resize makes tmux redraw everything).
+// Two ways xterm 5.5 stops drawing, both read from its source:
+//  1. It parses written data in WriteBuffer._innerWrite, from a
+//     setTimeout. Nothing there catches an exception, nor does its
+//     EventEmitter.fire for listeners called during parsing: one throw
+//     leaves the chunks queued and no timer scheduled, and every later
+//     write only appends to the queue - nothing is parsed again, so
+//     nothing is drawn, until a reload. unwedgeWrites() resumes the loop
+//     and skips a chunk that throws (that chunk's output is lost; the
+//     screen goes on).
+//  2. The DOM renderer draws on requestAnimationFrame and pauses while
+//     an IntersectionObserver says the terminal is off screen. A pause
+//     never lifted, or a frame that never runs, freezes the screen.
+//     renderHard() lifts both by hand and renders the rows at once.
+// Recovery, at most once per PAINT_WATCH_MS: resume parsing if it is
+// stuck, then a full refresh; next time a renderer reset; then leave the
+// pane for PAINT_QUIET_MS. Each step is a console.warn ("paint: ...").
+// No work when nothing is written; a pane in a hidden tab is not watched
+// (U1/U2: it is repainted when shown).
 const PAINT_WATCH_MS = 1000;
 const PAINT_QUIET_MS = 10000;
 let _paintRecoveries = 0;     // whole page, for the diagnostics beacon
+let _visChangedAt = 0;        // last visibilitychange, for the beacon
+let _lastPageError = null;    // last uncaught error {at, msg}, for the beacon
+
+function pageLooked() {
+  if (typeof document === 'undefined') return true;
+  if (document.visibilityState !== 'hidden') return true;
+  try { return document.hasFocus(); } catch (e) { return false; }
+}
 
 function paneOnScreen(p) {
   if (!p || !p.term || !p.term.element || paneHidden(p)) return false;
-  return !(typeof document !== 'undefined' && document.visibilityState === 'hidden');
+  return pageLooked();
 }
 
 function notePaneRendered(p) {
-  p.lastRenderAt = Date.now();
+  let now = Date.now();
+  p.lastRenderAt = now;
+  // A render while written chunks still wait unparsed (the cursor blink
+  // draws even when parsing has died) does not show that output: keep
+  // waiting from when parsing last moved.
+  let b = writeBacklog(p);
+  if (b && b.chunks && p.unrenderedSince) {
+    p.unrenderedSince = p.pendSince || now;
+    return;
+  }
+  p.unrenderedSince = 0;
   p.paintStage = 0;
   if (p.paintTimer) { clearTimeout(p.paintTimer); p.paintTimer = null; }
 }
 
-// Expect a render within PAINT_WATCH_MS from now.
-function watchPaint(p) {
-  if (!p || !p.paintWatchable || p.paintTimer || !paneOnScreen(p)) return;
-  if (Date.now() < (p.paintQuietUntil || 0)) return;
-  p.paintSince = Date.now();
-  p.paintTimer = setTimeout(() => checkPaint(p), PAINT_WATCH_MS);
+// xterm finished a parse slice.
+function notePaneParsed(p) {
+  let now = Date.now();
+  p.lastParsedAt = now;
+  let b = writeBacklog(p);
+  p.pendSince = (b && b.chunks) ? now : 0;
+}
+
+// Output went into the terminal (called after term.write).
+function notePaneWritten(p) {
+  let now = Date.now();
+  p.lastWriteAt = now;
+  let b = writeBacklog(p);
+  if (b && b.chunks && !p.pendSince) p.pendSince = now;   // waiting to be parsed
+  if (!p.paintWatchable) return;
+  if (!paneOnScreen(p)) { p.unrenderedSince = 0; return; }
+  if (!p.unrenderedSince) p.unrenderedSince = now;
+  checkPaint(p);
+}
+
+// Expect a render from now on (a repaint was asked for).
+function expectPaint(p) {
+  if (!p || !p.paintWatchable || !paneOnScreen(p)) return;
+  if (!p.unrenderedSince) p.unrenderedSince = Date.now();
+  checkPaint(p);
+}
+
+function armPaintCheck(p, ms) {
+  if (p.paintTimer) return;
+  p.paintTimer = setTimeout(() => { p.paintTimer = null; checkPaint(p); }, Math.max(50, ms));
 }
 
 function checkPaint(p) {
-  p.paintTimer = null;
-  if (panes[p.id] !== p || !paneOnScreen(p)) { p.paintStage = 0; return; }
-  if ((p.lastRenderAt || 0) >= p.paintSince) { p.paintStage = 0; return; }
+  if (panes[p.id] !== p || !p.unrenderedSince) return;
+  if (!paneOnScreen(p)) { p.unrenderedSince = 0; p.paintHiddenSkips = (p.paintHiddenSkips || 0) + 1; return; }
+  let now = Date.now();
+  let due = Math.max(p.unrenderedSince + PAINT_WATCH_MS, (p.lastRecoveryAt || 0) + PAINT_WATCH_MS,
+                     p.paintQuietUntil || 0);
+  if (now < due) { armPaintCheck(p, due - now); return; }
   let stage = p.paintStage || 0;
-  let waited = Date.now() - p.paintSince;
+  let waited = now - p.unrenderedSince;
+  p.lastRecoveryAt = now;
   if (stage >= 2) {
     console.warn('paint: pane', p.id, 'still not rendering after a renderer reset; ' +
                  'leaving it for', PAINT_QUIET_MS, 'ms');
     p.paintStage = 0;
-    p.paintQuietUntil = Date.now() + PAINT_QUIET_MS;
+    p.paintQuietUntil = now + PAINT_QUIET_MS;
+    armPaintCheck(p, PAINT_QUIET_MS);
     return;
   }
   p.paintRecoveries = (p.paintRecoveries || 0) + 1;
   _paintRecoveries++;
-  // Armed before the attempt: a render it causes at once (renderHard
-  // renders synchronously) clears this through notePaneRendered.
+  // Staged and re-armed before the attempt: a render it causes at once
+  // (renderHard renders synchronously) clears this via notePaneRendered.
   p.paintStage = stage + 1;
-  p.paintSince = Date.now();
-  p.paintTimer = setTimeout(() => checkPaint(p), PAINT_WATCH_MS);
+  armPaintCheck(p, PAINT_WATCH_MS);
+  unwedgeWrites(p, now);
   if (stage === 0) {
-    console.warn('paint: pane', p.id, 'has output not rendered after', waited,
+    console.warn('paint: pane', p.id, 'has output not rendered for', waited,
                  'ms; forcing a full refresh');
     renderFull(p);
   } else {
     console.warn('paint: pane', p.id, 'did not render after a full refresh; ' +
                  'resetting the renderer');
     renderHard(p);
+  }
+}
+
+// xterm's write queue: chunks written but not parsed yet (see 1. above).
+function writeBacklog(p) {
+  try {
+    let wb = p.term._core && p.term._core._writeBuffer;
+    if (wb && Array.isArray(wb._writeBuffer) && typeof wb._bufferOffset === 'number') {
+      return {wb: wb, chunks: Math.max(0, wb._writeBuffer.length - wb._bufferOffset)};
+    }
+  } catch (e) {}
+  return null;
+}
+
+// Parsing stopped with data queued (no parse for PAINT_WATCH_MS while
+// chunks wait): run xterm's write loop again; a chunk that throws is
+// skipped.
+function unwedgeWrites(p, now) {
+  let b = writeBacklog(p);
+  if (!b || !b.chunks || typeof b.wb._innerWrite !== 'function') return;
+  if (!p.pendSince || now - p.pendSince < PAINT_WATCH_MS) return;   // parsing moves
+  console.warn('paint: pane', p.id, 'xterm stopped parsing with', b.chunks,
+               'chunks queued; resuming it');
+  p.parseResumes = (p.parseResumes || 0) + 1;
+  for (let i = 0; i < 16; i++) {
+    let wb = b.wb;
+    if (wb._writeBuffer.length <= wb._bufferOffset) break;
+    try { wb._innerWrite(); break; }
+    catch (e) {
+      p.parseErrors = (p.parseErrors || 0) + 1;
+      _lastPageError = {at: Date.now(), msg: String(e && e.message || e)};
+      console.warn('paint: pane', p.id, 'a chunk throws in xterm\'s parser; skipping it:', e);
+      let d = wb._writeBuffer[wb._bufferOffset];
+      wb._bufferOffset++;
+      wb._pendingData = Math.max(0, (wb._pendingData || 0) - ((d && d.length) || 0));
+    }
   }
 }
 
@@ -3524,16 +3614,16 @@ function paneNeedsFit(p) {
   } catch (e) { return false; }
 }
 
-// Reach into xterm 5.5's render service (private names, every step
-// guarded: a different xterm only loses this step, never the page):
-// lift a pause the IntersectionObserver left on a terminal that is on
-// screen, drop an animation frame that never ran, re-measure the font,
-// rebuild the glyph cache, and render the rows now rather than on a frame.
+// xterm 5.5's render service, private names, every step guarded: a
+// different xterm only loses this step, never the page. Lift a pause the
+// IntersectionObserver left on a terminal that is on screen, drop an
+// animation frame that never ran, re-measure the font, rebuild the glyph
+// cache, and render the rows now rather than on a frame.
 function renderHard(p) {
-  let rs = null, deb = null;
+  let deb = null;
   try {
     let core = p.term._core;
-    rs = core && core._renderService;
+    let rs = core && core._renderService;
     deb = rs && rs._renderDebouncer;
     if (rs && rs._isPaused) {
       rs._isPaused = false;
@@ -3553,15 +3643,15 @@ function renderHard(p) {
 }
 
 // Repaint a pane that may just have come back on screen, and expect it
-// to render.
+// to render. A refit only when the box changed.
 function repaintPane(p) {
   if (!paneOnScreen(p)) return;
   if (paneNeedsFit(p)) {
-    fitPaneWhenStable(p, {onSettled: q => { renderFull(q); watchPaint(q); }});
+    fitPaneWhenStable(p, {onSettled: q => { renderFull(q); expectPaint(q); }});
     return;
   }
   renderFull(p);
-  watchPaint(p);
+  expectPaint(p);
 }
 
 function repaintVisiblePanes() {
@@ -3569,45 +3659,76 @@ function repaintVisiblePanes() {
 }
 window.addEventListener('focus', repaintVisiblePanes);
 window.addEventListener('pageshow', repaintVisiblePanes);
+document.addEventListener('visibilitychange', () => { _visChangedAt = Date.now(); });
+window.addEventListener('error', e => {
+  _lastPageError = {at: Date.now(), msg: String((e && (e.message || (e.error && e.error.message))) || 'error')};
+});
 
 // ── Diagnostics beacon ───────────────────────────────────────────────
 // So the next "typed, nothing on screen, reload shows it" is caught in
 // the server log: when the page goes away (a reload, a closed tab) and
-// some pane looks stuck - output written but never rendered, behind the
-// server's output offset, a paint recovery or an input resend happened -
-// one navigator.sendBeacon to ?action=client_diag carries per pane: an
-// 8-character session id prefix, the offsets, how long since the last
-// write and render, cols/rows against the element's size, the transport,
-// the recovery and resend counts. No terminal content, no secrets. When
-// nothing looks stuck, nothing is sent. A server without the action
-// answers 404 to a beacon nobody reads. pagehide only (not beforeunload,
-// which costs the page its back/forward cache): it fires on reload,
-// close and navigation in every engine.
+// some pane looks stuck - output on screen not rendered for over
+// PAINT_WATCH_MS, xterm's parse queue stuck, behind the server's output
+// offset, or a paint recovery happened - one
+// navigator.sendBeacon to ?action=client_diag carries per pane: an
+// 8-character session id prefix, offsets, ages of the last write, parse
+// and render, how long output has waited unrendered, xterm's parse queue
+// and render-pause state, cols/rows against the element's size, the
+// transport, counters; and for the page: visibility, focus, the age of
+// the last visibility change, the last uncaught error message (cut to 80
+// characters). No terminal content, no secrets. Nothing is sent when
+// nothing looks stuck. A server without the action answers 404 to a
+// beacon nobody reads. pagehide only (not beforeunload, which costs the
+// page its back/forward cache): it fires on reload, close and navigation.
 let _diagSent = false;
+
+function paneTransport(p) {
+  if (p.eventSource) return 'sse';
+  if (!p.sid) return 'none';
+  let t = p.transport || 'none';
+  return t === 'sse' ? 'sse-closed' : t;
+}
 
 function paneDiag(p, now) {
   let box = null;
   try { box = p.el.querySelector('.pane-term').getBoundingClientRect(); } catch (e) {}
   let ago = t => (t ? Math.max(0, now - t) : -1);
-  let hidden = paneHidden(p);
   let srv = (typeof p.serverCursor === 'number') ? p.serverCursor : -1;
+  let b = writeBacklog(p);
+  let paused = -1, frame = -1;
+  try {
+    let rs = p.term._core && p.term._core._renderService;
+    if (rs) {
+      paused = rs._isPaused ? 1 : 0;
+      let deb = rs._renderDebouncer;
+      if (deb) frame = deb._animationFrame !== undefined ? 1 : 0;
+    }
+  } catch (e) {}
+  let unrendered = p.unrenderedSince ? now - p.unrenderedSince : -1;
+  let pend = b ? b.chunks : -1;
   return {
     sid: String(p.sid || '').slice(0, 8),
     got: p.outCursor || 0,
     srv: srv,
     write_ago: ago(p.lastWriteAt),
+    parse_ago: ago(p.lastParsedAt),
     render_ago: ago(p.lastRenderAt),
+    unrendered: unrendered,
+    pend: pend,
+    pend_ms: p.pendSince ? now - p.pendSince : -1,
+    paused: paused, frame: frame,
     cols: p.term.cols || 0, rows: p.term.rows || 0,
     w: box ? Math.round(box.width) : -1, h: box ? Math.round(box.height) : -1,
-    mode: p.eventSource ? 'sse' : (p.sseDisabled ? 'long-poll' : 'none'),
-    tab_hidden: hidden,
+    mode: paneTransport(p),
+    tab_hidden: paneHidden(p),
     recoveries: p.paintRecoveries || 0,
-    resends: p.inputResends || 0,
-    // Written while on screen, over PAINT_WATCH_MS ago, not rendered since
-    // (a pane in a background tab or page does not render: not stuck).
-    unpainted: !!p.lastShownWriteAt && (p.lastRenderAt || 0) < p.lastShownWriteAt &&
-               now - p.lastShownWriteAt > PAINT_WATCH_MS,
-    // The server said there is more output than this pane got, a while ago.
+    resumes: p.parseResumes || 0,
+    hidden_skips: p.paintHiddenSkips || 0,
+    unpainted: unrendered > PAINT_WATCH_MS,
+    // Chunks queued and parsing has not moved for a while: the loop died.
+    wedged: pend > 0 && !!p.pendSince && now - p.pendSince > PAINT_WATCH_MS,
+    // The server said there is more output than this pane got, a while ago
+    // (serverCursor comes only from /api/input replies, so it may lag).
     behind: !!p.sid && srv > (p.outCursor || 0) && now - (p.serverCursorAt || now) > OUTPUT_LAG_MS
   };
 }
@@ -3620,11 +3741,18 @@ function sendDiagBeacon() {
     if (!p || !p.term) return;
     try { list.push(paneDiag(p, now)); } catch (e) {}
   });
-  if (!list.some(d => d.unpainted || d.behind || d.recoveries || d.resends)) return;
+  if (!list.some(d => d.unpainted || d.wedged || d.behind || d.recoveries)) return;
   _diagSent = true;
+  let focus = false;
+  try { focus = document.hasFocus(); } catch (e) {}
   try {
     navigator.sendBeacon(`${API}?action=client_diag`, JSON.stringify({
-      vis: document.visibilityState, recoveries: _paintRecoveries, panes: list.slice(0, 16)
+      vis: document.visibilityState, focus: focus,
+      vis_ago: _visChangedAt ? now - _visChangedAt : -1,
+      recoveries: _paintRecoveries,
+      err: _lastPageError ? _lastPageError.msg.slice(0, 80) : '',
+      err_ago: _lastPageError ? now - _lastPageError.at : -1,
+      panes: list.slice(0, 16)
     }));
   } catch (e) {}
 }
@@ -3696,9 +3824,7 @@ function handleOutputPayload(p, r, sid) {
     let bytes = new Uint8Array(chunk.length);
     for (let i = 0; i < chunk.length; i++) bytes[i] = chunk.charCodeAt(i);
     p.term.write(bytes);
-    p.lastWriteAt = Date.now();
-    if (paneOnScreen(p)) p.lastShownWriteAt = p.lastWriteAt;
-    watchPaint(p);            // ── Paint guard
+    notePaneWritten(p);       // ── Paint guard
     // Keep a short tail of decoded output only while we're still
     // within the tmux-death detection window on a persistent pane.
     if (p.persistent && p.connectedAt && (Date.now() - p.connectedAt) < 8000) {
@@ -3972,6 +4098,7 @@ function streamOutput(p) {
     return;
   }
   p.eventSource = es;
+  p.transport = 'sse';          // for the diagnostics beacon
   p.sseGotAnyMessage = false;
   p.sseLastAt = Date.now();
   let armedAt = Date.now();
@@ -3987,23 +4114,6 @@ function streamOutput(p) {
       // nothing about a buffering proxy. Start the stream over.
       if (Date.now() - armedAt > SSE_FIRST_MSG_TIMEOUT_MS + 3000 ||
           (typeof navigator !== 'undefined' && navigator.onLine === false)) {
-        kickOutput(p, true);
-        return;
-      }
-      // The network failed a moment ago (an input or a poll got no
-      // reply), or the stream has worked for this pane before: silence
-      // now is the dead connection, not a buffering proxy. Measured: when
-      // an HTTP/2 connection dies without a FIN, Chrome keeps putting new
-      // requests on it until it notices; the restarted stream got nothing
-      // in 5 s and the pane was put on long-polling for 2 minutes. Start
-      // the stream over instead - always while the network failure is
-      // recent, a few times otherwise (a proxy that buffers on a network
-      // the pane moved to still ends on long-polling).
-      let netRecent = Date.now() - (p.netFailAt || 0) < SSE_NET_GRACE_MS;
-      if (netRecent || (p.sseEverWorked && (p.sseNetRestarts || 0) < SSE_NET_RESTART_LIMIT)) {
-        p.sseNetRestarts = (p.sseNetRestarts || 0) + 1;
-        console.log('SSE: no event in', SSE_FIRST_MSG_TIMEOUT_MS, 'ms after a network failure,',
-                    'restarting the stream (' + p.sseNetRestarts + ')');
         kickOutput(p, true);
         return;
       }
@@ -4030,8 +4140,6 @@ function streamOutput(p) {
   // retry clock should only reset once a real frame proves the channel.
   let onBodyEvent = () => {
     p.sseGotAnyMessage = true;
-    p.sseEverWorked = true;
-    p.sseNetRestarts = 0;
     p.sseEarlyFails = 0;
     p.sseLastAt = Date.now();
     clearRetryClock(p);
@@ -4106,6 +4214,7 @@ function pollOutput(p, gen) {
   if (gen === undefined) { abortPoll(p); gen = p.outGen = (p.outGen || 0) + 1; }
   else if (gen !== p.outGen) return;
   let mySid = p.sid;
+  p.transport = 'long-poll';
   // A request parked on a dead connection never answers by itself.
   let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   p.pollAbort = ctl;
@@ -4123,7 +4232,6 @@ function pollOutput(p, gen) {
   }).catch(e => {
     clearTimeout(stall);
     if (p.sid !== mySid || gen !== p.outGen) return;   // replaced meanwhile
-    if (isNetworkFailure(e)) p.netFailAt = Date.now();
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
     setReconnecting(p, true);
@@ -4141,6 +4249,7 @@ function pollOutput(p, gen) {
 function recoverClosedStream(p, mySid, gen) {
   if (!p.polling || p.sid !== mySid) return;
   if (gen !== undefined && gen !== p.outGen) return;
+  p.transport = 'recover';
   let ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   p.pollAbort = ctl;      // kickOutput/abortPoll can cancel it, like a poll
   let stall = setTimeout(() => { if (ctl) { try { ctl.abort(); } catch (e) {} } }, POLL_STALL_MS);
@@ -4157,7 +4266,6 @@ function recoverClosedStream(p, mySid, gen) {
     clearTimeout(stall);
     if (!p.polling || p.sid !== mySid) return;
     if (gen !== undefined && gen !== p.outGen) return;
-    if (isNetworkFailure(e)) p.netFailAt = Date.now();
     let d = nextRetryDelay(p);
     if (d < 0) { transportFatal(p, e); return; }
     setReconnecting(p, true);
@@ -4175,46 +4283,6 @@ function recoverClosedStream(p, mySid, gen) {
 // scrambled ("ecoh" for "echo") on any link with jitter.
 let INPUT_STALL_MS = 10000;     // a hung request must not freeze typing
 const INPUT_RETRIES = 3;
-
-// Exactly-once resend. A request that times out or fails on the network
-// may or may not have reached the PTY. Against a server that de-duplicates
-// input (config.input_seq, and `input_seq` in every /api/input reply) the
-// same batch is sent again with the same (writer, seq) until it is
-// answered or the session is gone: the server writes a seq at most once,
-// so a resend can never double a key. Measured before (2026-10): when an
-// HTTP/2 connection dies without a FIN, Chrome keeps putting new requests
-// on it; a key typed a few seconds later went into it and was lost, 6 of
-// 6 tries. Against an older server a lost reply is still not resent (a
-// doubled key is worse than a lost one).
-const INPUT_RESEND_MS = [300, 1000, 2000, 3000, 5000];
-let _inputSeqServer = null;     // learned from input replies; null = ask config
-function inputSeqSupported() {
-  if (_inputSeqServer !== null) return _inputSeqServer;
-  return !!(serverConfig && serverConfig.input_seq);
-}
-// A successful reply to a sequenced /api/input says whether this server
-// de-duplicates (a rollback to an older server turns resending off again).
-// Only sequenced requests are answered with `input_seq`: the keepalive's
-// reply says nothing either way.
-function noteInputSeqSupport(r) {
-  if (r && typeof r === 'object' && !r.error) _inputSeqServer = !!r.input_seq;
-}
-// Random per pane object (and so per page load): the server keeps the
-// highest seq per writer, and two tabs on one session must not shadow
-// each other's numbers.
-function inputWriterId(p) {
-  if (!p.inputWriter) {
-    let s = '';
-    try {
-      let b = crypto.getRandomValues(new Uint8Array(12));
-      for (let i = 0; i < b.length; i++) s += (b[i] % 36).toString(36);
-    } catch (e) {
-      s = Math.random().toString(36).slice(2, 14);
-    }
-    p.inputWriter = (s || 'w') + p.id;
-  }
-  return p.inputWriter;
-}
 
 // Keys typed while a persistent pane re-attaches (its server session
 // expired during an absence; the tmux shell is the same one) are held
@@ -4296,11 +4364,7 @@ function flushInput(p) {
   sendInputBatch(p, p.sid, d, 0);
 }
 
-// `seq` numbers the batch for the server's de-duplication; a resend keeps
-// it. `uncertain`: an earlier attempt of this batch may have landed (its
-// reply was lost), so it must not be replayed into a re-attached shell.
-function sendInputBatch(p, sid, d, attempt, seq, uncertain) {
-  if (seq === undefined) seq = p.inputSeq = (p.inputSeq || 0) + 1;
+function sendInputBatch(p, sid, d, attempt) {
   let token = {};
   p.inputInFlight = token;
   let settled = false;
@@ -4317,73 +4381,42 @@ function sendInputBatch(p, sid, d, attempt, seq, uncertain) {
   // A big paste on a slow uplink legitimately takes long: allow a
   // second per 20 KB on top of the base.
   let stallMs = INPUT_STALL_MS + Math.floor(d.length / 20);
-  // No reply (timeout or network error): the bytes may or may not have
-  // reached the PTY. Resend the same batch, same seq, ahead of anything
-  // typed since (the in-flight slot stays taken, so order holds) - but
-  // only to a server that de-duplicates, and only into the same session.
-  let lost = (why) => {
-    if (settled) return;
-    p.netFailAt = Date.now();      // the stream's first-message timer reads it
-    if (!inputSeqSupported() || p.sid !== sid) {
-      if (why === 'timeout' && d.length > 1024) showErr('A paste of ' + Math.round(d.length / 1024) + ' KB was not delivered (no answer from the server) - paste it again.');
-      release();
-      return;
-    }
-    settled = true;
-    clearTimeout(stall);
-    p.inputResends = (p.inputResends || 0) + 1;
-    let wait = INPUT_RESEND_MS[Math.min(attempt, INPUT_RESEND_MS.length - 1)];
-    console.warn('input: no reply (' + why + '), resending batch #' + seq +
-                 ' (' + d.length + ' chars) in ' + wait + ' ms');
-    setTimeout(() => {
-      if (p.sid === sid) { sendInputBatch(p, sid, d, attempt + 1, seq, true); return; }
-      // The session ended while we waited: whether the batch landed in it
-      // is unknown, and a re-attached shell must not get it twice.
-      console.warn('input: session ended while resending batch #' + seq + '; not replayed');
-      if (p.inputInFlight === token) p.inputInFlight = null;
-      if (p.inputQueue.length && !p.flushTimer) flushInput(p);
-    }, wait);
-  };
   let stall = setTimeout(() => {
     // Not answered in time: the connection it went out on is probably
-    // dead, and so is the output channel's. Cancel it (a server that
-    // de-duplicates ignores it if it lands after all; an older one would
-    // write it after keys typed since).
+    // dead, and so is the output channel's. Cancel it, so it cannot
+    // land later, after keys typed since.
     if (ctl) { try { ctl.abort(); } catch (e) {} }
+    if (d.length > 1024) showErr('A paste of ' + Math.round(d.length / 1024) + ' KB was not delivered (no answer from the server) - paste it again.');
+    release();
     kickOutput(p);
-    lost('timeout');
   }, stallMs);
-  let body = {session_id: sid, data: d, writer: inputWriterId(p), seq: seq};
-  api('input',{body: body, signal: ctl ? ctl.signal : undefined}).then(r => {
+  api('input',{body:{session_id:sid,data:d}, signal: ctl ? ctl.signal : undefined}).then(r => {
     if (!settled && r && r._status === 404 && r.error) {
       // The session is gone. Someone else may have noticed first (the
       // keepalive's 404 landing a few ms earlier, the output loop) and
       // the pane is already re-attaching, or is back: the keys are held
       // either way. After inputSaysSessionGone, so that endSession's
-      // reset cannot touch them; before release(). Not a batch an
-      // earlier attempt may have delivered (`uncertain`).
+      // reset cannot touch them; before release().
       if (p.sid === sid) inputSaysSessionGone(p, r, sid);
-      if (p.persistent && (p.connecting || p.sid) && !uncertain) holdInput(p, d);
+      if (p.persistent && (p.connecting || p.sid)) holdInput(p, d);
       release();
       return;
     }
-    noteInputSeqSupport(r);
     noteServerCursor(p, r, sid);
     // Replies that prove the bytes never reached the PTY (the worker
     // pool was full, a rate limit, the proxy could not reach the
     // backend): resend the same batch, ahead of anything typed since.
-    // A network error is resent only to a server that de-duplicates
-    // (`lost` above) - the write may have happened and only the reply
-    // was lost, and a doubled keystroke is worse.
+    // A network error is NOT retried - the write may have happened and
+    // only the reply was lost, and a doubled keystroke is worse.
     let st = r && r.error && r._status;
     if (!settled && (st === 503 || st === 429 || st === 502) &&
         attempt < INPUT_RETRIES && p.sid === sid) {
       settled = true; clearTimeout(stall);
-      setTimeout(() => sendInputBatch(p, sid, d, attempt + 1, seq, uncertain), 200 * (attempt + 1));
+      setTimeout(() => sendInputBatch(p, sid, d, attempt + 1), 200 * (attempt + 1));
       return;
     }
     release();
-  }, () => lost('network error'));
+  }, release);
 }
 
 // ── Unified connect ─────────────────────────────────────────────────
