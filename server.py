@@ -3865,11 +3865,12 @@ def _cleanup_loop():
 # on, the page opens a channel (/api/seal_open: ephemeral ECDH P-256,
 # the reply signed by this server's long-lived identity key, which the
 # browser pins on first use) and then sends every API call as one
-# AES-256-GCM frame to /api/sealed?c=<channel>. The frame carries the
+# AES-256-GCM frame to /api/sealed?c=<channel>, as {"f": base64} JSON.
+# The frame carries the
 # inner method, action, query and body; the server dispatches it to the
 # SAME handler a plain request would reach (Handler._sealed), and the
-# reply goes back as a stream of length-prefixed frames, so the SSE
-# stream and downloads still stream. Wire contract: docs/protocol.md
+# reply goes back as text/event-stream, one `data: <base64 frame>` event
+# per frame, so the SSE stream and downloads still stream. Wire contract: docs/protocol.md
 # "Sealed channel"; what it protects and what not: docs/security.md.
 #
 # Channels live in memory only: a restart forgets them, the client gets
@@ -3885,9 +3886,11 @@ SEALED_REPLAY_WINDOW = 4096       # seqs this far below the highest are refused
 # sealed mode).
 SEALED_FORBIDDEN = frozenset({"seal_open", "sealed", "config", "ping",
                               "client_diag"})
-# The largest frame accepted: a full request body plus one upload piece
-# (the client's largest is 4 MiB) and the frame/header overhead.
-SEALED_MAX_BODY = max(MAX_BODY_SIZE, 8 * 1024 * 1024) + 64 * 1024
+# The largest request accepted: a frame holding a full request body plus
+# one upload piece (the client's largest is 4 MiB) and its overhead, as
+# base64 inside {"f": ...} (4/3 of the frame).
+SEALED_MAX_BODY = (max(MAX_BODY_SIZE, 8 * 1024 * 1024) + 64 * 1024) * 4 // 3 \
+    + 1024
 
 _sealed_lock = Lock()
 _sealed_id = None                 # (private key, SPKI DER, fingerprint)
@@ -4012,10 +4015,14 @@ class _SealedChannel:
         return self.c2s.decrypt(frame[:12], frame[12:], self.aad_c2s)
 
     def seal_frame(self, plain):
-        """One s2c frame, length-prefixed for the response stream."""
+        """One s2c frame as one SSE event: `data: <base64>` and a blank
+        line. Text, not binary: an HTTPS-intercepting security product
+        on the owner's machine answered every application/octet-stream
+        POST itself with 503 and never let it through, while JSON and
+        text/event-stream pass (docs/protocol.md "Sealed channel")."""
         iv = os.urandom(12)
         frame = iv + self.s2c.encrypt(iv, plain, self.aad_s2c)
-        return struct.pack(">I", len(frame)) + frame
+        return b"data: " + base64.b64encode(frame) + b"\n\n"
 
 
 def _sealed_open(client_raw):
@@ -4582,7 +4589,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _sealed(self):
         """POST /api/sealed?c=<channel> - one sealed request. The body is
-        one c2s frame: a JSON header line (seq, method, action, query,
+        {"f": base64(one c2s frame)}; the frame's plaintext is a JSON header line (seq, method, action, query,
         and for upload pieces len/pad), then the inner body. Nothing runs
         unless the channel is known, the frame decrypts and its seq is
         new. The inner request then goes through _dispatch exactly as the
@@ -4610,17 +4617,23 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"error": "request body too large"}, 413)
             return
         try:
-            frame = self.rfile.read(n)
+            raw = self.rfile.read(n)
         except socket.timeout:
-            frame = b""
-        if len(frame) < n:
+            raw = b""
+        if len(raw) < n:
             # A proxy that cuts request bodies: the upload code knows
             # this text and shrinks its pieces (docs/invariants.md O7b).
             self._json({"error": "client sent fewer bytes than "
                                  "Content-Length"}, 400)
             return
+        # The frame travels as {"f": "<base64(frame)>"} (JSON, see
+        # seal_frame for why not raw bytes).
         try:
-            plain = chan.open_frame(frame)
+            env = json.loads(raw.decode("utf-8"))
+            f = env.get("f") if isinstance(env, dict) else None
+            if not isinstance(f, str):
+                raise ValueError("no frame")
+            plain = chan.open_frame(base64.b64decode(f, validate=True))
         except Exception:
             self._json({"error": "bad frame"}, 400)
             return
@@ -4661,8 +4674,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()

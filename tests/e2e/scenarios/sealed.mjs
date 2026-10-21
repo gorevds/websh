@@ -33,7 +33,9 @@ export async function run({ b, t, port }) {
       let body = Buffer.alloc(0);
       if (r.postDataEntries) body = Buffer.concat(r.postDataEntries.map(e => e.bytes ? Buffer.from(e.bytes, 'base64') : Buffer.alloc(0)));
       else if (r.postData) body = Buffer.from(r.postData, 'latin1');
-      reqs.set(p.requestId, { id: p.requestId, url: r.url, method: r.method, body, hasPost: !!r.hasPostData, at: Date.now(), done: false });
+      const hh = r.headers || {};
+      reqs.set(p.requestId, { id: p.requestId, url: r.url, method: r.method, body, hasPost: !!r.hasPostData, at: Date.now(), done: false,
+                              ctype: hh['Content-Type'] || hh['content-type'] || '' });
     }
     if (d.method === 'Network.requestWillBeSentExtraInfo') {
       const h = p.headers || {};
@@ -119,10 +121,18 @@ export async function run({ b, t, port }) {
     t.ok(api.length > 0, `${api.length} API requests after the switch`);
     const badUrls = api.filter(r => !/[?&]action=(seal_open|config|ping)$/.test(r.url) && !/[?&]action=sealed&c=[0-9a-f]{32}$/.test(r.url));
     t.ok(badUrls.length === 0, 'only seal_open / sealed&c=<channel> (and config/ping) in URLs' + (badUrls.length ? ': ' + badUrls.slice(0, 3).map(r => r.url).join(' | ') : ''));
+    // Revision 2: sealed requests are JSON text {"f": base64}, replies
+    // text/event-stream of base64 frames. Search the raw text and every
+    // base64 run decoded.
+    const b64runs = buf => Buffer.concat((buf.toString('latin1').match(/[A-Za-z0-9+/]{16,}={0,2}/g) || []).map(m => Buffer.from(m, 'base64')));
+    for (const r of api) r.decoded = b64runs(r.body);
+    const octet = api.filter(r => /octet-stream/i.test(r.ctype));
+    t.ok(api.filter(r => /action=sealed&/.test(r.url)).every(r => /^application\/json/i.test(r.ctype)), 'every sealed request is sent as application/json');
+    t.ok(octet.length === 0, `no request after the switch is application/octet-stream (${octet.length})`);
     const secrets = { 'session id': sid, 'typed text': 'SEAL_$((6*7))', 'tag': tag, 'file name': name, 'file content': 'UPLOADMARK', 'JSON key session_id': 'session_id', 'JSON key data': '"data"' };
     for (const [what, s] of Object.entries(secrets)) {
       const inUrl = api.filter(r => r.url.includes(s));
-      const inBody = api.filter(r => r.body.includes(Buffer.from(s)));
+      const inBody = api.filter(r => r.body.includes(Buffer.from(s)) || r.decoded.includes(Buffer.from(s)));
       t.ok(inUrl.length === 0 && inBody.length === 0, `${what} not in clear (urls: ${inUrl.length}, bodies: ${inBody.length})`);
     }
     // Replies: the finished ones can be read back from DevTools.
@@ -133,8 +143,9 @@ export async function run({ b, t, port }) {
         if (!x) continue;
         readable++;
         const body = Buffer.from(x.body, x.base64Encoded ? 'base64' : 'utf8');
+        const dec = b64runs(body);
         for (const s of [sid, `SEAL_42_${tag}`, name, 'session_id'])
-          if (body.includes(Buffer.from(s))) leaks.push(r.url.replace(/.*action=/, '') + ' has ' + s.slice(0, 12));
+          if (body.includes(Buffer.from(s)) || dec.includes(Buffer.from(s))) leaks.push(r.url.replace(/.*action=/, '') + ' has ' + s.slice(0, 12));
       } catch (e) {}
     }
     t.note(`${readable} reply bodies inspected`);

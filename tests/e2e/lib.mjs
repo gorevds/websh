@@ -119,7 +119,16 @@ export class H2Front {
     const d = this.dir;
     execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '2',
       '-subj', '/CN=127.0.0.1', '-keyout', d + '/k.pem', '-out', d + '/c.pem'], { stdio: 'ignore' });
-    fs.writeFileSync(d + '/nginx.conf', `
+    fs.writeFileSync(d + '/nginx.conf', this.conf(d));
+    this.proc = spawn('nginx', ['-p', d, '-c', d + '/nginx.conf'], { stdio: 'ignore' });
+    for (let i = 0; i < 50; i++) {
+      try { execFileSync('curl', ['-skf', '-o', '/dev/null', this.url + 'api/ping']); return; } catch (e) {}
+      await sleep(100);
+    }
+    throw new Error('private nginx did not start on port ' + this.port + ' (see ' + d + '/error.log)');
+  }
+  conf(d) {
+    return `
 daemon off; pid ${d}/nginx.pid; error_log ${d}/error.log info;
 events { worker_connections 1024; }
 http {
@@ -142,13 +151,7 @@ http {
       proxy_buffering off;
     }
   }
-}`);
-    this.proc = spawn('nginx', ['-p', d, '-c', d + '/nginx.conf'], { stdio: 'ignore' });
-    for (let i = 0; i < 50; i++) {
-      try { execFileSync('curl', ['-skf', '-o', '/dev/null', this.url + 'api/ping']); return; } catch (e) {}
-      await sleep(100);
-    }
-    throw new Error('private nginx did not start on port ' + this.port + ' (see ' + d + '/error.log)');
+}`;
   }
   accessLog() { try { return fs.readFileSync(this.dir + '/access.log', 'utf8'); } catch (e) { return ''; } }
   async stop() {
@@ -161,6 +164,65 @@ http {
     }
     if (process.env.E2E_KEEP_NGINX) return;
     try { fs.rmSync(this.dir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+// ── the production front (websh.gorev.space, see AGENTS.local.md) ───
+// The public :443 is an nginx stream{} block (SNI demux, shared with
+// mtg) that forwards with PROXY protocol to an http vhost
+// `listen 127.0.0.1:8443 ssl proxy_protocol`. That listen line has no
+// `http2`, but other vhosts on the same socket do, and nginx applies it
+// to the socket: browsers get HTTP/2 (`curl --http2` says 2, ALPN h2;
+// checked 2026-10-21). E2E_PROD_H1=1 builds the HTTP/1.1 variant (six
+// connections per host in Chromium). Same proxy directives
+// as /etc/nginx/sites-enabled/websh, gzip on at http level, real_ip
+// from the PROXY header. meta.front = 'prod'. The scenario talks to the
+// stream port; the vhost is on port + 1.
+export class ProdFront extends H2Front {
+  conf(d) {
+    const vhost = this.port + 1;
+    return `
+load_module /usr/lib/nginx/modules/ngx_stream_module.so;
+daemon off; pid ${d}/nginx.pid; error_log ${d}/error.log info;
+events { worker_connections 1024; }
+stream {
+  server {
+    listen 127.0.0.1:${this.port};
+    proxy_protocol on;
+    proxy_timeout 1d;
+    proxy_pass 127.0.0.1:${vhost};
+  }
+}
+http {
+  default_type application/octet-stream;
+  access_log ${d}/access.log;
+  gzip on;
+  set_real_ip_from 127.0.0.1;
+  real_ip_header proxy_protocol;
+  client_body_temp_path ${d}/body; proxy_temp_path ${d}/proxy;
+  fastcgi_temp_path ${d}/fcgi; uwsgi_temp_path ${d}/uwsgi; scgi_temp_path ${d}/scgi;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  ssl_session_cache shared:e2e_SSL:1m; ssl_session_timeout 1440m; ssl_session_tickets off;
+  server {
+    listen 127.0.0.1:${vhost} ssl${process.env.E2E_PROD_H1 === '1' ? '' : ' http2'} proxy_protocol;
+    ssl_certificate ${d}/c.pem; ssl_certificate_key ${d}/k.pem;
+    client_max_body_size 2g;
+    proxy_request_buffering off;
+    location / {
+      proxy_pass         http://127.0.0.1:${this.upstream};
+      proxy_http_version 1.1;
+      # prod has $host; here the port is not 443, and $host would drop
+      # it (the Origin carries it): the one deliberate difference.
+      proxy_set_header   Host              $http_host;
+      proxy_set_header   X-Real-IP         $remote_addr;
+      proxy_set_header   X-Forwarded-For   $remote_addr;
+      proxy_set_header   X-Forwarded-Proto $scheme;
+      proxy_read_timeout 1800s;
+      proxy_send_timeout 1800s;
+      proxy_buffering    off;
+    }
+  }
+}`;
   }
 }
 

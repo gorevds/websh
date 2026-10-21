@@ -83,10 +83,12 @@ function isCapacityError(r, msg) {
 // second layer under TLS for networks that read HTTPS (a corporate root
 // CA, DPI). Off, nothing here runs and every request is exactly what it
 // was. On, every API call except config and ping goes as ONE AES-GCM
-// frame to ?action=sealed&c=<channel>, carrying the real method,
-// action, query and body; the reply comes back as length-prefixed
-// frames, read as they arrive, so the output stream and downloads
-// still stream. Wire contract: docs/protocol.md "Sealed channel".
+// frame to ?action=sealed&c=<channel> (as JSON {"f": base64}), carrying
+// the real method, action, query and body; the reply comes back as
+// text/event-stream, one `data: <base64 frame>` event per frame, read as
+// it arrives, so the output stream and downloads still stream. Text on
+// both legs: an HTTPS-intercepting security product refused binary
+// (application/octet-stream) POSTs outright. Wire contract: docs/protocol.md "Sealed channel".
 //
 // The decision is made per call, at the boundary: apiFetch() for fetch,
 // openEventSource() for the output stream, newApiXhr() for uploads. The
@@ -134,10 +136,15 @@ function _u8cat() {
   for (let i = 0; i < arguments.length; i++) { out.set(arguments[i], o); o += arguments[i].length; }
   return out;
 }
+// Base64 in pieces of 24 KiB (a multiple of 3, so the pieces join into
+// one valid string): no argument list or binary string the size of a
+// multi-MB upload piece.
 function _b64enc(u8) {
-  let s = '';
-  for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
-  return btoa(s);
+  let out = [];
+  for (let i = 0; i < u8.length; i += 0x6000) {
+    out.push(btoa(String.fromCharCode.apply(null, u8.subarray(i, i + 0x6000))));
+  }
+  return out.join('');
 }
 function _b64dec(str) {
   let s = atob(String(str || '')), u = new Uint8Array(s.length);
@@ -317,30 +324,49 @@ async function _sealFrame(ch, hdr, body, padHeader) {
   return _u8cat(iv, ct);
 }
 
-// Reads `uint32 length || frame` records from a byte source and decrypts
-// them. `pull()` gives the next chunk of bytes or null at the end.
+// Reads the reply's frames - one SSE event `data: <base64(frame)>` each
+// (text, not binary: an HTTPS-intercepting security product on the
+// owner's machine refused application/octet-stream outright) - from a
+// byte source, as they arrive, and decrypts them. `pull()` gives the
+// next chunk of bytes or null at the end.
 function _sealFrameReader(ch, pull, cancel) {
-  let buf = new Uint8Array(0), eof = false;
-  async function fill(n) {
-    while (buf.length < n && !eof) {
-      let v = await pull();
-      if (v === null) eof = true;
-      else if (v.length) buf = buf.length ? _u8cat(buf, v) : v;
-    }
-    return buf.length >= n;
-  }
-  return {
-    // The next plaintext, or null when the bytes ended between records.
-    next: async () => {
-      if (!await fill(4)) {
-        if (buf.length) throw new TypeError('encrypted reply cut short');
+  let dec = new TextDecoder();
+  let text = '', scanned = 0, eof = false;
+  // The next complete event's data, or null at the end of the bytes.
+  async function nextEvent() {
+    for (;;) {
+      let m = /\r?\n\r?\n/g;
+      m.lastIndex = Math.max(0, scanned - 3);
+      let hit = m.exec(text);
+      if (hit) {
+        let ev = text.slice(0, hit.index);
+        text = text.slice(hit.index + hit[0].length);
+        scanned = 0;
+        let data = [];
+        ev.split(/\r?\n/).forEach(line => {
+          if (line.indexOf('data:') === 0) data.push(line.slice(line[5] === ' ' ? 6 : 5));
+        });
+        if (data.length) return data.join('');
+        continue;          // a comment or an empty event
+      }
+      scanned = text.length;
+      if (eof) {
+        if (text.trim()) throw new TypeError('encrypted reply cut short');
         return null;
       }
-      let n = new DataView(buf.buffer, buf.byteOffset, 4).getUint32(0);
-      if (n < 28) throw new TypeError('bad encrypted frame');
-      if (!await fill(4 + n)) throw new TypeError('encrypted reply cut short');
-      let f = buf.subarray(4, 4 + n);
-      buf = buf.subarray(4 + n);
+      let v = await pull();
+      if (v === null) { eof = true; text += dec.decode(); }
+      else if (v.length) text += dec.decode(v, {stream: true});
+    }
+  }
+  return {
+    // The next plaintext, or null when the bytes ended between frames.
+    next: async () => {
+      let b = await nextEvent();
+      if (b === null) return null;
+      let f;
+      try { f = _b64dec(b); } catch (e) { throw new TypeError('bad encrypted frame'); }
+      if (f.length < 28) throw new TypeError('bad encrypted frame');
       return new Uint8Array(await crypto.subtle.decrypt(
         {name: 'AES-GCM', iv: f.subarray(0, 12), additionalData: ch.aadS}, ch.ks, f.subarray(12)));
     },
@@ -426,7 +452,8 @@ async function sealedFetch(method, action, query, body, opts) {
                             opts.extra || {});
     let frame = await _sealFrame(ch, hdr, body || new Uint8Array(0));
     let r = await fetch(`${API}?action=sealed&c=${ch.id}`, {method: 'POST',
-      headers: {'Content-Type': 'application/octet-stream'}, body: frame, signal: opts.signal});
+      headers: {'Content-Type': 'application/json'},
+      body: '{"f":"' + _b64enc(frame) + '"}', signal: opts.signal});
     if (r.status === 410) {
       if (attempt > 0) return _sealUnavailableResponse(_sealLostAgain());
       if (_seal === ch) { _seal = null; renderSealedState(); }
@@ -662,13 +689,12 @@ SealedXhr.prototype.send = function (blob) {
       }
       let hdr = Object.assign({seq: ++ch.seq, method: String(this._method || 'POST').toUpperCase(),
                                action: action, query: query}, extra);
-      let frame = await _sealFrame(ch, hdr, body, !!pad);
+      let wire = '{"f":"' + _b64enc(await _sealFrame(ch, hdr, body, !!pad)) + '"}';
       if (this._aborted) return;
       let res = await new Promise(resolve => {
         let x = this._x = new XMLHttpRequest();
         x.open('POST', `${API}?action=sealed&c=${ch.id}`, true);
-        x.setRequestHeader('Content-Type', 'application/octet-stream');
-        x.responseType = 'arraybuffer';
+        x.setRequestHeader('Content-Type', 'application/json');
         if (deadline) x.timeout = Math.max(1, deadline - Date.now());
         x.upload.onprogress = e => {
           if (!this.upload.onprogress || !e.total) return;
@@ -679,7 +705,7 @@ SealedXhr.prototype.send = function (blob) {
         x.onerror = () => resolve({fail: 'error'});
         x.ontimeout = () => resolve({fail: 'timeout'});
         x.onabort = () => resolve({fail: 'abort'});
-        x.send(frame);
+        x.send(wire);
       });
       if (this._aborted || res.fail === 'abort') return;
       if (res.fail) { this._fail(res.fail); return; }
@@ -697,8 +723,7 @@ SealedXhr.prototype.send = function (blob) {
       if (x.status !== 200) {
         // Not a sealed reply (a proxy's own 400/502, our 413/410): pass
         // it on with its text, which the upload code reads.
-        let t = '';
-        try { t = new TextDecoder().decode(new Uint8Array(x.response || new ArrayBuffer(0))); } catch (e) {}
+        let t = x.responseText || '';
         // A frame that arrived whole-sized but does not decrypt was
         // damaged on the way (a middlebox that cut and refilled the
         // body): for the upload that is a cut piece, the same as a
@@ -708,7 +733,7 @@ SealedXhr.prototype.send = function (blob) {
         return;
       }
       try {
-        let resp = await _sealResponse(ch, new Response(x.response));
+        let resp = await _sealResponse(ch, new Response(x.responseText || ''));
         let t = await resp.text();
         this._finish(resp.status, t);
       } catch (e) { this._fail('error'); }

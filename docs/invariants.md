@@ -413,7 +413,14 @@ once: no key lost or doubled. Keys typed while the channel is unusable
 (key-changed modal open, channel cannot be opened, 410 backoff) follow
 I3: a short blockage delivers them once, in order; older than
 `INPUT_HOLD_MS` they are dropped, never delivered late. Through
-`api.php` the sealed bytes pass unchanged and unbuffered. A replayed, tampered or unknown-channel
+`api.php` the sealed bytes pass unchanged and unbuffered.
+Frames travel as text - requests `application/json` `{"f": base64}`,
+replies `text/event-stream`, one `data: <base64>` event per frame -
+never as `application/octet-stream`: on the owner's Mac an
+endpoint-security product that intercepts HTTPS answered every
+octet-stream POST with its own `503 text/html` (nginx: 400/499, 0
+bytes), so the first, binary format failed for its only user on the
+day it shipped (2026-10-21). A replayed, tampered or unknown-channel
 frame executes nothing. Inside, a request means exactly what the plain
 URL means (rate limits, access log with the inner action). Upload
 pieces of one upload are one size on the wire, the total rounded up
@@ -424,7 +431,11 @@ looks at the raw bytes, a real PTY shell behind a fake `ssh`); frontend
 `test_sealed.js` (a fake server speaking the wire contract, every
 request recorded raw and decrypted; `sealed I3: …`); backend
 `TestSealedThroughPhpProxy` (php -S or the websh-php-smoke image);
-e2e `sealed`, `sealedtoggle`, `sealedrestart`, and any scenario with
+backend `TestSealedThroughNginx` (production's proxy directives);
+e2e `sealed`, `sealedtoggle`, `sealedrestart`, `sealedblocked` (a
+middlebox that answers octet-stream POSTs 503, as measured),
+`sealedprod` (a production-like front: nginx stream + PROXY protocol,
+HTTP/2), `sealedurl` (safe against a deployment), and any scenario with
 `E2E_SEALED=1` (requests are still counted by their inner action;
 `tabstress` there caught the lock badge squeezing the tab strip below
 one tab's width at 560 px).

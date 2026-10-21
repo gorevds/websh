@@ -355,8 +355,14 @@ forgets them all.
 Frames: `iv (12 random bytes) || AES-GCM ciphertext+tag`, AAD
 `<channel> ":c2s"` or `<channel> ":s2c"`.
 
-Request body (`application/octet-stream`): exactly one c2s frame whose
-plaintext is one JSON header line, `\n`, then the raw inner body.
+Both legs are text, not binary: a security product on the owner's
+machine that intercepts HTTPS answered every `application/octet-stream`
+POST itself (`503 text/html`) and never let it through, while JSON
+bodies and `text/event-stream` replies pass.
+
+Request body (`application/json`): `{"f": "<base64(frame)>"}` (standard
+base64 with padding), holding exactly one c2s frame whose plaintext is
+one JSON header line, `\n`, then the raw inner body.
 Header: `{"seq": int, "method": "GET"|"POST", "action": "<action>",
 "query": {name: string}}`, and for upload pieces `"len": int` (the
 number of real bytes at the start of the inner body; the rest is
@@ -366,10 +372,11 @@ server replies `{"ok": true, "pad": true}` and runs nothing).
 Checked in this order, and nothing is executed when one fails:
 unknown or expired channel `410 {"error": "channel unknown"}` (the
 client opens a new channel and sends the request once more); body
-missing `400 {"error": "bad frame"}`, larger than ~8 MiB `413`, shorter
+missing `400 {"error": "bad frame"}`, larger than ~11 MiB `413`, shorter
 than its Content-Length `400 {"error": "client sent fewer bytes than
-Content-Length"}` (the upload code's "cut" signal); a frame that does
-not decrypt or a malformed header `400 {"error": "bad frame"}`; a
+Content-Length"}` (the upload code's "cut" signal); malformed JSON, a
+missing or non-base64 `f`, a frame that does not decrypt or a
+malformed header `400 {"error": "bad frame"}`; a
 `seq` already used on this channel, or more than 4096 below the
 highest seen, `400 {"error": "replay"}`; `seal_open`, `sealed`,
 `config`, `ping` and `client_diag` inside `400`.
@@ -377,8 +384,10 @@ highest seen, `400 {"error": "replay"}`; `seal_open`, `sealed`,
 Otherwise the inner request goes to the same handler as the plain
 `/api/<action>?<query>` with that method and body (same validation,
 rate limits, access-log events; an unknown action is the inner `404`),
-and the outer reply is `200 application/octet-stream`: a sequence of
-`uint32 big-endian length || s2c frame`. The first frame's plaintext is
+and the outer reply is `200 text/event-stream` (`Cache-Control:
+no-cache`, `X-Accel-Buffering: no`): each s2c frame is one SSE event,
+`data: <base64(frame)>` followed by a blank line, written as it is
+produced. The first frame's plaintext is
 `{"status": int, "headers": {...}}` (the inner status and headers -
 Content-Type, Content-Length, Content-Disposition, ...); each following
 frame is a piece of the inner body, sent as the handler writes it (the

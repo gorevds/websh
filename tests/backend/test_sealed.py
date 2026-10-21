@@ -43,9 +43,9 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
-import struct
 import subprocess
 import sys
 import tempfile
@@ -302,26 +302,48 @@ class SealedClient(object):
             hdr.update(extra)
         return self.seal(hdr, body)
 
-    def post_frame(self, frame, channel=None, timeout=15):
-        """Send a raw c2s frame; return (HTTPConnection, HTTPResponse)."""
+    @staticmethod
+    def wrap(frame):
+        """Revision 2: a c2s frame travels as JSON text, {"f": base64}."""
+        return json.dumps({"f": base64.b64encode(frame).decode("ascii")}).encode()
+
+    def post_frame(self, frame, channel=None, timeout=15, raw_body=None,
+                   ctype="application/json"):
+        """Send a c2s frame (or, with raw_body, exactly those bytes);
+        return (HTTPConnection, HTTPResponse)."""
         c = self._conn(timeout=timeout)
         c.request("POST", self._url("sealed", "c=" + (channel or self.channel)),
-                  body=frame,
-                  headers={"Content-Type": "application/octet-stream"})
+                  body=self.wrap(frame) if raw_body is None else raw_body,
+                  headers={"Content-Type": ctype})
         return c, c.getresponse()
 
     def read_frame(self, resp):
-        """Next s2c plaintext, or None at EOF (no frame at all)."""
-        hdr = resp.read(4)
-        if not hdr:
-            return None
-        if len(hdr) < 4:
-            raise Truncated("cut inside a length prefix")
-        n = struct.unpack(">I", hdr)[0]
-        fr = resp.read(n)
-        if len(fr) < n:
-            raise Truncated("cut inside a frame")
-        return self.unseal_s2c(fr)
+        """Next s2c plaintext, or None at a clean EOF between events.
+        Revision 2: the reply is text/event-stream, one `data: <base64>`
+        event per frame."""
+        data = []
+        while True:
+            line = resp.readline()
+            if not line:
+                if data:
+                    raise Truncated("cut inside an event")
+                return None
+            if not line.endswith(b"\n"):
+                raise Truncated("cut inside a line")
+            line = line.rstrip(b"\r\n")
+            if line == b"":
+                if not data:
+                    continue            # a stray blank line
+                b = b"".join(data)
+                return self.unseal_s2c(base64.b64decode(b, validate=True))
+            if line.startswith(b":"):
+                continue                # SSE comment
+            if line.startswith(b"data:"):
+                v = line[5:]
+                if v.startswith(b" "):
+                    v = v[1:]
+                data.append(v)
+            # other fields (event:, id:, retry:) carry nothing here
 
     def request(self, action, method="GET", query=None, body=b"", seq=None,
                 extra=None, channel=None, frame=None, timeout=15):
@@ -331,6 +353,7 @@ class SealedClient(object):
         try:
             if r.status != 200:
                 return SealedReply(r.status, r.read())
+            self.last_outer_headers = dict((k.lower(), v) for k, v in r.getheaders())
             first = self.read_frame(r)
             if first is None:
                 raise Truncated("no header frame")
@@ -801,7 +824,7 @@ class TestSealedUnavailable(unittest.TestCase):
         self.assertEqual(code, 501, raw)
         self.assertEqual(json.loads(raw.decode()), {"error": "sealed mode unavailable"})
         code, raw = self.s.post("/api.php?action=sealed&c=" + "a" * 32,
-                                b"\x00" * 64, "application/octet-stream")
+                                json.dumps({"f": base64.b64encode(b"\x00" * 64).decode()}))
         self.assertEqual(code, 501, raw)
         self.assertEqual(json.loads(raw.decode()), {"error": "sealed mode unavailable"})
         code, raw = self.s.post("/api/seal_open", b"{}")
@@ -1099,13 +1122,13 @@ class TestSealedRefusals(_FakeSshCase):
         # same) and shrinks its upload pieces; nothing may run.
         c = self.client(via_tap=False)
         sid, s = self._plant()
-        fr = c.frame_for("input", "POST", None,
-                         json.dumps({"session_id": sid, "data": "CUT"}).encode())
+        fr = c.wrap(c.frame_for("input", "POST", None,
+                                json.dumps({"session_id": sid, "data": "CUT"}).encode()))
         k = socket.create_connection(("127.0.0.1", self.port), timeout=20)
         try:
             k.sendall((
                 "POST /api.php?action=sealed&c={} HTTP/1.1\r\nHost: x\r\n"
-                "Content-Type: application/octet-stream\r\n"
+                "Content-Type: application/json\r\n"
                 "Content-Length: {}\r\n\r\n".format(c.channel, len(fr) + 5000)
             ).encode() + fr)
             k.shutdown(socket.SHUT_WR)
@@ -1121,6 +1144,41 @@ class TestSealedRefusals(_FakeSshCase):
         self.assertRegex(head.split(b"\r\n")[0], rb" 400 ", head[:200])
         self.assertIn(b"client sent fewer bytes than Content-Length", body)
         self.assertEqual(s.writes, [])
+
+    def test_a_bad_json_wrapper_is_bad_frame_and_not_executed(self):
+        c = self.client()
+        sid, s = self._plant()
+        good = c.frame_for("input", "POST", None,
+                           json.dumps({"session_id": sid, "data": "W"}).encode())
+        b64 = base64.b64encode(good).decode()
+        for what, body in (
+                ("not JSON", b"{\"f\": "),
+                ("JSON but not an object", json.dumps([b64]).encode()),
+                ("no f", json.dumps({"g": b64}).encode()),
+                ("f not a string", json.dumps({"f": 12}).encode()),
+                ("f not base64", json.dumps({"f": "!!!" + b64[3:]}).encode()),
+                ("the frame in binary (the old format)", good)):
+            for ctype in ("application/json", "application/octet-stream"):
+                cn, r = c.post_frame(None, raw_body=body, ctype=ctype)
+                raw = r.read()
+                cn.close()
+                self.assertEqual(r.status, 400, (what, ctype, raw[:120]))
+                if ctype == "application/json":
+                    self.assertEqual(json.loads(raw.decode()), {"error": "bad frame"}, what)
+        self.assertEqual(s.writes, [], "nothing executed")
+        # The well-formed one still works (no seq burned by the bad ones).
+        self.assertEqual(c.request(None, frame=good).status, 200)
+        self.assertEqual(s.writes, [b"W"])
+
+    def test_the_reply_is_an_unbuffered_event_stream(self):
+        c = self.client()
+        sid, s = self._plant()
+        r = c.post_json("input", {"session_id": sid, "data": "h"})
+        self.assertEqual(r.status, 200)
+        h = c.last_outer_headers
+        self.assertTrue(h.get("content-type", "").startswith("text/event-stream"), h)
+        self.assertEqual(h.get("cache-control"), "no-cache", h)
+        self.assertEqual(h.get("x-accel-buffering"), "no", h)
 
     def test_unknown_channel_is_410_and_not_executed(self):
         c = self.client()
@@ -1281,12 +1339,24 @@ class TestSealedObserverSeesNothing(_FakeSshCase):
             "upload content": b"CONTENTMARK-upload",
             "JSON key session_id": b"session_id",
             "JSON key action": b"\"action\"",
-            "SSE framing": b"data: {",
-            "event-stream type": b"text/event-stream",
+            "SSE framing of the inner stream": b"data: {",
+            "inner event name": b"event: data",
             "Content-Disposition": b"Content-Disposition",
         }
+        # Revision 2: the frames are base64 text on the wire. Search the
+        # raw text, and every base64 run decoded (ciphertext - nothing in
+        # it may be readable either).
+        decoded = b"".join(base64.b64decode(m + b"=" * (-len(m) % 4))
+                           for m in re.findall(rb"[A-Za-z0-9+/]{16,}={0,2}", wire))
         for what, needle in secrets.items():
             self.assertNotIn(needle, wire, what + " seen in clear on the wire")
+            self.assertNotIn(needle, decoded, what + " seen in a decoded base64 run")
+        # The wire format itself: JSON requests, event-stream replies, no
+        # binary octet-stream anywhere (endpoint-security software on the
+        # owner's machine answered every such POST with its own 503).
+        self.assertNotIn(b"application/octet-stream", c2s)
+        self.assertIn(b"Content-Type: application/json", c2s)
+        self.assertIn(b"text/event-stream", s2c)
         # Every API request line names only seal_open or sealed&c=<hex>.
         lines = self.tap.request_lines()
         self.assertTrue(lines)
@@ -1313,10 +1383,108 @@ def _php_route():
     return None
 
 
+class _SealedThroughAFront(object):
+    """The same sealed exchanges through a front (api.php, nginx): the
+    event-stream reply must pass byte for byte and frame by frame."""
+
+    def front_client(self):
+        c = SealedClient(self.front_port)
+        self.assertEqual(c.open(), 200, getattr(c, "open_body", b""))
+        c.verify_identity()
+        return c
+
+    def test_a_sealed_stream_arrives_frame_by_frame_for_seconds(self):
+        c = self.front_client()
+        sid = self.sealed_connect(c)
+        conn, resp, header = c.open_stream("stream", {"session_id": sid, "since": 0},
+                                           timeout=20)
+        try:
+            self.assertEqual(header.get("status"), 200, header)
+            out = SseText()
+            while b"$ " not in out.text:
+                out.feed(c.read_frame(resp))
+            # Five rounds over several seconds, each typed only after the
+            # previous echo came back through the SAME open request: a
+            # buffering proxy would deliver nothing until the end.
+            for k in range(5):
+                mark = ("PHPMARK_%d_" % k).encode()
+                t0 = time.time()
+                r = c.post_json("input", {"session_id": sid,
+                                          "data": "echo PHPMARK_%d_$((%d*2))\n" % (k, k)})
+                self.assertEqual(r.status, 200)
+                want = mark + str(k * 2).encode()
+                while want not in out.text:
+                    pt = c.read_frame(resp)
+                    self.assertTrue(pt, "the stream ended (or was cut) in the front")
+                    out.feed(pt)
+                self.assertLess(time.time() - t0, 3.0, "round %d took too long" % k)
+                time.sleep(0.8)
+        finally:
+            conn.close()
+
+    def test_a_multi_megabyte_sealed_download_is_identical_and_streamed(self):
+        c = self.front_client()
+        sid = self.sealed_connect(c)
+        payload = os.urandom(5 * 1024 * 1024 + 123)
+        p = os.path.join(self.home, "big-php.bin")
+        with open(p, "wb") as f:
+            f.write(payload)
+        os.environ["FAKE_SSH_SLOW"] = "1"     # the remote trickles it out over ~3 s
+        try:
+            frame = c.frame_for("download", "GET", {"session_id": sid, "path": p})
+            t0 = time.time()
+            conn, r = c.post_frame(frame, timeout=60)
+            self.assertEqual(r.status, 200)
+            header = json.loads(c.read_frame(r).decode())
+            self.assertEqual(header["status"], 200, header)
+            chunks, first_at, clean = [], None, False
+            while True:
+                pt = c.read_frame(r)
+                if pt is None:
+                    break
+                if pt == b"":
+                    clean = True
+                    break
+                if first_at is None:
+                    first_at = time.time() - t0
+                chunks.append(pt)
+            total = time.time() - t0
+            conn.close()
+        finally:
+            os.environ.pop("FAKE_SSH_SLOW", None)
+        body = b"".join(chunks)
+        self.assertTrue(clean, "the reply ends with the end frame")
+        self.assertEqual(len(body), len(payload))
+        self.assertEqual(hashlib.sha256(body).hexdigest(),
+                         hashlib.sha256(payload).hexdigest(), "byte-identical")
+        self.assertGreater(total, 1.5, "the remote really was slow (%.1f s)" % total)
+        self.assertLess(first_at, total / 2,
+                        "first body frame at %.1f s of %.1f s: php buffered the reply"
+                        % (first_at, total))
+
+    def test_replay_and_unknown_channel_answers_pass_through(self):
+        c = self.front_client()
+        sid = str(uuid.uuid4())
+        s = _RecSession(sid)
+        with server.sessions_lock:
+            server.sessions[sid] = s
+        self.addCleanup(self._drop, sid)
+        frame = c.frame_for("input", "POST", None,
+                            json.dumps({"session_id": sid, "data": "P"}).encode())
+        self.assertEqual(c.request(None, frame=frame).status, 200)
+        r = c.request(None, frame=frame)
+        self.assertEqual((r.outer_status, r.outer_json()), (400, {"error": "replay"}))
+        r = c.request(None, frame=frame, channel="0" * 32)
+        self.assertEqual((r.outer_status, r.outer_json()), (410, {"error": "channel unknown"}))
+        self.assertEqual(s.writes, [b"P"])
+
+
+
+
 @NEEDS_CRYPTO
 @unittest.skipUnless(_php_route(), "no php and no websh-php-smoke image "
                      "(docker build -t websh-php-smoke tests/php)")
-class TestSealedThroughPhpProxy(_FakeSshCase):
+class TestSealedThroughPhpProxy(_SealedThroughAFront, _FakeSshCase):
     """api.php in front of the server (php -S, the way tests/php/smoke.sh
     runs it): a sealed request and its long, streamed sealed reply pass
     byte for byte, and frames arrive while the request is still open."""
@@ -1360,6 +1528,7 @@ class TestSealedThroughPhpProxy(_FakeSshCase):
                 cls._stop_php()
                 raise RuntimeError("php -S did not come up on :%d" % cls.php_port)
             time.sleep(0.1)
+        cls.front_port = cls.php_port
 
     @classmethod
     def _stop_php(cls):
@@ -1378,96 +1547,79 @@ class TestSealedThroughPhpProxy(_FakeSshCase):
         cls._stop_php()
         super().tearDownClass()
 
-    def php_client(self):
-        c = SealedClient(self.php_port)
-        self.assertEqual(c.open(), 200, getattr(c, "open_body", b""))
-        c.verify_identity()
-        return c
 
-    def test_a_sealed_stream_through_php_arrives_frame_by_frame_for_seconds(self):
-        c = self.php_client()
-        sid = self.sealed_connect(c)
-        conn, resp, header = c.open_stream("stream", {"session_id": sid, "since": 0},
-                                           timeout=20)
-        try:
-            self.assertEqual(header.get("status"), 200, header)
-            out = SseText()
-            while b"$ " not in out.text:
-                out.feed(c.read_frame(resp))
-            # Five rounds over several seconds, each typed only after the
-            # previous echo came back through the SAME open request: a
-            # buffering proxy would deliver nothing until the end.
-            for k in range(5):
-                mark = ("PHPMARK_%d_" % k).encode()
-                t0 = time.time()
-                r = c.post_json("input", {"session_id": sid,
-                                          "data": "echo PHPMARK_%d_$((%d*2))\n" % (k, k)})
-                self.assertEqual(r.status, 200)
-                want = mark + str(k * 2).encode()
-                while want not in out.text:
-                    pt = c.read_frame(resp)
-                    self.assertTrue(pt, "the stream ended (or was cut) inside php")
-                    out.feed(pt)
-                self.assertLess(time.time() - t0, 3.0, "round %d took too long" % k)
-                time.sleep(0.8)
-        finally:
-            conn.close()
+@NEEDS_CRYPTO
+@unittest.skipUnless(shutil.which("nginx"), "no nginx binary")
+class TestSealedThroughNginx(_SealedThroughAFront, _FakeSshCase):
+    """A private nginx with production's proxy directives
+    (/etc/nginx/sites-enabled/websh: proxy_http_version 1.1,
+    proxy_buffering off, proxy_request_buffering off; gzip on at http
+    level). Plain HTTP here; TLS and HTTP/2 are the e2e ProdFront's."""
 
-    def test_a_multi_megabyte_sealed_download_through_php_is_identical_and_streamed(self):
-        c = self.php_client()
-        sid = self.sealed_connect(c)
-        payload = os.urandom(5 * 1024 * 1024 + 123)
-        p = os.path.join(self.home, "big-php.bin")
-        with open(p, "wb") as f:
-            f.write(payload)
-        os.environ["FAKE_SSH_SLOW"] = "1"     # the remote trickles it out over ~3 s
-        try:
-            frame = c.frame_for("download", "GET", {"session_id": sid, "path": p})
-            t0 = time.time()
-            conn, r = c.post_frame(frame, timeout=60)
-            self.assertEqual(r.status, 200)
-            header = json.loads(c.read_frame(r).decode())
-            self.assertEqual(header["status"], 200, header)
-            chunks, first_at, clean = [], None, False
-            while True:
-                pt = c.read_frame(r)
-                if pt is None:
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.ngx_dir = tempfile.mkdtemp(prefix="websh-sealed-nginx-")
+        cls.front_port = _free_port()
+        d = cls.ngx_dir
+        conf = """
+daemon off; pid {d}/nginx.pid; error_log {d}/error.log info;
+events {{ worker_connections 256; }}
+http {{
+  default_type application/octet-stream;
+  access_log {d}/access.log;
+  gzip on;
+  client_body_temp_path {d}/body; proxy_temp_path {d}/proxy;
+  fastcgi_temp_path {d}/fcgi; uwsgi_temp_path {d}/uwsgi; scgi_temp_path {d}/scgi;
+  server {{
+    listen 127.0.0.1:{port};
+    client_max_body_size 2g;
+    proxy_request_buffering off;
+    location / {{
+      proxy_pass http://127.0.0.1:{up};
+      proxy_http_version 1.1;
+      proxy_set_header Host $http_host;
+      proxy_set_header X-Real-IP $remote_addr;
+      proxy_set_header X-Forwarded-For $remote_addr;
+      proxy_set_header X-Forwarded-Proto $scheme;
+      proxy_read_timeout 1800s; proxy_send_timeout 1800s;
+      proxy_buffering off;
+    }}
+  }}
+}}""".format(d=d, port=cls.front_port, up=cls.port)
+        with open(os.path.join(d, "nginx.conf"), "w") as f:
+            f.write(conf)
+        cls.ngx = subprocess.Popen(["nginx", "-p", d, "-c", os.path.join(d, "nginx.conf")],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.time() + 10
+        while True:
+            try:
+                c = http.client.HTTPConnection("127.0.0.1", cls.front_port, timeout=2)
+                c.request("GET", "/api/ping")
+                if c.getresponse().status == 200:
                     break
-                if pt == b"":
-                    clean = True
-                    break
-                if first_at is None:
-                    first_at = time.time() - t0
-                chunks.append(pt)
-            total = time.time() - t0
-            conn.close()
-        finally:
-            os.environ.pop("FAKE_SSH_SLOW", None)
-        body = b"".join(chunks)
-        self.assertTrue(clean, "the reply ends with the end frame")
-        self.assertEqual(len(body), len(payload))
-        self.assertEqual(hashlib.sha256(body).hexdigest(),
-                         hashlib.sha256(payload).hexdigest(), "byte-identical")
-        self.assertGreater(total, 1.5, "the remote really was slow (%.1f s)" % total)
-        self.assertLess(first_at, total / 2,
-                        "first body frame at %.1f s of %.1f s: php buffered the reply"
-                        % (first_at, total))
+            except OSError:
+                pass
+            if cls.ngx.poll() is not None or time.time() > deadline:
+                cls._stop_ngx()
+                raise RuntimeError("private nginx did not start: see " + d)
+            time.sleep(0.05)
 
-    def test_replay_and_unknown_channel_answers_pass_through_php(self):
-        c = self.php_client()
-        sid = str(uuid.uuid4())
-        s = _RecSession(sid)
-        with server.sessions_lock:
-            server.sessions[sid] = s
-        self.addCleanup(self._drop, sid)
-        frame = c.frame_for("input", "POST", None,
-                            json.dumps({"session_id": sid, "data": "P"}).encode())
-        self.assertEqual(c.request(None, frame=frame).status, 200)
-        r = c.request(None, frame=frame)
-        self.assertEqual((r.outer_status, r.outer_json()), (400, {"error": "replay"}))
-        r = c.request(None, frame=frame, channel="0" * 32)
-        self.assertEqual((r.outer_status, r.outer_json()), (410, {"error": "channel unknown"}))
-        self.assertEqual(s.writes, [b"P"])
+    @classmethod
+    def _stop_ngx(cls):
+        if cls.ngx.poll() is None:
+            cls.ngx.send_signal(signal.SIGQUIT)
+            try:
+                cls.ngx.wait(5)
+            except subprocess.TimeoutExpired:
+                cls.ngx.kill()
+                cls.ngx.wait()
+        shutil.rmtree(cls.ngx_dir, ignore_errors=True)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._stop_ngx()
+        super().tearDownClass()
 
 
 if __name__ == "__main__":

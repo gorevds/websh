@@ -54,12 +54,26 @@ const b64 = u8 => Buffer.from(u8).toString('base64');
 const unb64 = s => new Uint8Array(Buffer.from(s, 'base64'));
 const cat = (...a) => { const n = a.reduce((s, x) => s + x.length, 0); const o = new Uint8Array(n); let i = 0; for (const x of a) { o.set(x, i); i += x.length; } return o; };
 const hex = u8 => Buffer.from(u8).toString('hex');
+// Every base64 run of 16+ characters in a text body, decoded and joined.
+function b64runs(u8) {
+  const t = Buffer.from(u8).toString('latin1');
+  return new Uint8Array(Buffer.concat((t.match(/[A-Za-z0-9+/]{16,}={0,2}/g) || []).map(m => Buffer.from(m, 'base64'))));
+}
 function has(hay, needle) {           // bytes contain bytes
   if (typeof needle === 'string') needle = enc.encode(needle);
   return Buffer.from(hay).indexOf(Buffer.from(needle)) >= 0;
 }
 
 // ── the fake websh server ────────────────────────────────────────────
+
+// Revision 2: every dispatched sealed reply is an event stream.
+const SSE_HEADERS = {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'};
+function ctypeOf(h) {
+  if (!h) return '';
+  if (typeof h.get === 'function') return h.get('Content-Type') || '';
+  for (const k of Object.keys(h)) if (k.toLowerCase() === 'content-type') return String(h[k]);
+  return '';
+}
 
 class FakeWebsh {
   constructor(o) {
@@ -203,13 +217,21 @@ class FakeWebsh {
   async frameOut(ch, pt) {
     const iv = nodeCrypto.randomBytes(12);
     const ct = new Uint8Array(await subtle.encrypt({name: 'AES-GCM', iv, additionalData: enc.encode(ch.channel + ':s2c')}, ch.s2c, pt));
-    const len = Buffer.alloc(4); len.writeUInt32BE(12 + ct.length);
-    return cat(new Uint8Array(len), iv, ct);
+    // Revision 2: one SSE event per frame, the frame in base64.
+    return enc.encode('data: ' + b64(cat(new Uint8Array(iv), ct)) + '\n\n');
   }
-  async sealed(channel, bodyU8) {
+  async sealed(channel, wireU8, ctype) {
     if (this.forgetEvery) this.channels.clear();
     const ch = this.channels.get(channel);
     if (!ch) return {status: 410, json: {error: 'channel unknown'}};
+    // Revision 2: the request is JSON text {"f": base64(frame)}.
+    if (!/^application\/json\b/i.test(ctype || '')) this.badCtype = (this.badCtype || 0) + 1;
+    let bodyU8;
+    try {
+      const f = JSON.parse(dec.decode(wireU8)).f;
+      if (typeof f !== 'string' || !/^[A-Za-z0-9+/]*={0,2}$/.test(f)) throw new Error('f');
+      bodyU8 = unb64(f);
+    } catch (e) { return {status: 400, json: {error: 'bad frame'}}; }
     let pt;
     try {
       pt = new Uint8Array(await subtle.decrypt({name: 'AES-GCM', iv: bodyU8.slice(0, 12), additionalData: enc.encode(channel + ':c2s')},
@@ -220,7 +242,7 @@ class FakeWebsh {
     if (ch.seen.has(header.seq) || header.seq < ch.max - 4096) return {status: 400, json: {error: 'replay'}};
     ch.seen.add(header.seq); ch.max = Math.max(ch.max, header.seq);
     const req = {action: header.action, method: header.method, query: header.query || {}, header,
-                 body: pt.slice(nl + 1), wireLen: bodyU8.length, sealed: true};
+                 body: pt.slice(nl + 1), wireLen: wireU8.length, sealed: true};
     this.inner.push(req);
     if (['seal_open', 'sealed', 'config', 'ping', 'client_diag'].includes(req.action)) return {status: 400, json: {error: 'not allowed'}};
     const r = await this.handle(req);
@@ -274,19 +296,19 @@ class FakeWebsh {
       s.streams.add(st);
       (this.sseStreams = this.sseStreams || []).push(st);
       setTimeout(() => st.send(), 1);
-      return {status: 200, stream};
+      return {status: 200, stream, headers: SSE_HEADERS};
     }
     const parts = [await this.frameOut(ch, enc.encode(JSON.stringify({status: r.status, headers: r.headers || {}})))];
     if (r.body && r.body.length) parts.push(await this.frameOut(ch, r.body));
     if (!r.truncate) parts.push(await this.frameOut(ch, new Uint8Array(0)));
-    return {status: 200, bytes: cat(...parts)};
+    return {status: 200, bytes: cat(...parts), headers: SSE_HEADERS};
   }
 
   // ── transport: one entry for fetch, XHR and beacons ──
-  async exchange(kind, url, method, body) {
+  async exchange(kind, url, method, body, ctype) {
     const u = new URL(url, 'http://localhost/');
     const action = u.searchParams.get('action') || (u.pathname.match(/\/api\/(\w+)/) || [])[1] || '';
-    const rec = {kind, url: String(url), action, method, body};
+    const rec = {kind, url: String(url), action, method, body, ctype: ctype || ''};
     this.wire.push(rec);
     let out;
     if (action === 'seal_open') {
@@ -295,7 +317,7 @@ class FakeWebsh {
       else if (!this.available) out = {status: 501, json: {error: 'sealed mode unavailable'}};
       else out = await this.sealOpen(body);
     } else if (action === 'sealed') {
-      out = !this.available ? {status: 501, json: {error: 'sealed mode unavailable'}} : await this.sealed(u.searchParams.get('c'), body);
+      out = !this.available ? {status: 501, json: {error: 'sealed mode unavailable'}} : await this.sealed(u.searchParams.get('c'), body, ctype);
     } else {
       const query = {};
       u.searchParams.forEach((v, k) => { if (k !== 'action') query[k] = v; });
@@ -325,7 +347,7 @@ function installTransport(win, srv) {
     init = init || {};
     const body = await bodyBytes(win, init.body);
     if (st.dead) return new Promise(() => {});
-    const out = await srv.exchange('fetch', url, (init.method || 'GET').toUpperCase(), body);
+    const out = await srv.exchange('fetch', url, (init.method || 'GET').toUpperCase(), body, ctypeOf(init.headers));
     if (st.dead) return new Promise(() => {});
     if (out.stream) {
       // Like a browser: aborting the request's signal errors the body
@@ -341,7 +363,7 @@ function installTransport(win, srv) {
         },
         cancel() { try { rd.cancel(); } catch (e) {} },
       });
-      return new Response(body, {status: out.status, headers: {'Content-Type': 'application/octet-stream'}});
+      return new Response(body, {status: out.status, headers: out.headers || {'Content-Type': 'application/octet-stream'}});
     }
     if (srv.chunking === 'split' && out.bytes && out.bytes.length && /action=sealed/.test(String(url))) {
       const b = out.bytes;
@@ -355,7 +377,7 @@ function installTransport(win, srv) {
   win.XMLHttpRequest = class {
     constructor() { this.upload = {}; this.status = 0; this.responseText = ''; this.response = null; this.responseType = ''; this.readyState = 0; this._h = {}; }
     open(m, url) { this.method = m; this.url = url; this.readyState = 1; }
-    setRequestHeader() {}
+    setRequestHeader(k, v) { (this._rq = this._rq || {})[k] = v; }
     getResponseHeader(n) { return this._h[n.toLowerCase()] || null; }
     abort() { this.aborted = true; if (this.onabort) this.onabort(); }
     send(body) {
@@ -363,7 +385,7 @@ function installTransport(win, srv) {
         const b = await bodyBytes(win, body);
         if (srv.xhrCut && srv.xhrCut(this, b)) { if (this.onerror) this.onerror(); return; }
         let out;
-        try { out = await srv.exchange('xhr', this.url, this.method.toUpperCase(), b); }
+        try { out = await srv.exchange('xhr', this.url, this.method.toUpperCase(), b, ctypeOf(this._rq)); }
         catch (e) { if (!this.aborted && this.onerror) this.onerror(); return; }
         if (this.aborted || st.dead) return;
         if (this.upload.onprogress) this.upload.onprogress({loaded: b.length, total: b.length, lengthComputable: true});
@@ -639,13 +661,21 @@ test('sealed on: every API call but config/ping goes sealed; no plain URL or bod
       for (const n of [sid, PASSWORD, USER, HOST, 'KEYMARK', 'session_id', 'secret-plan'])
         ok(!has(w.body, n), 'clear body of ' + w.action + ' carries "' + n + '"');
     } else {
-      for (const n of [sid, PASSWORD, USER, 'KEYMARK', 'session_id', '"action"'])
+      // Revision 2: base64 text on the wire - the raw text and every
+      // base64 run decoded.
+      for (const n of [sid, PASSWORD, USER, 'KEYMARK', 'session_id', '"action"']) {
         ok(!has(w.body, n), 'sealed body carries "' + n + '" in clear');
+        ok(!has(b64runs(w.body), n), 'sealed body carries "' + n + '" once its base64 is decoded');
+      }
+      ok(/^application\/json\b/i.test(w.ctype), 'a sealed request is sent as JSON text; got ' + JSON.stringify(w.ctype));
     }
     if (w.reply && w.action !== 'config' && w.action !== 'ping')
-      for (const n of [sid, 'KEYMARK', 'secret-plan', 'CONTENTMARK', 'Welcome'])
+      for (const n of [sid, 'KEYMARK', 'secret-plan', 'CONTENTMARK', 'Welcome']) {
         ok(!has(w.reply, n), 'reply to ' + w.action + ' carries "' + n + '" in clear');
+        ok(!has(b64runs(w.reply), n), 'reply to ' + w.action + ' carries "' + n + '" once its base64 is decoded');
+      }
   }
+  ok(!srv.wire.some(w => /octet-stream/i.test(w.ctype)), 'no application/octet-stream request at all (endpoint security answers those itself)');
   const badge = $(win, 'sealedBadge');
   ok(visible(badge), 'the lock badge is shown while the channel is up');
   ok(badge && (badge.title || '').includes(srv.fp), 'its title shows the fingerprint; got ' + JSON.stringify(badge && badge.title));
@@ -1174,6 +1204,7 @@ test('sealed upload: byte-identical, every piece request the same size, total ro
     const P = r.reqs.length ? r.reqs[0].body.length : 0;
     ok(r.reqs.every(x => x.body.length === P), size + ': every piece carries P bytes of body; ' + [...new Set(r.reqs.map(x => x.body.length))].join(','));
     ok(r.reqs.every(x => typeof x.header.len === 'number'), size + ': each piece header has "len"');
+    ok(!srv.wire.some(w => /octet-stream/i.test(w.ctype)), size + ': no piece went as application/octet-stream');
     const real = r.reqs.filter(x => !x.header.pad), pad = r.reqs.filter(x => x.header.pad);
     ok(real.reduce((s, x) => s + x.header.len, 0) === size, size + ': the lens add up to the file size');
     ok(pad.every(x => x.header.len === 0 && x.header.pad === true), size + ': padding pieces are len 0, pad true');
@@ -1203,9 +1234,9 @@ test('sealed upload: a piece cut by the network shrinks P, and the new P applies
   let cut = 0;
   const realExchange = srv.exchange.bind(srv);
   // The first piece request is cut on the network (no reply).
-  srv.exchange = async (kind, url, method, body) => {
+  srv.exchange = async (kind, url, method, body, ctype) => {
     if (/action=sealed/.test(url) && body.length > 200000 && cut === 0) { cut++; srv.wire.push({kind, url, action: 'sealed', method, body, status: 0}); throw new TypeError('Failed to fetch'); }
-    return realExchange(kind, url, method, body);
+    return realExchange(kind, url, method, body, ctype);
   };
   srv.xhrCut = (xhr, b) => { if (/action=sealed/.test(xhr.url) && b.length > 200000 && cut === 0) { cut++; return true; } return false; };
   const data = randomBytes(9 * 1024 * 1024 + 3);
@@ -1224,9 +1255,9 @@ async function proxyCutUpload(replies) {
     const realExchange = srv.exchange.bind(srv);
     // A proxy that cuts every request body over 1 MiB.
     const tooBig = n => n > 1024 * 1024;
-    srv.exchange = async (kind, url, method, body) => {
+    srv.exchange = async (kind, url, method, body, ctype) => {
       if (/action=sealed/.test(url) && tooBig(body.length)) { cuts++; srv.wire.push({kind, url, action: 'sealed', method, body, status: reply.status}); return reply; }
-      return realExchange(kind, url, method, body);
+      return realExchange(kind, url, method, body, ctype);
     };
     const data = randomBytes(6 * 1024 * 1024 + 11);
     const r = await sealedUpload(env, data, 'proxy.bin');

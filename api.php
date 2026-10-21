@@ -399,9 +399,10 @@ function proxy_stream($url) {
     }
 }
 
-// Sealed channel (docs/protocol.md "Sealed channel"): an opaque binary
-// POST body and an opaque binary reply that may be the output stream or
-// a download inside. The body is passed verbatim; the reply is passed
+// Sealed channel (docs/protocol.md "Sealed channel"): a JSON POST body
+// {"f": base64} and a text/event-stream reply (one base64 frame per
+// event) that may carry the output stream or a download inside. The
+// body is passed verbatim; the reply is passed
 // verbatim and UNBUFFERED, chunk by chunk as the backend writes it, and
 // its status is the backend's (410 "channel unknown" makes the browser
 // open a new channel, so it must not become a 200 or a 502).
@@ -429,7 +430,7 @@ function proxy_sealed($url) {
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
     curl_setopt($ch, CURLOPT_TIMEOUT, 3600);   // as proxy_stream
     curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array(
-        'Content-Type: application/octet-stream',
+        'Content-Type: application/json',
         'Expect:',
     )));
     curl_setopt($ch, CURLOPT_HEADERFUNCTION,
@@ -440,9 +441,9 @@ function proxy_sealed($url) {
                     && preg_match('#^HTTP/\S+\s+(\d+)\b#', $h, $m)) {
                 $code = intval($m[1]);
                 http_response_code($code);
-                header('Cache-Control: no-cache, no-store');
+                header('Cache-Control: no-cache');
                 if ($code === 200) {
-                    header('Content-Type: application/octet-stream');
+                    header('Content-Type: text/event-stream');
                     header('X-Accel-Buffering: no');
                 } else {
                     header('Content-Type: application/json');

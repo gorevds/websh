@@ -194,8 +194,8 @@ available) and Web Crypto in the browser (an HTTPS page).
 **What an observer of the HTTPS connection sees, with it on.** After
 the page has loaded: `POST ?action=seal_open` (two ephemeral public
 keys, a channel id, the server's identity key and a signature) and
-`POST ?action=sealed&c=<channel id>` requests with opaque binary
-bodies and replies. Not in clear anywhere - URL, headers, body - are
+`POST ?action=sealed&c=<channel id>` requests whose JSON bodies and
+event-stream replies carry only base64 of encrypted frames. Not in clear anywhere - URL, headers, body - are
 action names, session ids, host / username / password / key /
 `vault_key`, keystrokes, terminal output, file names, paths, file
 contents, directory listings, tmux slot ids. `/api/config`,
@@ -227,6 +227,13 @@ without the volume) looks exactly like an interception - keep the key.
   is genuine. Against passive reading it works from the first use;
   against an active man in the middle only after the key was pinned
   from a clean network, and only if the page is still the real one.
+- **Software on your own machine that injects script into the page**
+  - antivirus, DLP or "web protection" products that intercept HTTPS
+  and add their own script (seen in the wild: a `main.js?attr=...`
+  that wraps `fetch`) - sees everything the page sees: what you type,
+  what the terminal shows, the files you upload. Sealed mode hides
+  traffic from the network and from proxies that only read it, not
+  from such software.
 - Anything on the browser's machine or the websh server itself: the
   layer ends in the page and in `server.py`. The server still sees and
   logs what it always did (the access log records the inner action).
