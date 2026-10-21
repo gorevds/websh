@@ -71,6 +71,15 @@ invalidates the previous loop's ticket (`p.outGen`).
    event, transient errors are left to EventSource's own auto-retry
    plus our wall-clock budget (below).
 
+With "Encrypt traffic inside websh" on (`docs/protocol.md`, "Sealed
+channel"), `openEventSource` returns a `SealedEventSource` instead: the
+same stream read through a sealed `fetch` whose body is decrypted frame
+by frame as it arrives. It keeps EventSource's behaviour the code above
+relies on - named events, `onerror` + a retry after ~3 s from the last
+event id (sent as `since=`) when the connection drops or ends,
+`readyState` 2 for good on a non-200 reply - so the first-message
+timer, the stall detector and the cursor logic are the same code.
+
 ### Silent connection death
 
 A connection that dies without a FIN - Wi-Fi switched, laptop slept, a

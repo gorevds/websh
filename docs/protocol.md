@@ -277,7 +277,12 @@ Public configuration for the client. Reply: `{"connections": [...],
 "restrict_hosts": bool, "isolate_storage": bool, "session_timeout":
 int, "version": str, "proto": int, "vault_enabled": bool}`
 (connection entries carry no secrets; deployments may extend this with
-additive fields).
+additive fields). Also `"upload_chunks": true` and
+`"sealed": {"available": bool, "identity": "<fingerprint>"|null}` -
+whether this server can open a [sealed channel](#sealed-channel) (it
+can iff `cryptography` imports and its identity key loads) and the
+fingerprint of its identity key: SHA-256 of the key's
+SubjectPublicKeyInfo DER, uppercase hex in 16 groups of 4.
 
 ### POST /api/client_diag
 A page's diagnostics beacon (`navigator.sendBeacon` on `pagehide`, sent
@@ -302,6 +307,9 @@ large, `429` more than 10 per IP in 10 minutes. A server without the
 action answers `404`, which a beacon ignores. Through `api.php` it is an
 ordinary JSON action.
 
+### POST /api/seal_open, POST /api/sealed?c= (sealed channel)
+See [Sealed channel](#sealed-channel) below.
+
 ### GET /api/ping
 Liveness (also used by the PHP shim's auto-start probe). Reply:
 `{"ok": true, "version": str, "proto": int}`.
@@ -311,3 +319,71 @@ Liveness (also used by the PHP shim's auto-start probe). Reply:
 `GET /`, `/index.html`, `/websh.js`, `/assets/websh-logo.svg` are
 served from the script directory with security headers (CSP etc.);
 everything else under GET → `404 {"error": "not found"}`.
+
+## Sealed channel
+
+An opt-in second encryption layer under TLS (the client's "Encrypt
+traffic inside websh" option; what it protects: `docs/security.md`,
+"Sealed traffic"). With it on, the client sends every call except
+`config` and `ping` through these two actions; with it off, nothing
+here is used and every request is what the sections above describe.
+Without `cryptography` both answer `501 {"error": "sealed mode
+unavailable"}`. Through `api.php` both pass unchanged: the body
+verbatim, the reply verbatim and unbuffered, with the backend's status.
+
+### POST /api/seal_open
+Body `{"pub": b64(client ephemeral P-256 public key, raw uncompressed,
+65 bytes)}`. Reply 200:
+`{"channel": "<32 hex>", "pub": b64(server ephemeral raw 65 B),
+"identity": b64(identity SPKI DER), "sig": b64(ECDSA-P256-SHA256, raw
+r||s 64 B, over client_pub || server_pub || channel_ascii)}`.
+`400 {"error": "bad key"}` for a key that is not a P-256 point; shares
+the per-IP side-channel rate limit (`429`).
+
+Keys: `shared = ECDH(client_eph, server_eph)`;
+`K_c2s = HKDF-SHA256(shared, salt = client_pub || server_pub, info =
+"websh sealed c2s", 32 B)`, `K_s2c` the same with `"websh sealed s2c"`;
+AES-256-GCM. The client verifies `sig` with `identity`, and the
+fingerprint of `identity` against the one it pinned on first use,
+before it uses the channel.
+
+Channels live in server memory: idle ones expire after an hour, at
+most 2000 exist (the least recently used is dropped). A restart
+forgets them all.
+
+### POST /api/sealed?c=<channel>
+Frames: `iv (12 random bytes) || AES-GCM ciphertext+tag`, AAD
+`<channel> ":c2s"` or `<channel> ":s2c"`.
+
+Request body (`application/octet-stream`): exactly one c2s frame whose
+plaintext is one JSON header line, `\n`, then the raw inner body.
+Header: `{"seq": int, "method": "GET"|"POST", "action": "<action>",
+"query": {name: string}}`, and for upload pieces `"len": int` (the
+number of real bytes at the start of the inner body; the rest is
+padding and is dropped) and `"pad": true` (a padding-only piece: the
+server replies `{"ok": true, "pad": true}` and runs nothing).
+
+Checked in this order, and nothing is executed when one fails:
+unknown or expired channel `410 {"error": "channel unknown"}` (the
+client opens a new channel and sends the request once more); body
+missing `400 {"error": "bad frame"}`, larger than ~8 MiB `413`, shorter
+than its Content-Length `400 {"error": "client sent fewer bytes than
+Content-Length"}` (the upload code's "cut" signal); a frame that does
+not decrypt or a malformed header `400 {"error": "bad frame"}`; a
+`seq` already used on this channel, or more than 4096 below the
+highest seen, `400 {"error": "replay"}`; `seal_open`, `sealed`,
+`config`, `ping` and `client_diag` inside `400`.
+
+Otherwise the inner request goes to the same handler as the plain
+`/api/<action>?<query>` with that method and body (same validation,
+rate limits, access-log events; an unknown action is the inner `404`),
+and the outer reply is `200 application/octet-stream`: a sequence of
+`uint32 big-endian length || s2c frame`. The first frame's plaintext is
+`{"status": int, "headers": {...}}` (the inner status and headers -
+Content-Type, Content-Length, Content-Disposition, ...); each following
+frame is a piece of the inner body, sent as the handler writes it (the
+SSE stream and downloads stream); an empty frame ends the reply. A
+reply that stops without the empty frame is truncated: the client
+treats it as a dropped connection. An inner reply that declared a
+Content-Length and did not reach it (a cut download) gets no end frame.
+

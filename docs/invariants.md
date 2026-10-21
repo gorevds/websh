@@ -172,7 +172,8 @@ resets the renderer, each with a `console.warn`. A pane coming back on
 screen is repainted, refitted only if its box changed (no
 `/api/resize` otherwise). Hidden tabs are not watched (U1, U2). A page
 leaving with a stuck-looking pane sends one `client_diag` beacon (no
-content), logged as one line.
+content), logged as one line - except in sealed mode (X7), where it is
+not sent at all.
 Guard: e2e `wedge` (a parser hook throws once while a plain pane
 prints: typed text back on screen in ~0.2 s, output keeps flowing to
 its last line, 3 rounds; on the code before the fix the pane froze at
@@ -395,6 +396,58 @@ user's login shell. Guard: backend `TestSideChannelSnippetsExecuted`.
 **X6. Remote output cannot replace the clipboard by itself** (OSC 52
 needs a user gesture). Guard: frontend `CURSOR_HIDE: OSC 52…` and the
 clipboard tests around it.
+
+**X7. Sealed mode never downgrades, and what crosses the network says
+nothing.** The owner (2026-10): a work laptop behind a TLS-inspecting
+proxy, DPI at the ISP - "nobody may read, or even partly understand,
+what I type or upload". Written before release (not yet a bug that
+reached a user): what must hold once the Options checkbox
+"Encrypt traffic inside websh" is on. Every API call but `config` /
+`ping` goes as `seal_open` / `sealed&c=<channel>`; no URL, header or
+body carries an action, a session id, credentials, keys typed, output,
+paths, file names or contents. If the channel cannot be opened, or the
+server's identity differs from the pinned one, nothing is sent - not
+in clear, not through the unverified key - and the user sees why.
+A lost channel (410, a restart) is reopened and the request resent
+once: no key lost or doubled. Keys typed while the channel is unusable
+(key-changed modal open, channel cannot be opened, 410 backoff) follow
+I3: a short blockage delivers them once, in order; older than
+`INPUT_HOLD_MS` they are dropped, never delivered late. Through
+`api.php` the sealed bytes pass unchanged and unbuffered. A replayed, tampered or unknown-channel
+frame executes nothing. Inside, a request means exactly what the plain
+URL means (rate limits, access log with the inner action). Upload
+pieces of one upload are one size on the wire, the total rounded up
+to a size bucket, the file byte-identical. Off means today's requests,
+byte for byte. The `client_diag` beacon (O9) is not sent while on.
+Guard: backend `test_sealed.py` (a reference client, a wire tap that
+looks at the raw bytes, a real PTY shell behind a fake `ssh`); frontend
+`test_sealed.js` (a fake server speaking the wire contract, every
+request recorded raw and decrypted; `sealed I3: …`); backend
+`TestSealedThroughPhpProxy` (php -S or the websh-php-smoke image);
+e2e `sealed`, `sealedtoggle`, `sealedrestart`, and any scenario with
+`E2E_SEALED=1` (requests are still counted by their inner action;
+`tabstress` there caught the lock badge squeezing the tab strip below
+one tab's width at 560 px).
+
+How the code holds X7: every API call goes through one of three
+boundaries - `apiFetch` (fetch), `openEventSource` (the output stream),
+`newApiXhr` (upload pieces) - which decide plain or sealed per call
+from `settings.sealed`; the call sites are unchanged. A call that
+cannot be sealed gets a local `503 {"code":"sealed_unavailable"}` that
+was never sent (the output loops retry inside their budget; the input
+queue holds the batch in `p.sealHeld`, ahead of later keys, and sends it
+when the channel can be tried again), plus a toast and no badge. A second `410`
+right after a fresh channel fails the call and backs off (2 s doubling
+to 8 s, under `INPUT_HOLD_MS`) instead of looping. Keys are never delivered late (I3): a sealed
+call whose caller gave up while it waited for the channel (the input
+stall timer) is not sent, and an `input` that waited for the channel
+longer than `INPUT_HOLD_MS` (the "key changed" dialog left open) is
+dropped with a toast, never sent; held batches whose oldest key is older
+than `INPUT_HOLD_MS` are all dropped with that toast (never the end of
+a command without its start). Closing a sealed stream cancels its
+body quietly - no unhandled rejection in the page. The server runs the inner request through
+the same `_dispatch` with only path, headers, body and `wfile` swapped
+(`Handler._sealed`), so I1-I4 and O1-O9 hold through it unchanged.
 
 ## Tests themselves
 

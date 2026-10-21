@@ -52,6 +52,8 @@ import datetime
 import fcntl
 import gzip
 import hashlib
+import http.client
+import io
 import ipaddress
 import json
 import os
@@ -82,6 +84,19 @@ except ImportError:  # pragma: no cover - exercised by the no-deps CI job
     AESGCM = None
     InvalidTag = Exception
     HAS_CRYPTOGRAPHY = False
+
+# The sealed channel (see "Sealed channel" below) needs the EC half of
+# the same optional module: ECDH + ECDSA on P-256, HKDF-SHA256.
+try:
+    from cryptography.hazmat.primitives import hashes as _c_hashes
+    from cryptography.hazmat.primitives import serialization as _c_ser
+    from cryptography.hazmat.primitives.asymmetric import ec as _c_ec
+    from cryptography.hazmat.primitives.asymmetric.utils import \
+        decode_dss_signature as _c_decode_dss
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF as _c_HKDF
+    HAS_SEALED_CRYPTO = HAS_CRYPTOGRAPHY
+except ImportError:  # pragma: no cover - exercised by the no-deps CI job
+    HAS_SEALED_CRYPTO = False
 
 # ─── Knob resolution ─────────────────────────────────────────────────
 #
@@ -126,12 +141,15 @@ _SERVER_KNOBS = _server_knobs()
 # per-IP-cap spoofing), nor redirect the filesystem paths the server
 # writes to — WEBSH_ACCESS_LOG (arbitrary-path O_APPEND|O_CREAT) and
 # WEBSH_CREDS_PATH (where the vault's _save_creds_atomic os.replace()
-# lands, i.e. arbitrary-path file overwrite). All env only.
+# lands, i.e. arbitrary-path file overwrite). All env only. The same
+# goes for WEBSH_SEALED_KEY_FILE (the sealed channel's identity key is
+# created there).
 # WEBSH_AUTH_HEADER flips authentication semantics and WEBSH_RECORD_DIR
 # is another filesystem write path, so both are env-only as well.
 _ENV_ONLY_KNOBS = frozenset({
     "HOST", "TRUSTED_PROXIES", "WEBSH_ACCESS_LOG", "WEBSH_CREDS_PATH",
-    "WEBSH_AUTH_HEADER", "WEBSH_RECORD_DIR", "WEBSH_RECORD_INPUT"})
+    "WEBSH_AUTH_HEADER", "WEBSH_RECORD_DIR", "WEBSH_RECORD_INPUT",
+    "WEBSH_SEALED_KEY_FILE"})
 
 # Every name that went through _knob() at import: lets main() warn about
 # "server" keys that can never take effect (env-only, or a typo) instead
@@ -1755,6 +1773,10 @@ def config_public():
         # that appends them; an older one would overwrite the file with
         # each piece.
         "upload_chunks": True,
+        # Sealed channel: whether this server can open one, and the
+        # fingerprint of its identity key (the browser pins it on first
+        # use and shows it next to the setting).
+        "sealed": _sealed_public(),
     }
     # Optional connect-form prefill (websh.json "form_defaults"): lets a
     # deployment seed host/port/username in the manual form without
@@ -3823,6 +3845,7 @@ def cleanup():
     # Scan-pattern values are (ts, host) tuples, not bare timestamps.
     _prune_stale(_scan_pattern, _scan_pattern_lock,
                  now - SCAN_PATTERN_WINDOW, ts_of=lambda e: e[0])
+    _sealed_prune()
 
 
 def _cleanup_loop():
@@ -3833,6 +3856,274 @@ def _cleanup_loop():
             cleanup()
         except Exception:
             pass
+
+
+# ─── Sealed channel ──────────────────────────────────────────────────
+#
+# An opt-in second encryption layer under TLS, for networks that read
+# HTTPS (a corporate root CA, DPI). With "Encrypt traffic inside websh"
+# on, the page opens a channel (/api/seal_open: ephemeral ECDH P-256,
+# the reply signed by this server's long-lived identity key, which the
+# browser pins on first use) and then sends every API call as one
+# AES-256-GCM frame to /api/sealed?c=<channel>. The frame carries the
+# inner method, action, query and body; the server dispatches it to the
+# SAME handler a plain request would reach (Handler._sealed), and the
+# reply goes back as a stream of length-prefixed frames, so the SSE
+# stream and downloads still stream. Wire contract: docs/protocol.md
+# "Sealed channel"; what it protects and what not: docs/security.md.
+#
+# Channels live in memory only: a restart forgets them, the client gets
+# 410 "channel unknown" (before anything is executed) and opens a new
+# one. Without `cryptography` the mode is unavailable (501), everything
+# else is unchanged.
+
+SEALED_CHANNEL_IDLE = 3600        # seconds an unused channel survives
+SEALED_CHANNEL_MAX = 2000         # oldest dropped beyond this
+SEALED_REPLAY_WINDOW = 4096       # seqs this far below the highest are refused
+# Inner actions that must not travel sealed: the handshake itself, the
+# plain bootstrap calls, and the diagnostics beacon (not sent at all in
+# sealed mode).
+SEALED_FORBIDDEN = frozenset({"seal_open", "sealed", "config", "ping",
+                              "client_diag"})
+# The largest frame accepted: a full request body plus one upload piece
+# (the client's largest is 4 MiB) and the frame/header overhead.
+SEALED_MAX_BODY = max(MAX_BODY_SIZE, 8 * 1024 * 1024) + 64 * 1024
+
+_sealed_lock = Lock()
+_sealed_id = None                 # (private key, SPKI DER, fingerprint)
+_sealed_id_path = None            # the path _sealed_id / _sealed_id_error are for
+_sealed_id_error = None           # why the identity could not be loaded
+_sealed_channels = OrderedDict()  # channel id -> _SealedChannel
+_sealed_channels_lock = Lock()
+
+
+def _sealed_key_path():
+    """WEBSH_SEALED_KEY_FILE (env only), else websh.sealed.key in the
+    directory of the vault's credential store."""
+    env = str(_knob("WEBSH_SEALED_KEY_FILE", "")).strip()
+    if env:
+        return env
+    return os.path.join(os.path.dirname(os.path.abspath(_creds_path())),
+                        "websh.sealed.key")
+
+
+def _sealed_fingerprint(spki_der):
+    """SHA-256 of the SubjectPublicKeyInfo DER: uppercase hex in 16
+    groups of 4, the form the browser shows next to the setting."""
+    h = hashlib.sha256(spki_der).hexdigest().upper()
+    return " ".join(h[i:i + 4] for i in range(0, len(h), 4))
+
+
+def _sealed_identity(create=False):
+    """(private key, SPKI DER, fingerprint), or None when sealed mode is
+    unavailable. Loaded once per path. A missing file is created (mode
+    0600) by main() at start (`create`), or on first use when
+    WEBSH_SEALED_KEY_FILE names it - never at the implicit default path
+    by a request, so importing the module (tests, tools) cannot leave a
+    key in whatever the working directory is. An existing file that
+    cannot be read or is not a P-256 key is never overwritten - the
+    browsers that pinned it would all see a key change - and leaves the
+    mode unavailable until it is fixed and the server restarted."""
+    global _sealed_id, _sealed_id_path, _sealed_id_error
+    if not HAS_SEALED_CRYPTO:
+        return None
+    path = _sealed_key_path()
+    with _sealed_lock:
+        if _sealed_id_path == path:
+            return _sealed_id
+        explicit = bool(str(_knob("WEBSH_SEALED_KEY_FILE", "")).strip())
+        try:
+            try:
+                with open(path, "rb") as f:
+                    pem = f.read()
+                key = _c_ser.load_pem_private_key(pem, password=None)
+                if not isinstance(key, _c_ec.EllipticCurvePrivateKey) or \
+                        key.curve.name != "secp256r1":
+                    raise ValueError("not an ECDSA P-256 key")
+            except FileNotFoundError:
+                if not (create or explicit):
+                    return None     # main() creates it; nothing cached
+                key = _c_ec.generate_private_key(_c_ec.SECP256R1())
+                pem = key.private_bytes(
+                    _c_ser.Encoding.PEM, _c_ser.PrivateFormat.PKCS8,
+                    _c_ser.NoEncryption())
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                             0o600)
+                try:
+                    os.write(fd, pem)
+                finally:
+                    os.close(fd)
+                _log("INFO", "sealed channel: created identity key {}"
+                     .format(path))
+            spki = key.public_key().public_bytes(
+                _c_ser.Encoding.DER,
+                _c_ser.PublicFormat.SubjectPublicKeyInfo)
+            _sealed_id = (key, spki, _sealed_fingerprint(spki))
+            _sealed_id_error = None
+        except Exception as e:
+            _sealed_id = None
+            _sealed_id_error = "{}: {}".format(path, e)
+            _log("ERROR", "sealed channel: unavailable, identity key {}"
+                 .format(_sealed_id_error))
+        _sealed_id_path = path
+        return _sealed_id
+
+
+def _sealed_public():
+    """The /api/config "sealed" object."""
+    ident = _sealed_identity()
+    return {"available": ident is not None,
+            "identity": ident[2] if ident else None}
+
+
+class _SealedChannel:
+    """One browser's channel: its two AES-GCM keys and the replay
+    window over the request seqs it has used."""
+
+    def __init__(self, cid, k_c2s, k_s2c):
+        self.cid = cid
+        self.c2s = AESGCM(k_c2s)
+        self.s2c = AESGCM(k_s2c)
+        self.aad_c2s = (cid + ":c2s").encode("ascii")
+        self.aad_s2c = (cid + ":s2c").encode("ascii")
+        self.last_used = time.time()
+        self.lock = Lock()
+        self.max_seq = -1
+        self.seen = set()
+
+    def take_seq(self, seq):
+        """True (and remembered) when `seq` was never used on this
+        channel and is not older than the replay window."""
+        with self.lock:
+            if seq in self.seen or seq <= self.max_seq - SEALED_REPLAY_WINDOW:
+                return False
+            self.seen.add(seq)
+            if seq > self.max_seq:
+                self.max_seq = seq
+                floor = seq - SEALED_REPLAY_WINDOW
+                if len(self.seen) > 2 * SEALED_REPLAY_WINDOW:
+                    self.seen = {s for s in self.seen if s > floor}
+            return True
+
+    def open_frame(self, frame):
+        """Decrypt one c2s frame; raises on anything but a valid one."""
+        if len(frame) < 12 + 16:
+            raise ValueError("short frame")
+        return self.c2s.decrypt(frame[:12], frame[12:], self.aad_c2s)
+
+    def seal_frame(self, plain):
+        """One s2c frame, length-prefixed for the response stream."""
+        iv = os.urandom(12)
+        frame = iv + self.s2c.encrypt(iv, plain, self.aad_s2c)
+        return struct.pack(">I", len(frame)) + frame
+
+
+def _sealed_open(client_raw):
+    """Handshake: returns the /api/seal_open reply, or raises ValueError
+    for a bad client key."""
+    ident = _sealed_identity()
+    if ident is None:
+        raise RuntimeError("sealed mode unavailable")
+    if len(client_raw) != 65 or client_raw[:1] != b"\x04":
+        raise ValueError("bad key")
+    client_pub = _c_ec.EllipticCurvePublicKey.from_encoded_point(
+        _c_ec.SECP256R1(), client_raw)
+    eph = _c_ec.generate_private_key(_c_ec.SECP256R1())
+    server_raw = eph.public_key().public_bytes(
+        _c_ser.Encoding.X962, _c_ser.PublicFormat.UncompressedPoint)
+    shared = eph.exchange(_c_ec.ECDH(), client_pub)
+    salt = client_raw + server_raw
+
+    def derive(info):
+        return _c_HKDF(algorithm=_c_hashes.SHA256(), length=32, salt=salt,
+                       info=info).derive(shared)
+
+    cid = os.urandom(16).hex()
+    chan = _SealedChannel(cid, derive(b"websh sealed c2s"),
+                          derive(b"websh sealed s2c"))
+    der = ident[0].sign(client_raw + server_raw + cid.encode("ascii"),
+                        _c_ec.ECDSA(_c_hashes.SHA256()))
+    r, s = _c_decode_dss(der)
+    sig = r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    with _sealed_channels_lock:
+        _sealed_channels[cid] = chan
+        while len(_sealed_channels) > SEALED_CHANNEL_MAX:
+            _sealed_channels.popitem(last=False)
+    b64 = lambda b: base64.b64encode(b).decode("ascii")
+    return {"channel": cid, "pub": b64(server_raw),
+            "identity": b64(ident[1]), "sig": b64(sig)}
+
+
+def _sealed_channel(cid):
+    """The live channel `cid`, or None (unknown or idle too long)."""
+    now = time.time()
+    with _sealed_channels_lock:
+        chan = _sealed_channels.get(cid) if isinstance(cid, str) else None
+        if chan is None:
+            return None
+        if now - chan.last_used > SEALED_CHANNEL_IDLE:
+            del _sealed_channels[cid]
+            return None
+        chan.last_used = now
+        _sealed_channels.move_to_end(cid)
+        return chan
+
+
+def _sealed_prune():
+    """Drop idle channels (called from cleanup())."""
+    cutoff = time.time() - SEALED_CHANNEL_IDLE
+    with _sealed_channels_lock:
+        for cid in [c for c, ch in _sealed_channels.items()
+                    if ch.last_used < cutoff]:
+            del _sealed_channels[cid]
+
+
+class _SealedWriter:
+    """Stands in for Handler.wfile while an inner request runs: the
+    inner status line and headers become the first frame, every write
+    one more frame, sent at once (an SSE event or a download chunk is
+    not held back). finish() writes the empty frame that marks a clean
+    end - unless the inner reply declared a Content-Length it did not
+    reach, which is a truncated body, as it would be in plain HTTP."""
+
+    def __init__(self, chan, raw):
+        self.chan = chan
+        self.raw = raw
+        self.status = None
+        self.headers = {}
+        self.started = False
+        self.sent = 0
+
+    def start(self):
+        head = {"status": self.status or 200, "headers": self.headers}
+        self.raw.write(self.chan.seal_frame(json.dumps(head).encode("utf-8")))
+        self.started = True
+
+    def write(self, data):
+        if not data:
+            return 0      # an empty frame means "end"; nothing to send
+        data = bytes(data)
+        self.raw.write(self.chan.seal_frame(data))
+        self.sent += len(data)
+        return len(data)
+
+    def flush(self):
+        self.raw.flush()
+
+    def finish(self):
+        if not self.started:
+            return        # the handler wrote nothing: no reply, as plain
+        declared = None
+        for k, v in self.headers.items():
+            if k.lower() == "content-length":
+                try:
+                    declared = int(v)
+                except (TypeError, ValueError):
+                    pass
+        if declared is not None and self.sent < declared:
+            return
+        self.raw.write(self.chan.seal_frame(b""))
+        self.raw.flush()
 
 
 # ─── HTTP handler ────────────────────────────────────────────────────
@@ -3962,9 +4253,34 @@ class Handler(BaseHTTPRequestHandler):
     # knows whether a 500 can still be sent.
     _headers_sent = False
 
+    # While a sealed request's inner handler runs (Handler._sealed), its
+    # status and headers go into this _SealedWriter instead of onto the
+    # wire. None for every plain request: those three methods then do
+    # exactly what BaseHTTPRequestHandler does.
+    _sealed_out = None
+
     def send_response(self, code, message=None):
         self._headers_sent = True
+        out = self._sealed_out
+        if out is not None:
+            out.status = code
+            out.headers = {}
+            return
         BaseHTTPRequestHandler.send_response(self, code, message)
+
+    def send_header(self, keyword, value):
+        out = self._sealed_out
+        if out is not None:
+            out.headers[keyword] = value
+            return
+        BaseHTTPRequestHandler.send_header(self, keyword, value)
+
+    def end_headers(self):
+        out = self._sealed_out
+        if out is not None:
+            out.start()
+            return
+        BaseHTTPRequestHandler.end_headers(self)
 
     def _json(self, obj, status=200):
         body = json.dumps(obj).encode("utf-8")
@@ -4154,6 +4470,8 @@ class Handler(BaseHTTPRequestHandler):
         "mv":              "_mv",
         "save":            "_save_credential",
         "client_diag":     "_client_diag",
+        "seal_open":       "_seal_open",
+        "sealed":          "_sealed",
         # Compatibility with the bundled frontend in Python-only mode.
         # The PHP shim translates POST ?action=save_delete into
         # DELETE /api/save; when server.py serves api.php-style URLs
@@ -4233,6 +4551,167 @@ class Handler(BaseHTTPRequestHandler):
 
     def _ping(self):
         self._json({"ok": True, "version": __version__, "proto": PROTO_VERSION})
+
+    # ── Sealed channel ──────────────────────────────────────────────
+
+    def _reply_sealed_unavailable(self):
+        self._json({"error": "sealed mode unavailable"}, 501)
+
+    def _seal_open(self):
+        """POST /api/seal_open {"pub": b64(65-byte P-256 point)} - open a
+        sealed channel (see the "Sealed channel" section above). Costs an
+        ECDH, a key generation and a signature, so it shares the per-IP
+        side-channel rate limit."""
+        if _sealed_identity() is None:
+            self._reply_sealed_unavailable()
+            return
+        if self._side_channel_throttled():
+            return
+        body = self._json_body()
+        if body is None:
+            return
+        pub = body.get("pub")
+        try:
+            if not isinstance(pub, str):
+                raise ValueError("pub must be a string")
+            reply = _sealed_open(base64.b64decode(pub, validate=True))
+        except (ValueError, TypeError, binascii.Error):
+            self._json({"error": "bad key"}, 400)
+            return
+        self._json(reply)
+
+    def _sealed(self):
+        """POST /api/sealed?c=<channel> - one sealed request. The body is
+        one c2s frame: a JSON header line (seq, method, action, query,
+        and for upload pieces len/pad), then the inner body. Nothing runs
+        unless the channel is known, the frame decrypts and its seq is
+        new. The inner request then goes through _dispatch exactly as the
+        plain /api/<action> would - same handler, rate limits and
+        access-log events - with only the transport swapped: path,
+        headers and body are the inner ones, and the reply is written
+        through a _SealedWriter as a stream of s2c frames."""
+        if _sealed_identity() is None:
+            self._reply_sealed_unavailable()
+            return
+        params = urllib.parse.parse_qs(
+            urllib.parse.urlparse(self.path).query)
+        chan = _sealed_channel(params.get("c", [""])[0])
+        if chan is None:
+            self._json({"error": "channel unknown"}, 410)
+            return
+        try:
+            n = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            n = -1
+        if n <= 0:
+            self._json({"error": "bad frame"}, 400)
+            return
+        if n > SEALED_MAX_BODY:
+            self._json({"error": "request body too large"}, 413)
+            return
+        try:
+            frame = self.rfile.read(n)
+        except socket.timeout:
+            frame = b""
+        if len(frame) < n:
+            # A proxy that cuts request bodies: the upload code knows
+            # this text and shrinks its pieces (docs/invariants.md O7b).
+            self._json({"error": "client sent fewer bytes than "
+                                 "Content-Length"}, 400)
+            return
+        try:
+            plain = chan.open_frame(frame)
+        except Exception:
+            self._json({"error": "bad frame"}, 400)
+            return
+        head, _, inner_body = plain.partition(b"\n")
+        try:
+            hdr = json.loads(head.decode("utf-8"))
+            if not isinstance(hdr, dict):
+                raise ValueError("header")
+            seq = hdr.get("seq")
+            method = hdr.get("method")
+            action = hdr.get("action")
+            query = hdr.get("query") or {}
+            if not isinstance(seq, int) or isinstance(seq, bool) or \
+                    seq < 0 or method not in ("GET", "POST") or \
+                    not isinstance(action, str) or \
+                    not re.match(r"^[a-z_]{1,32}$", action) or \
+                    not isinstance(query, dict):
+                raise ValueError("header")
+            q = []
+            for k, v in query.items():
+                if isinstance(v, bool) or not isinstance(v, (str, int)):
+                    raise ValueError("query")
+                q.append((str(k), str(v)))
+            length = hdr.get("len")
+            if length is not None:
+                if not isinstance(length, int) or isinstance(length, bool) \
+                        or not 0 <= length <= len(inner_body):
+                    raise ValueError("len")
+                inner_body = inner_body[:length]
+        except Exception:
+            self._json({"error": "bad frame"}, 400)
+            return
+        if not chan.take_seq(seq):
+            self._json({"error": "replay"}, 400)
+            return
+        if action in SEALED_FORBIDDEN:
+            self._json({"error": "action not allowed sealed"}, 400)
+            return
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        self.wfile.flush()
+
+        out = _SealedWriter(chan, self.wfile)
+        if hdr.get("pad") is True:
+            # Upload padding past the real end of the file: acknowledged,
+            # nothing executed, the file is not touched.
+            body = json.dumps({"ok": True, "pad": True}).encode("utf-8")
+            out.status = 200
+            out.headers = {"Content-Type": "application/json",
+                           "Content-Length": str(len(body))}
+            out.start()
+            out.write(body)
+            out.finish()
+            return
+
+        inner_headers = http.client.HTTPMessage()
+        for k, v in self.headers.items():
+            if k.lower() not in ("content-length", "content-type",
+                                 "last-event-id", "transfer-encoding",
+                                 "expect"):
+                inner_headers[k] = v
+        inner_headers["Content-Length"] = str(len(inner_body))
+        if method == "POST":
+            inner_headers["Content-Type"] = "application/json"
+        saved = (self.path, self.headers, self.rfile, self.wfile,
+                 self.command)
+        self.path = "/api/" + action + \
+            ("?" + urllib.parse.urlencode(q) if q else "")
+        self.headers = inner_headers
+        self.rfile = io.BytesIO(inner_body)
+        self.wfile = out
+        self.command = method
+        self._headers_sent = False
+        self._sealed_out = out
+        try:
+            self._dispatch(self._POST_ROUTES if method == "POST"
+                           else self._GET_ROUTES)
+        finally:
+            self._sealed_out = None
+            (self.path, self.headers, self.rfile, self.wfile,
+             self.command) = saved
+            self._headers_sent = True
+        try:
+            out.finish()
+        except OSError:
+            pass    # the client left; nothing to tell it
 
     # ── Source-IP / session-ID validation ───────────────────────────
 
@@ -6256,6 +6735,15 @@ def main():
         _log("INFO", "credential vault: disabled (set WEBSH_VAULT_ENABLE=1 to opt in)")
     else:
         _log("INFO", "credential vault: enabled")
+    # The identity is created here on first start, so the fingerprint a
+    # browser will pin is in the log before anyone connects.
+    if not HAS_SEALED_CRYPTO:
+        _log("INFO", "sealed channel: unavailable (install cryptography "
+             "to enable)")
+    else:
+        ident = _sealed_identity(create=True)
+        if ident is not None:
+            _log("INFO", "sealed channel: identity {}".format(ident[2]))
     if _WEBSH_RECORD_INPUT_REQUESTED:
         _log("WARN", "WEBSH_RECORD_INPUT is set but IGNORED: keystroke/input "
                      "recording is hard-disabled (recording is output-only). "

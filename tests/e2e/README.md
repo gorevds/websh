@@ -37,7 +37,17 @@ and on the network, and unit tests passed while they were live.
 | `reconnectbreak` | the Reconnect control under attack while a pane stays disconnected: auth_failed straight from a plain drop and the message changing in place, the window resized 1200 / 640 / 1000 / 560 px, terminal font zoom (split and lone), device pixel ratio 1.5, its tab hidden + window resized + shown again, three reconnect/drop cycles split and lone (one control, no stale strip, no /api/resize from the strip), the lone strip with the search bar, the tmux banner and the retry banner (no overlap). Placement: centred when there is room, else right next to the buttons, never over them |
 | `tabhide` | a control whose action is impossible is not shown: with one tab no "Move to tab" (top bar of a lone pane, every pane bar; hit-tested) and no "Move into tab" in the tab menu; a second tab brings both back at once; closing it by its x or Alt+W, or emptying it by a move, hides them at once; a reload with one tab keeps them hidden; at 560 px the tab in front stays inside the strip as the button comes and goes; the only tab dragged with a real mouse shows no drag look and the next click is not swallowed, with two tabs the same gesture reorders |
 | `wedge` | a throw inside xterm's parse loop (a parser hook that throws once, plain pane, output streaming) does not freeze the pane until reload: typed text back on screen within 3 s, output flows to its last line, 3 rounds; a 15 s spinner triggers no `paint:` recovery |
+| `sealed` | sealed mode switched on in Options with a live pane (the user's click): the lock badge comes up, Options shows the fingerprint the server logged at start, typed text is executed and echoed, a 1.3 MB upload lands byte-identical (sha256 on disk); in what Chromium put on the network after the switch (DevTools: what a TLS-inspecting proxy reads) only `seal_open` / `sealed&c=<channel>` URLs, no session id, typed text, output, file name or file content in any URL, body or finished reply, and every upload piece request one size |
+| `sealedtoggle` | sealed mode switched on and off 24 times in 3 s (the Options checkbox) while two split panes are typed into word by word: each pane's line arrives whole, in order, once, in its own pane; output flows in both afterwards; same sessions |
+| `sealedrestart` | sealed mode on, a persistent pane, a 12 MB upload under way, websh restarts: nothing in clear throughout, the upload ends visibly (saved byte-identical, or failed - plain mode fails it the same way), the pane re-attaches to the same tmux shell, the identity is the same (no key-changed modal), typing works |
 | `tabnarrow` | narrow windows (560 / 600 / 640 / 660 / 900 px), five tabs, a lone pane in front (pane actions in the top bar): the strip has room for a whole tab, and every tab, shown, is fully inside the strip |
+
+`E2E_SEALED=1 scripts/e2e.sh …` runs scenarios with sealed mode switched
+on (by the Options checkbox, right after the page boots). Requests are
+still counted by action: the harness wraps the page's
+`crypto.subtle.encrypt` and reads the action from each sealed request's
+header line (`lib.mjs` `_countSealed`), so `b.requests.input`, `.upload`,
+`.resize`, `.connect` mean the same with the mode on.
 
 ## Needs
 

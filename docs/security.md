@@ -182,6 +182,67 @@ State-changing methods (`POST`, `DELETE`) are gated twice:
 - `MAX_SESSIONS` limits concurrent user sessions; `MAX_BG_SESSIONS` limits file transfer sessions separately
 - `MAX_SESSIONS_PER_IP` (off by default) caps how many sessions a single source IP can hold at once — useful when running a public-facing instance where one abuser shouldn't be able to fill all the global slots
 
+## Sealed traffic
+
+Options → "Encrypt traffic inside websh" (off by default) adds a second
+encryption layer under TLS, for networks that read HTTPS: a work
+computer whose TLS-inspecting proxy has its own root CA installed, an
+ISP or state DPI box. Wire format: [`protocol.md`](protocol.md#sealed-channel).
+It needs `cryptography` on the server (`/api/config` says whether it is
+available) and Web Crypto in the browser (an HTTPS page).
+
+**What an observer of the HTTPS connection sees, with it on.** After
+the page has loaded: `POST ?action=seal_open` (two ephemeral public
+keys, a channel id, the server's identity key and a signature) and
+`POST ?action=sealed&c=<channel id>` requests with opaque binary
+bodies and replies. Not in clear anywhere - URL, headers, body - are
+action names, session ids, host / username / password / key /
+`vault_key`, keystrokes, terminal output, file names, paths, file
+contents, directory listings, tmux slot ids. `/api/config`,
+`/api/ping`, the page and its static files stay plain (they carry no
+session data); the `client_diag` beacon is not sent at all.
+
+What it still sees: that a websh page was loaded (its files are
+plain), the timing and sizes of requests and replies (a keystroke is
+a small request; output is a stream), and how long a download is.
+Uploads are padded: every piece of one file has the same size on the
+wire, and the total is rounded up to a bucket (64 KiB x 2^k x {1,
+1.25, 1.5, 1.75}, plus a random extra piece), so a file's size shows
+only as its bucket. Nothing else is padded.
+
+**Trust on first use.** The server's identity key (ECDSA P-256,
+`WEBSH_SEALED_KEY_FILE`, created at first start; its fingerprint is in
+the startup log) signs every handshake. A browser pins the fingerprint
+the first time it opens a channel (shown under the option, to compare
+with the log). If the server later presents another key, nothing is
+sent through the channel: a dialog shows both fingerprints, "Trust
+the new key" or "Cancel"; Cancel leaves the option on and the panes
+failing visibly. A replaced key file (reinstall, a new container
+without the volume) looks exactly like an interception - keep the key.
+
+**What it does not protect against.**
+
+- A proxy that **rewrites** pages can serve its own `websh.js`, which
+  can do anything: the layer protects only as long as the page itself
+  is genuine. Against passive reading it works from the first use;
+  against an active man in the middle only after the key was pinned
+  from a clean network, and only if the page is still the real one.
+- Anything on the browser's machine or the websh server itself: the
+  layer ends in the page and in `server.py`. The server still sees and
+  logs what it always did (the access log records the inner action).
+- It is not a replacement for TLS: it runs inside it.
+
+**No silent downgrade.** While the option is on, a call that cannot be
+sealed - the server cannot seal, the channel cannot be opened, the key
+changed and was not trusted - fails visibly (a local error the call
+sites treat like a busy server, a toast, no lock badge); it is never
+sent in plain form instead (`docs/invariants.md` X7). A server restart
+forgets every channel: the browser opens a new one and resends the
+request once, which is safe because a request on an unknown channel
+is refused (`410`) before anything runs; a seq already used on a
+channel is refused too (`400 replay`), so a captured request cannot be
+played again.
+
 ## Header-trust authentication
 
 websh itself has no user accounts — possession of a session id is the

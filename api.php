@@ -25,7 +25,9 @@ $action  = (isset($_GET['action']) && is_string($_GET['action'])) ? $_GET['actio
 // SSE stream needs a longer execution window than the JSON endpoints.
 // Some shared hosts cap this hard, in which case the stream is killed
 // after the cap and the browser falls back to long-poll automatically.
-if ($action === 'stream') {
+// A sealed request may carry the stream too (its action is inside the
+// encrypted frame), so it gets the same window.
+if ($action === 'stream' || $action === 'sealed') {
     @set_time_limit(0);
 } else {
     @set_time_limit(55);
@@ -37,7 +39,7 @@ if (!extension_loaded('curl')) {
     exit;
 }
 
-if ($action !== 'stream') {
+if ($action !== 'stream' && $action !== 'sealed') {
     header('Content-Type: application/json');
     header('Cache-Control: no-cache, no-store, must-revalidate');
 }
@@ -98,6 +100,7 @@ switch ($action) {
     case 'stream':   proxy_stream($URL);   break;
     case 'download': proxy_download($URL); break;
     case 'upload':   proxy_upload($URL);   break;
+    case 'sealed':   proxy_sealed($URL);   break;
     case 'save_delete':
         // Browsers can't issue DELETE through form posts, so the
         // client POSTs here and we translate to a real backend DELETE.
@@ -390,6 +393,74 @@ function proxy_stream($url) {
     if (!$sent_headers) {
         // curl never received a response status line — treat as gateway
         // failure rather than letting PHP emit its default text/html.
+        http_response_code(502);
+        header('Content-Type: application/json');
+        echo json_encode(array('error' => 'backend unavailable: ' . $err));
+    }
+}
+
+// Sealed channel (docs/protocol.md "Sealed channel"): an opaque binary
+// POST body and an opaque binary reply that may be the output stream or
+// a download inside. The body is passed verbatim; the reply is passed
+// verbatim and UNBUFFERED, chunk by chunk as the backend writes it, and
+// its status is the backend's (410 "channel unknown" makes the browser
+// open a new channel, so it must not become a 200 or a 502).
+function proxy_sealed($url) {
+    $method = isset($_SERVER['REQUEST_METHOD']) ? $_SERVER['REQUEST_METHOD'] : 'GET';
+    if ($method !== 'POST') {
+        header('HTTP/1.1 405 Method Not Allowed');
+        header('Content-Type: application/json');
+        echo '{"error":"method not allowed"}';
+        return;
+    }
+    ignore_user_abort(true);   // see proxy_stream
+    @ini_set('zlib.output_compression', '0');
+    @ini_set('output_buffering', '0');
+    @ini_set('implicit_flush', '1');
+    while (ob_get_level() > 0) { ob_end_clean(); }
+    @ob_implicit_flush(true);
+
+    $sent_headers = false;
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_POST, true);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, file_get_contents('php://input'));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+    curl_setopt($ch, CURLOPT_HEADER, false);
+    curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 3600);   // as proxy_stream
+    curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array(
+        'Content-Type: application/octet-stream',
+        'Expect:',
+    )));
+    curl_setopt($ch, CURLOPT_HEADERFUNCTION,
+        function ($ch, $header) use (&$sent_headers) {
+            $len = strlen($header);
+            $h = trim($header);
+            if (!$sent_headers
+                    && preg_match('#^HTTP/\S+\s+(\d+)\b#', $h, $m)) {
+                $code = intval($m[1]);
+                http_response_code($code);
+                header('Cache-Control: no-cache, no-store');
+                if ($code === 200) {
+                    header('Content-Type: application/octet-stream');
+                    header('X-Accel-Buffering: no');
+                } else {
+                    header('Content-Type: application/json');
+                }
+                $sent_headers = true;
+            }
+            return $len;
+        });
+    curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) {
+        echo $data;
+        @flush();
+        if (connection_aborted()) return 0;
+        return strlen($data);
+    });
+    $ok = curl_exec($ch);
+    $err = curl_error($ch);
+    curl_close($ch);
+    if (!$sent_headers) {
         http_response_code(502);
         header('Content-Type: application/json');
         echo json_encode(array('error' => 'backend unavailable: ' . $err));

@@ -1,0 +1,1282 @@
+// Sealed mode in the browser: a second encryption layer under TLS.
+//
+// Written from the behaviour spec (the owner: "nobody between my browser
+// and my server may read, or even partly understand, what I type or
+// upload"), not from the code. websh.js runs under jsdom; the server is
+// a fake written here that speaks the spec's wire contract with Node's
+// WebCrypto: seal_open (ECDH P-256 + ECDSA identity signature), sealed
+// frames (AES-256-GCM, HKDF keys, AAD channel:c2s / channel:s2c),
+// replies as uint32-length-prefixed frames ending in an empty frame.
+// Every request the page makes - fetch, XHR, beacon - is recorded raw,
+// so "an observer sees nothing" is checked on the bytes, and every
+// sealed request is also decrypted, so "it really went sealed" is too.
+//
+// What these guard (spec, "What the user sees" and "Client"):
+//   - the Options checkbox: default off, persisted, reset turns it off,
+//     disabled when the server cannot do it;
+//   - with the mode on, nothing but config/ping goes out in clear, and
+//     never a silent downgrade to plain requests;
+//   - TOFU pin, and a changed server key stops everything behind a modal;
+//   - a server restart (channel gone: 410) is invisible: reopen, resend
+//     once, no key doubled or lost;
+//   - toggling with open panes loses no key and no output;
+//   - the client_diag beacon is not sent while on;
+//   - uploads: byte-identical, every piece request the same size, the
+//     total rounded up to a size bucket.
+//
+// Same output format as test_connect.js; scripts/check.sh runs it.
+
+const fs = require('fs');
+const path = require('path');
+const {JSDOM} = require('jsdom');
+const nodeCrypto = require('node:crypto');
+const {IDBFactory, IDBKeyRange} = require('fake-indexeddb');
+
+const REPO = path.resolve(__dirname, '..', '..');
+const html = fs.readFileSync(path.join(REPO, 'index.html'), 'utf8');
+const js = fs.readFileSync(path.join(REPO, 'websh.js'), 'utf8');
+const subtle = nodeCrypto.webcrypto.subtle;
+
+let passed = 0, failed = 0, current = '(between scenarios)';
+const failures = [];
+function ok(cond, msg) {
+  if (cond) passed++;
+  else { failed++; failures.push(current + ': ' + msg); console.log('  FAIL: ' + msg); }
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function until(fn, ms) {
+  const end = Date.now() + (ms || 2000);
+  while (Date.now() < end) { try { if (await fn()) return true; } catch (e) {} await sleep(5); }
+  return false;
+}
+const enc = new TextEncoder(), dec = new TextDecoder();
+const b64 = u8 => Buffer.from(u8).toString('base64');
+const unb64 = s => new Uint8Array(Buffer.from(s, 'base64'));
+const cat = (...a) => { const n = a.reduce((s, x) => s + x.length, 0); const o = new Uint8Array(n); let i = 0; for (const x of a) { o.set(x, i); i += x.length; } return o; };
+const hex = u8 => Buffer.from(u8).toString('hex');
+function has(hay, needle) {           // bytes contain bytes
+  if (typeof needle === 'string') needle = enc.encode(needle);
+  return Buffer.from(hay).indexOf(Buffer.from(needle)) >= 0;
+}
+
+// ── the fake websh server ────────────────────────────────────────────
+
+class FakeWebsh {
+  constructor(o) {
+    o = o || {};
+    this.available = o.available !== false;
+    this.reportSealed = o.reportSealed !== false;   // false: an older server (no "sealed" in config)
+    this.wire = [];          // every request: {kind, url, action, method, body: Uint8Array, status}
+    this.inner = [];         // decrypted sealed requests: {action, method, query, header, body, wireLen}
+    this.channels = new Map();
+    this.sessions = {};
+    this.files = {};
+    this.uploads = [];
+    this.beacons = [];
+    this.sealOpenFail = null;      // null | 'neterr' | <status>
+    this.forgetEvery = false;      // every sealed request answers 410 (channel store lost each time)
+    this.hooks = {};               // action -> fn(req) returning a reply, or undefined to fall through
+    this.nSid = 0;
+  }
+  async init() { await this.newIdentity(); return this; }
+  async newIdentity() {
+    this.identity = await subtle.generateKey({name: 'ECDSA', namedCurve: 'P-256'}, true, ['sign', 'verify']);
+    this.spki = new Uint8Array(await subtle.exportKey('spki', this.identity.publicKey));
+    const h = hex(new Uint8Array(await subtle.digest('SHA-256', this.spki))).toUpperCase();
+    this.fp = h.match(/.{4}/g).join(' ');
+  }
+  restart() { this.channels.clear(); }      // channels live in memory only
+  config() {
+    const c = {restrict_hosts: false, connections: [], upload_chunks: true, proto: 1, version: 'test',
+               session_timeout: 300};
+    if (this.reportSealed) c.sealed = {available: this.available, identity: this.available ? this.fp : null};
+    return c;
+  }
+
+  // ── sessions: a tiny shell that echoes what is typed ──
+  newSession() {
+    const sid = '7e57' + String(++this.nSid).padStart(4, '0') + '-aaaa-4bbb-8ccc-' + nodeCrypto.randomBytes(6).toString('hex');
+    this.sessions[sid] = {input: '', out: '', streams: new Set(), alive: true, inputCalls: 0};
+    return sid;
+  }
+  emit(sid, text) {
+    const s = this.sessions[sid]; if (!s) return;
+    const from = s.out.length;
+    s.out += text;
+    for (const st of s.streams) st.send(from);
+  }
+
+  // ── the inner API (what a plain URL would reach) ──
+  async handle(req) {
+    if (this.hooks[req.action]) {
+      const r = await this.hooks[req.action](req);
+      if (r !== undefined) return r;
+    }
+    const q = req.query, j = () => JSON.parse(dec.decode(req.body) || '{}');
+    const json = (obj, status) => ({status: status || 200, headers: {'Content-Type': 'application/json'}, body: enc.encode(JSON.stringify(obj))});
+    switch (req.action) {
+      case 'config': return json(this.config());
+      case 'ping': return json({ok: true, version: 'test', proto: 1});
+      case 'connect': {
+        const sid = this.newSession();
+        setTimeout(() => this.emit(sid, 'Welcome\r\n$ '), 5);
+        return json({session_id: sid, status: 'connecting', alive: true, auth_failed: false,
+                     persistent: !!j().persistent, slot_id: j().slot_id || null, tmux_cmd: 'tmux'});
+      }
+      case 'input': {
+        const b = j(); const s = this.sessions[b.session_id];
+        if (!s) return json({error: 'session not found'}, 404);
+        s.inputCalls++;
+        s.input += b.data;
+        setTimeout(() => this.emit(b.session_id, b.data.replace(/\r/g, '\r\n')), 2);
+        return json({ok: true, alive: true, cursor: s.out.length});
+      }
+      case 'output': {
+        const s = this.sessions[q.session_id];
+        if (!s) return json({error: 'session not found'}, 404);
+        const since = q.since !== undefined ? +q.since : s.out.length;
+        await until(() => s.out.length > since, 40);
+        const data = s.out.slice(since);
+        return json({data: b64(enc.encode(data)), alive: true, auth_failed: false, cursor: s.out.length});
+      }
+      case 'stream': {
+        const s = this.sessions[q.session_id];
+        if (!s) return json({error: 'session not found'}, 404);
+        const since = q.since !== undefined ? +q.since : 0;
+        return {status: 200, headers: {'Content-Type': 'text/event-stream'}, sse: {s, since}};
+      }
+      case 'resize': return json({ok: true});
+      case 'disconnect': { const b = j(); if (this.sessions[b.session_id]) this.sessions[b.session_id].alive = false; return json({ok: true}); }
+      case 'tmux_options': return json({ok: true});
+      case 'tmux_capture': return json({data: ''});
+      case 'ls': return json({path: q.path || '/home/u', entries: [{name: 'secret-plan-Q7.txt', type: 'f', size: 5, mtime: 0}]});
+      case 'download': {
+        const f = this.files[q.path];
+        if (!f) return json({error: 'File not found'}, 404);
+        return {status: 200, headers: {'Content-Type': 'application/octet-stream', 'Content-Length': String(f.length),
+                'Content-Disposition': 'attachment; filename="' + q.path.split('/').pop() + '"'}, body: f};
+      }
+      case 'upload': {
+        const name = q.path, off = q.offset === undefined ? null : +q.offset;
+        const h = req.header || {};
+        const real = h.len !== undefined ? h.len : req.body.length;
+        this.uploads.push({name, offset: off, len: h.len, pad: h.pad, bodyLen: req.body.length, wireLen: req.wireLen});
+        if (h.pad) return json({ok: true, size: (this.files[name] || new Uint8Array(0)).length});
+        const cur = this.files[name] || new Uint8Array(0);
+        if (off !== null && off !== 0 && cur.length !== off) return json({error: 'offset mismatch', size: cur.length}, 409);
+        const piece = req.body.slice(0, real);
+        this.files[name] = off ? cat(cur, piece) : piece;
+        return json({ok: true, bytes: real, size: this.files[name].length});
+      }
+      case 'upload_finalize': {
+        const b = j();
+        this.files['/final/' + b.final] = this.files[b.tmp];
+        return json({ok: true, path: (b.dir || '/home/u') + '/' + b.final});
+      }
+      case 'upload_cancel': return json({ok: true});
+      default: return json({error: 'not found'}, 404);
+    }
+  }
+
+  // ── sealed: handshake and frames ──
+  async sealOpen(bodyU8) {
+    let pub;
+    try { pub = unb64(JSON.parse(dec.decode(bodyU8)).pub); } catch (e) { return {status: 400, json: {error: 'bad key'}}; }
+    let cpubKey;
+    try { cpubKey = await subtle.importKey('raw', pub, {name: 'ECDH', namedCurve: 'P-256'}, true, []); }
+    catch (e) { return {status: 400, json: {error: 'bad key'}}; }
+    const eph = await subtle.generateKey({name: 'ECDH', namedCurve: 'P-256'}, true, ['deriveBits']);
+    const spub = new Uint8Array(await subtle.exportKey('raw', eph.publicKey));
+    const channel = nodeCrypto.randomBytes(16).toString('hex');
+    const shared = await subtle.deriveBits({name: 'ECDH', public: cpubKey}, eph.privateKey, 256);
+    const hk = await subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+    const salt = cat(pub, spub);
+    const key = async info => subtle.importKey('raw',
+      await subtle.deriveBits({name: 'HKDF', hash: 'SHA-256', salt, info: enc.encode(info)}, hk, 256),
+      'AES-GCM', false, ['encrypt', 'decrypt']);
+    const ch = {c2s: await key('websh sealed c2s'), s2c: await key('websh sealed s2c'), seen: new Set(), max: 0, channel};
+    this.channels.set(channel, ch);
+    const sig = new Uint8Array(await subtle.sign({name: 'ECDSA', hash: 'SHA-256'}, this.identity.privateKey,
+                                                  cat(pub, spub, enc.encode(channel))));
+    return {status: 200, json: {channel, pub: b64(spub), identity: b64(this.spki), sig: b64(sig)}};
+  }
+  async frameOut(ch, pt) {
+    const iv = nodeCrypto.randomBytes(12);
+    const ct = new Uint8Array(await subtle.encrypt({name: 'AES-GCM', iv, additionalData: enc.encode(ch.channel + ':s2c')}, ch.s2c, pt));
+    const len = Buffer.alloc(4); len.writeUInt32BE(12 + ct.length);
+    return cat(new Uint8Array(len), iv, ct);
+  }
+  async sealed(channel, bodyU8) {
+    if (this.forgetEvery) this.channels.clear();
+    const ch = this.channels.get(channel);
+    if (!ch) return {status: 410, json: {error: 'channel unknown'}};
+    let pt;
+    try {
+      pt = new Uint8Array(await subtle.decrypt({name: 'AES-GCM', iv: bodyU8.slice(0, 12), additionalData: enc.encode(channel + ':c2s')},
+                                               ch.c2s, bodyU8.slice(12)));
+    } catch (e) { return {status: 400, json: {error: 'bad frame'}}; }
+    const nl = pt.indexOf(10);
+    const header = JSON.parse(dec.decode(pt.slice(0, nl)));
+    if (ch.seen.has(header.seq) || header.seq < ch.max - 4096) return {status: 400, json: {error: 'replay'}};
+    ch.seen.add(header.seq); ch.max = Math.max(ch.max, header.seq);
+    const req = {action: header.action, method: header.method, query: header.query || {}, header,
+                 body: pt.slice(nl + 1), wireLen: bodyU8.length, sealed: true};
+    this.inner.push(req);
+    if (['seal_open', 'sealed', 'config', 'ping', 'client_diag'].includes(req.action)) return {status: 400, json: {error: 'not allowed'}};
+    const r = await this.handle(req);
+    const self = this;
+    if (r.sse) {
+      // A sealed SSE stream: frames go out as events happen.
+      let ctl, chain = Promise.resolve(), closed = false;
+      const s = r.sse.s;
+      const st = {
+        cur: r.sse.since,
+        send() {
+          if (closed) return;
+          const data = s.out.slice(st.cur); if (!data) return;
+          st.cur = s.out.length;
+          const ev = 'id: ' + st.cur + '\nevent: data\ndata: ' + JSON.stringify({data: b64(enc.encode(data)), alive: true, auth_failed: false, cursor: st.cur}) + '\n\n';
+          chain = chain.then(async () => { push(await self.frameOut(ch, enc.encode(ev))); });
+        },
+        endEvent() {
+          chain = chain.then(async () => { push(await self.frameOut(ch, enc.encode('event: end\ndata: {"alive": false, "auth_failed": false}\n\n'))); push(await self.frameOut(ch, new Uint8Array(0))); closed = true; try { ctl.close(); } catch (e) {} });
+          s.streams.delete(st);
+        },
+        cut() { closed = true; s.streams.delete(st); chain.then(() => { try { ctl.close(); } catch (e) {} }); },
+        endClean() { s.streams.delete(st); chain.then(async () => { push(await self.frameOut(ch, new Uint8Array(0))); closed = true; ctl.close(); }); },
+      };
+      const stream = new ReadableStream({start(c) { ctl = c; }, cancel() { closed = true; s.streams.delete(st); }});
+      // How the bytes reach the reader: one chunk per frame (default),
+      // the opening frames and the waiting output in ONE chunk (TCP
+      // coalesces them whenever output is already waiting - the real
+      // server writes the primer and the backlog back to back), or
+      // every frame split at arbitrary byte boundaries.
+      const push = bytes => {
+        if (closed) return;
+        if (self.chunking === 'split') { let i = 0; while (i < bytes.length) { const n = 1 + Math.floor(Math.random() * 7); ctl.enqueue(bytes.slice(i, i + n)); i += n; } }
+        else ctl.enqueue(bytes);
+      };
+      const backlogFirst = self.chunking === 'together';
+      // Everything a frame says is fixed NOW: send() may move st.cur
+      // before the encryption below resolves.
+      const primerCursor = st.cur;
+      let backlog = '', backlogCursor = st.cur;
+      if (backlogFirst) { backlog = s.out.slice(st.cur); st.cur = backlogCursor = s.out.length; }
+      chain = chain.then(async () => {
+        const head = await self.frameOut(ch, enc.encode(JSON.stringify({status: 200, headers: r.headers})));
+        const primer = await self.frameOut(ch, enc.encode(': ok\n\nevent: data\ndata: {"data": "", "alive": true, "auth_failed": false, "cursor": ' + primerCursor + '}\n\n'));
+        if (!backlogFirst) { push(head); push(primer); return; }
+        let first = cat(head, primer);
+        if (backlog)
+          first = cat(first, await self.frameOut(ch, enc.encode('id: ' + backlogCursor + '\nevent: data\ndata: ' + JSON.stringify({data: b64(enc.encode(backlog)), alive: true, auth_failed: false, cursor: backlogCursor}) + '\n\n')));
+        push(first);
+      });
+      s.streams.add(st);
+      (this.sseStreams = this.sseStreams || []).push(st);
+      setTimeout(() => st.send(), 1);
+      return {status: 200, stream};
+    }
+    const parts = [await this.frameOut(ch, enc.encode(JSON.stringify({status: r.status, headers: r.headers || {}})))];
+    if (r.body && r.body.length) parts.push(await this.frameOut(ch, r.body));
+    if (!r.truncate) parts.push(await this.frameOut(ch, new Uint8Array(0)));
+    return {status: 200, bytes: cat(...parts)};
+  }
+
+  // ── transport: one entry for fetch, XHR and beacons ──
+  async exchange(kind, url, method, body) {
+    const u = new URL(url, 'http://localhost/');
+    const action = u.searchParams.get('action') || (u.pathname.match(/\/api\/(\w+)/) || [])[1] || '';
+    const rec = {kind, url: String(url), action, method, body};
+    this.wire.push(rec);
+    let out;
+    if (action === 'seal_open') {
+      if (this.sealOpenFail === 'neterr') { rec.status = 0; throw new TypeError('Failed to fetch'); }
+      if (this.sealOpenFail) out = {status: this.sealOpenFail, json: {error: 'boom'}};
+      else if (!this.available) out = {status: 501, json: {error: 'sealed mode unavailable'}};
+      else out = await this.sealOpen(body);
+    } else if (action === 'sealed') {
+      out = !this.available ? {status: 501, json: {error: 'sealed mode unavailable'}} : await this.sealed(u.searchParams.get('c'), body);
+    } else {
+      const query = {};
+      u.searchParams.forEach((v, k) => { if (k !== 'action') query[k] = v; });
+      const r = await this.handle({action, method, query, body, sealed: false});
+      if (r.sse) out = {status: 404, json: {error: 'no EventSource in this harness'}};
+      else out = {status: r.status, bytes: r.body, headers: r.headers};
+    }
+    rec.status = out.status;
+    if (out.json) out = {status: out.status, bytes: enc.encode(JSON.stringify(out.json)), headers: {'Content-Type': 'application/json'}};
+    rec.reply = out.bytes;
+    return out;
+  }
+}
+
+async function bodyBytes(win, body) {
+  if (body == null) return new Uint8Array(0);
+  if (typeof body === 'string') return enc.encode(body);
+  if (body instanceof ArrayBuffer || Object.prototype.toString.call(body) === '[object ArrayBuffer]') return new Uint8Array(body.slice(0));
+  if (ArrayBuffer.isView(body)) return new Uint8Array(body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength));
+  if (body instanceof win.Blob) return new Uint8Array(await body.arrayBuffer());
+  throw new Error('unsupported request body type: ' + Object.prototype.toString.call(body));
+}
+
+function installTransport(win, srv) {
+  const st = {dead: false};
+  win.fetch = async function(url, init) {
+    init = init || {};
+    const body = await bodyBytes(win, init.body);
+    if (st.dead) return new Promise(() => {});
+    const out = await srv.exchange('fetch', url, (init.method || 'GET').toUpperCase(), body);
+    if (st.dead) return new Promise(() => {});
+    if (out.stream) {
+      // Like a browser: aborting the request's signal errors the body
+      // being read (AbortError) - the page must expect that.
+      const sig = init.signal;
+      const rd = out.stream.getReader();
+      const body = new ReadableStream({
+        start(c) {
+          if (sig) sig.addEventListener('abort', () => { try { c.error(new DOMException('signal is aborted without reason', 'AbortError')); } catch (e) {} try { rd.cancel(); } catch (e) {} });
+        },
+        async pull(c) {
+          try { const {done, value} = await rd.read(); if (done) c.close(); else c.enqueue(value); } catch (e) { try { c.error(e); } catch (x) {} }
+        },
+        cancel() { try { rd.cancel(); } catch (e) {} },
+      });
+      return new Response(body, {status: out.status, headers: {'Content-Type': 'application/octet-stream'}});
+    }
+    if (srv.chunking === 'split' && out.bytes && out.bytes.length && /action=sealed/.test(String(url))) {
+      const b = out.bytes;
+      const rs = new ReadableStream({start(c) { let i = 0; while (i < b.length) { const n = 1 + Math.floor(Math.random() * 7); c.enqueue(b.slice(i, i + n)); i += n; } c.close(); }});
+      return new Response(rs, {status: out.status, headers: out.headers || {'Content-Type': 'application/octet-stream'}});
+    }
+    return new Response(out.bytes && out.bytes.length ? out.bytes : null,
+                        {status: out.status, headers: out.headers || {'Content-Type': 'application/octet-stream'}});
+  };
+  win.fetch.__state = st;
+  win.XMLHttpRequest = class {
+    constructor() { this.upload = {}; this.status = 0; this.responseText = ''; this.response = null; this.responseType = ''; this.readyState = 0; this._h = {}; }
+    open(m, url) { this.method = m; this.url = url; this.readyState = 1; }
+    setRequestHeader() {}
+    getResponseHeader(n) { return this._h[n.toLowerCase()] || null; }
+    abort() { this.aborted = true; if (this.onabort) this.onabort(); }
+    send(body) {
+      (async () => {
+        const b = await bodyBytes(win, body);
+        if (srv.xhrCut && srv.xhrCut(this, b)) { if (this.onerror) this.onerror(); return; }
+        let out;
+        try { out = await srv.exchange('xhr', this.url, this.method.toUpperCase(), b); }
+        catch (e) { if (!this.aborted && this.onerror) this.onerror(); return; }
+        if (this.aborted || st.dead) return;
+        if (this.upload.onprogress) this.upload.onprogress({loaded: b.length, total: b.length, lengthComputable: true});
+        let bytes = out.bytes || new Uint8Array(0);
+        if (out.stream) {
+          const rd = out.stream.getReader(); const acc = [];
+          for (;;) { const {done, value} = await rd.read(); if (done) break; acc.push(value); }
+          bytes = cat(...acc);
+        }
+        this.status = out.status; this.readyState = 4;
+        this._h = {}; for (const [k, v] of Object.entries(out.headers || {})) this._h[k.toLowerCase()] = v;
+        if (this.responseType === 'arraybuffer') this.response = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+        else if (this.responseType === 'blob') this.response = new win.Blob([bytes]);
+        else { this.responseText = Buffer.from(bytes).toString('latin1'); this.response = this.responseText; }
+        if (this.onreadystatechange) this.onreadystatechange();
+        if (this.onload) this.onload();
+        if (this.onloadend) this.onloadend();
+      })();
+    }
+  };
+  win.navigator.sendBeacon = (url, data) => {
+    srv.beacons.push({url, data});
+    srv.wire.push({kind: 'beacon', url: String(url), action: new URL(url, 'http://localhost/').searchParams.get('action'),
+                   method: 'POST', body: enc.encode(typeof data === 'string' ? data : '')});
+    return true;
+  };
+  return st;
+}
+
+// A plain EventSource wired to the fake server (the browser's own SSE
+// client in the plain mode), recorded on the wire like everything else.
+function liveEventSource(win, srv) {
+  return class {
+    constructor(url) {
+      this.url = url; this.readyState = 0; this._l = {};
+      (srv.esInstances = srv.esInstances || []).push(this);
+      const u = new URL(url, 'http://localhost/');
+      srv.wire.push({kind: 'eventsource', url: String(url), action: u.searchParams.get('action'), method: 'GET', body: new Uint8Array(0)});
+      const s = srv.sessions[u.searchParams.get('session_id')];
+      setTimeout(() => {
+        if (this.readyState === 2) return;
+        if (!s) { this.readyState = 2; this._fire('error', {}); return; }
+        this.readyState = 1; this._fire('open', {});
+        const since = u.searchParams.get('since');
+        const es = this;
+        this._st = {cur: since !== null ? +since : 0,
+          send() {
+            if (es.readyState !== 1) return;
+            const data = s.out.slice(this.cur); if (!data) return;
+            this.cur = s.out.length;
+            es._fire('data', {data: JSON.stringify({data: b64(enc.encode(data)), alive: true, auth_failed: false, cursor: this.cur}), lastEventId: String(this.cur)});
+          }};
+        s.streams.add(this._st); this._s = s;
+        this._fire('data', {data: JSON.stringify({data: '', alive: true, auth_failed: false, cursor: this._st.cur}), lastEventId: ''});
+        this._st.send();
+      }, 2);
+    }
+    addEventListener(t, f) { (this._l[t] = this._l[t] || []).push(f); }
+    removeEventListener(t, f) { this._l[t] = (this._l[t] || []).filter(x => x !== f); }
+    _fire(t, ev) { ev.type = t; for (const f of (this._l[t] || [])) try { f(ev); } catch (e) { console.log('es handler threw', e); } if (this['on' + t]) this['on' + t](ev); if (t === 'data' && this.onmessage) {} }
+    close() { this.readyState = 2; if (this._s) this._s.streams.delete(this._st); }
+  };
+}
+
+// ── the page ─────────────────────────────────────────────────────────
+
+function fakes(win, rec) {
+  win.Terminal = class {
+    constructor(opts) {
+      this.options = Object.assign({}, opts || {});
+      this.cols = 80; this.rows = 24; this.written = '';
+      this.modes = {mouseTrackingMode: 'none'};
+      (rec.terms = rec.terms || []).push(this);
+    }
+    loadAddon() {} open(el) { this.element = el; } reset() {} focus() {} blur() {} dispose() {} clear() {} scrollToBottom() {} refresh() {}
+    write(d, cb) { this.written += typeof d === 'string' ? d : dec.decode(d); if (cb) setTimeout(cb, 0); }
+    onData(cb) { this._onData = cb; return {dispose() {}}; }
+    onBinary() { return {dispose() {}}; } onResize() { return {dispose() {}}; } onBell() { return {dispose() {}}; }
+    onTitleChange() { return {dispose() {}}; } onScroll() { return {dispose() {}}; } onRender() { return {dispose() {}}; }
+    onWriteParsed() { return {dispose() {}}; } onSelectionChange() { return {dispose() {}}; } onCursorMove() { return {dispose() {}}; }
+    onKey() { return {dispose() {}}; } onLineFeed() { return {dispose() {}}; }
+    attachCustomKeyEventHandler() {} registerLinkProvider() { return {dispose() {}}; }
+    registerDecoration() { return null; } registerMarker() { return null; }
+    getSelection() { return ''; } hasSelection() { return false; }
+    paste(d) { if (this._onData) this._onData(d); }
+    get parser() { return {registerOscHandler() { return {dispose() {}}; }, registerCsiHandler() { return {dispose() {}}; }}; }
+    get buffer() { return {active: {length: 0, viewportY: 0, baseY: 0, cursorY: 0, getLine: () => null}}; }
+    get unicode() { return {activeVersion: '11'}; }
+  };
+  win.FitAddon = {FitAddon: class { activate() {} fit() {} proposeDimensions() { return {cols: 80, rows: 24}; } }};
+  win.SearchAddon = {SearchAddon: class { activate() {} findNext() { return true; } findPrevious() { return true; } clearDecorations() {} dispose() {} onDidChangeResults() { return {dispose() {}}; } }};
+  win.WebLinksAddon = {WebLinksAddon: class { activate() {} dispose() {} }};
+  win.Unicode11Addon = {Unicode11Addon: class { activate() {} dispose() {} }};
+  win.ResizeObserver = class { observe() {} disconnect() {} unobserve() {} };
+  Object.defineProperty(win.crypto, 'subtle', {value: subtle, configurable: true});
+  win.TextEncoder = TextEncoder; win.TextDecoder = TextDecoder;
+  win.indexedDB = new IDBFactory(); win.IDBKeyRange = IDBKeyRange;
+  // What a browser has and jsdom lacks; the sealed client may use any.
+  win.Response = Response; win.Headers = Headers; win.ReadableStream = ReadableStream;
+  win.AbortController = AbortController;
+  if (!win.Blob.prototype.arrayBuffer) {
+    win.Blob.prototype.arrayBuffer = function() {
+      return new Promise((res, rej) => { const fr = new win.FileReader(); fr.onload = () => res(fr.result); fr.onerror = () => rej(fr.error); fr.readAsArrayBuffer(this); });
+    };
+  }
+  win.URL.createObjectURL = () => 'blob:x'; win.URL.revokeObjectURL = () => {};
+}
+
+const EXPOSE = `
+; (function(){
+  Object.defineProperty(window, 'panes', {get: () => panes, configurable: true});
+  Object.defineProperty(window, 'settings', {get: () => settings, configurable: true});
+  Object.defineProperty(window, 'bootReady', {get: () => bootReady, configurable: true});
+  for (const k of ['UPLOAD_CHUNK_BYTES', 'UPLOAD_CHUNK_TIMEOUT_MS', 'UPLOAD_RETRY_BASE_MS', 'INPUT_STALL_MS'])
+    try { Object.defineProperty(window, k, {get: () => eval(k), set: v => { eval(k + ' = v'); }, configurable: true}); } catch (e) {}
+})();`;
+
+const envs = [];
+async function mkEnv(o) {
+  o = o || {};
+  const srv = o.server || await new FakeWebsh(o).init();
+  const dom = new JSDOM(html, {runScripts: 'outside-only', pretendToBeVisual: true, url: 'http://localhost/websh/'});
+  const win = dom.window;
+  const rec = {};
+  fakes(win, rec);
+  const st = installTransport(win, srv);
+  // jsdom has no EventSource, so the page would never try a stream. A
+  // browser has one; a scenario that needs the (sealed) stream says so.
+  // This stub never connects: a plain stream through it would sit idle.
+  if (o.eventSource === 'live') win.EventSource = liveEventSource(win, srv);
+  else if (o.eventSource) win.EventSource = class { constructor(u) { this.url = u; this.readyState = 0; } addEventListener() {} close() { this.readyState = 2; } };
+  win.localStorage.clear();
+  const store = Object.assign({}, o.storage || {});
+  if (o.sealed) {
+    const s = JSON.parse(store.websh_settings || '{}'); s.sealed = true;
+    store.websh_settings = JSON.stringify(s);
+  }
+  for (const [k, v] of Object.entries(store)) win.localStorage.setItem(k, v);
+  win.eval(js + EXPOSE);
+  await Promise.race([win.bootReady, sleep(2000)]);
+  await sleep(20);
+  const env = {dom, win, srv, rec, st, skew: 0};
+  // The page's clock, movable: "25 s pass" without waiting 25 s. Timers
+  // are real; a test that needs a timer to fire shortens it.
+  const realNow = win.Date.now.bind(win.Date);
+  win.Date.now = () => realNow() + env.skew;
+  envs.push(env);
+  return env;
+}
+function cleanup(env) {
+  try {
+    for (const p of Object.values(env.win.panes || {})) { p.polling = false; try { env.win.stopKeepalive(p); } catch (e) {} }
+    env.st.dead = true;
+    for (const s of (env.srv.sseStreams || [])) try { s.cut(); } catch (e) {}
+  } catch (e) {}
+  // Closed a moment later: a crypto operation already in flight would
+  // otherwise resolve into a closed window (document undefined) and
+  // count as an unhandled rejection of whatever test runs next.
+  setTimeout(() => { try { env.dom.window.close(); } catch (e) {} }, 300);
+}
+const $ = (win, id) => win.document.getElementById(id);
+const visible = el => !!el && !el.classList.contains('h') && !el.hidden && el.style.display !== 'none';
+const storageDump = win => { const o = {}; for (let i = 0; i < win.localStorage.length; i++) { const k = win.localStorage.key(i); o[k] = win.localStorage.getItem(k); } return o; };
+function setCheckbox(win, el, v) { el.checked = v; el.dispatchEvent(new win.Event('change', {bubbles: true})); el.dispatchEvent(new win.Event('input', {bubbles: true})); }
+const plainApi = srv => srv.wire.filter(w => !['config', 'ping', 'seal_open', 'sealed'].includes(w.action));
+const innerActions = srv => srv.inner.map(r => r.action);
+const PASSWORD = 'Pw-SEALED-7f3a9c', HOST = 'target-HOSTMARK.example', USER = 'userMARK';
+
+async function connect(env) {
+  const win = env.win;
+  $(win, 'iH').value = HOST; $(win, 'iU').value = USER; $(win, 'iPw').value = PASSWORD;
+  $(win, 'iPersistent').checked = false;
+  win.doConnect();
+  await until(() => Object.values(win.panes).some(p => p.sid), 3000);
+  const p = Object.values(win.panes).find(x => x.sid);
+  return p;
+}
+const termText = p => (p && p.term && p.term.written) || '';
+function typeKeys(win, p, s) { for (const c of s) win.queueInput(p, c); }
+
+const scenarios = [];
+function test(name, fn) { scenarios.push({name, fn}); }
+
+// ═════════════════════════════════════════════════════════════════════
+// The option
+
+test('sealed option: the checkbox exists and is off by default', async () => {
+  const env = await mkEnv(); const win = env.win;
+  ok(win.settings.sealed === false, 'settings.sealed defaults to false; got ' + JSON.stringify(win.settings.sealed));
+  win.openOptions();
+  const cb = $(win, 'optSealed');
+  ok(!!cb && cb.type === 'checkbox', '#optSealed is a checkbox in Options');
+  ok(cb && cb.checked === false, 'unchecked by default');
+  ok(cb && !cb.disabled, 'enabled when the server reports the mode available');
+  ok(env.srv.wire.every(w => w.action !== 'seal_open' && w.action !== 'sealed'), 'off: no seal_open, nothing sealed');
+  cleanup(env);
+});
+
+test('sealed option: turned on, it is saved and a reload keeps it', async () => {
+  const env = await mkEnv(); const win = env.win;
+  win.openOptions();
+  setCheckbox(win, $(win, 'optSealed'), true);
+  await sleep(30);
+  ok(win.settings.sealed === true, 'settings.sealed true after the click');
+  let saved = {};
+  try { saved = JSON.parse(win.localStorage.getItem('websh_settings') || '{}'); } catch (e) {}
+  ok(saved.sealed === true, 'stored with the other display settings (websh_settings.sealed); got ' + JSON.stringify(saved));
+  const store = storageDump(win);
+  cleanup(env);
+  const env2 = await mkEnv({storage: store}); const w2 = env2.win;
+  ok(w2.settings.sealed === true, 'after a reload settings.sealed is still true');
+  w2.openOptions();
+  ok($(w2, 'optSealed').checked === true, 'and the checkbox shows it');
+  cleanup(env2);
+});
+
+test('sealed option: "Reset to defaults" turns it off', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win;
+  win.openOptions();
+  ok($(win, 'optSealed').checked === true, 'on before the reset');
+  win.resetOptions();
+  await sleep(20);
+  ok(win.settings.sealed === false, 'settings.sealed false after reset');
+  ok($(win, 'optSealed').checked === false, 'checkbox unchecked after reset');
+  cleanup(env);
+});
+
+test('sealed option: disabled, with the reason, when the server cannot do it', async () => {
+  const env = await mkEnv({available: false}); const win = env.win;
+  win.openOptions();
+  const cb = $(win, 'optSealed');
+  ok(cb && cb.disabled === true, 'disabled when config says available:false');
+  const dlg = $(win, 'ovOpt');
+  ok(/cryptography/.test(dlg ? dlg.textContent : ''), 'the hint names the missing `cryptography` module');
+  cleanup(env);
+  const env2 = await mkEnv({reportSealed: false}); const w2 = env2.win;
+  w2.openOptions();
+  ok($(w2, 'optSealed') && $(w2, 'optSealed').disabled === true, 'disabled with a server that does not report the mode at all (older server)');
+  cleanup(env2);
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Mode on: nothing in clear
+
+test('sealed on: every API call but config/ping goes sealed; no plain URL or body carries anything', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  ok(!!p, 'connected through the sealed channel');
+  if (!p) { cleanup(env); return; }
+  const sid = p.sid;
+  await until(() => /\$ /.test(termText(p)), 2000);
+  ok(/Welcome/.test(termText(p)), 'output arrived; terminal has ' + JSON.stringify(termText(p).slice(-60)));
+  typeKeys(win, p, 'echo KEYMARK-1\r');
+  ok(await until(() => srv.sessions[sid].input === 'echo KEYMARK-1\r', 2000), 'typed text reached the shell; got ' + JSON.stringify(srv.sessions[sid].input));
+  ok(await until(() => /KEYMARK-1/.test(termText(p)), 2000), 'its echo is on screen');
+  // file browser, a download, a resize, a disconnect
+  srv.files['/home/u/secret-plan-Q7.txt'] = enc.encode('CONTENTMARK');
+  try { win.showFileBrowser(p.id); } catch (e) {}
+  await until(() => innerActions(srv).includes('ls'), 1000);
+  try { await win.startFastDownload(p.id, '/home/u/secret-plan-Q7.txt'); } catch (e) {}
+  try { win.flushPaneResize && win.flushPaneResize(p, 100, 30); } catch (e) {}
+  await sleep(30);
+  const acts = innerActions(srv);
+  for (const a of ['connect', 'input', 'ls', 'download'])
+    ok(acts.includes(a), a + ' went through the sealed channel; inner actions: ' + [...new Set(acts)].join(','));
+  ok(acts.includes('stream') || acts.includes('output'), 'output is read through the sealed channel');
+  const plain = plainApi(srv);
+  ok(plain.length === 0, 'no plain API request; got ' + plain.map(w => w.action + ' ' + w.url).slice(0, 5).join(' | '));
+  for (const w of srv.wire) {
+    const u = w.url;
+    ok(!u.includes(sid) && !u.includes('secret-plan') && !u.includes('session_id') && !u.includes('HOSTMARK'), 'no secret in a URL: ' + u);
+    if (w.action !== 'sealed') {
+      for (const n of [sid, PASSWORD, USER, HOST, 'KEYMARK', 'session_id', 'secret-plan'])
+        ok(!has(w.body, n), 'clear body of ' + w.action + ' carries "' + n + '"');
+    } else {
+      for (const n of [sid, PASSWORD, USER, 'KEYMARK', 'session_id', '"action"'])
+        ok(!has(w.body, n), 'sealed body carries "' + n + '" in clear');
+    }
+    if (w.reply && w.action !== 'config' && w.action !== 'ping')
+      for (const n of [sid, 'KEYMARK', 'secret-plan', 'CONTENTMARK', 'Welcome'])
+        ok(!has(w.reply, n), 'reply to ' + w.action + ' carries "' + n + '" in clear');
+  }
+  const badge = $(win, 'sealedBadge');
+  ok(visible(badge), 'the lock badge is shown while the channel is up');
+  ok(badge && (badge.title || '').includes(srv.fp), 'its title shows the fingerprint; got ' + JSON.stringify(badge && badge.title));
+  win.openOptions();
+  ok(($(win, 'optSealedPin') || {}).textContent && $(win, 'optSealedPin').textContent.includes(srv.fp),
+     'Options shows the trusted fingerprint under the checkbox; got ' + JSON.stringify(($(win, 'optSealedPin') || {}).textContent));
+  cleanup(env);
+});
+
+test('sealed off: the page talks exactly as before (no seal_open, no sealed)', async () => {
+  const env = await mkEnv(); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  ok(!!p, 'connected plain');
+  if (p) { typeKeys(win, p, 'ls\r'); await until(() => srv.sessions[p.sid].input === 'ls\r', 1000); }
+  ok(srv.wire.every(w => w.action !== 'seal_open' && w.action !== 'sealed'), 'nothing sealed while off');
+  ok(srv.wire.some(w => w.action === 'connect') && srv.wire.some(w => w.action === 'input'), 'plain connect and input as today');
+  ok(!visible($(win, 'sealedBadge')), 'no lock badge while off');
+  cleanup(env);
+});
+
+test('sealed on: when the channel cannot be opened nothing is sent in clear, and the user is told', async () => {
+  for (const how of ['neterr', 500, 'unavailable']) {
+    const srv = await new FakeWebsh(how === 'unavailable' ? {} : {}).init();
+    if (how === 'unavailable') srv.available = false; else srv.sealOpenFail = how;
+    if (how === 'unavailable') srv.reportSealed = true;
+    const env = await mkEnv({sealed: true, server: srv}); const win = env.win;
+    $(win, 'iH').value = HOST; $(win, 'iU').value = USER; $(win, 'iPw').value = PASSWORD;
+    $(win, 'iPersistent').checked = false;
+    win.doConnect();
+    await sleep(400);
+    const plain = plainApi(srv);
+    ok(plain.length === 0, how + ': no fallback to a plain request; got ' + plain.map(w => w.action).join(','));
+    ok(!srv.wire.some(w => has(w.body, PASSWORD) || has(w.body, USER)), how + ': the credentials never left in clear');
+    ok(!Object.values(win.panes).some(p => p.sid), how + ': no session');
+    ok(!visible($(win, 'sealedBadge')), how + ': no lock badge');
+    const text = win.document.body.textContent;
+    ok(/encrypt|seal/i.test(text.replace(/Encrypt traffic inside websh/g, '').replace(/a second layer under TLS[^.]*/g, '')),
+       how + ': a visible error mentions the encrypted channel');
+    cleanup(env);
+  }
+});
+
+test('sealed on: an open pane whose channel later fails does not fall back to clear', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup: no pane'); cleanup(env); return; }
+  await until(() => /\$ /.test(termText(p)), 1000);
+  srv.restart(); srv.sealOpenFail = 500;          // server restarted and can no longer seal
+  const before = srv.wire.length;
+  typeKeys(win, p, 'echo LEAKMARK\r');
+  await sleep(600);
+  const after = srv.wire.slice(before);
+  ok(!after.some(w => !['seal_open', 'sealed', 'config', 'ping'].includes(w.action)), 'no plain request after the failure: ' + after.map(w => w.action).join(','));
+  ok(!after.some(w => has(w.body, 'LEAKMARK')), 'typed text never sent in clear');
+  ok(!visible($(win, 'sealedBadge')), 'badge gone while the channel is down');
+  cleanup(env);
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Identity pin
+
+test('sealed pin: first use pins the key; a different key later stops everything behind a modal', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  ok(!!p, 'first use (TOFU) connects');
+  const pin1 = win.localStorage.getItem('websh_sealed_pin');
+  ok(!!pin1, 'the pin is stored under websh_sealed_pin');
+  const store = storageDump(win);
+  cleanup(env);
+
+  // Same browser, the server now presents another identity.
+  const srv2 = await new FakeWebsh().init();
+  const env2 = await mkEnv({storage: store, server: srv2}); const w2 = env2.win;
+  $(w2, 'iH').value = HOST; $(w2, 'iU').value = USER; $(w2, 'iPw').value = PASSWORD;
+  $(w2, 'iPersistent').checked = false;
+  w2.doConnect();
+  const modal = () => $(w2, 'ovSealedMismatch');
+  ok(await until(() => visible(modal()), 2000), '#ovSealedMismatch is shown');
+  const mt = modal() ? modal().textContent : '';
+  ok(mt.includes(srv.fp) && mt.includes(srv2.fp), 'it shows the old and the new fingerprint');
+  await sleep(100);
+  ok(!srv2.wire.some(w => w.action === 'sealed'), 'nothing was sent through the unverified channel');
+  ok(plainApi(srv2).length === 0, 'and nothing in clear');
+  const btn = re => [...(modal() ? modal().querySelectorAll('button') : [])].find(b => re.test(b.textContent));
+  const cancel = btn(/cancel/i), trust = btn(/trust the new key/i);
+  ok(!!cancel && !!trust, 'the modal has "Trust the new key" and "Cancel"');
+  if (cancel) {
+    const code = cancel.getAttribute('onclick');
+    if (code) w2.eval('(function(){' + code + '}).call(document.querySelector("#ovSealedMismatch"))'); else cancel.click();
+  }
+  await sleep(100);
+  ok(!visible(modal()), 'Cancel closes the modal');
+  ok(w2.settings.sealed === true, 'Cancel leaves the mode on');
+  ok(!srv2.wire.some(w => w.action === 'sealed') && plainApi(srv2).length === 0, 'after Cancel: still nothing sent');
+  ok(w2.localStorage.getItem('websh_sealed_pin') === pin1, 'the old pin is kept');
+  cleanup(env2);
+
+  // Trust the new key: the request goes ahead, the new pin is stored.
+  const env3 = await mkEnv({storage: store, server: srv2}); const w3 = env3.win;
+  srv2.wire.length = 0; srv2.inner.length = 0;
+  $(w3, 'iH').value = HOST; $(w3, 'iU').value = USER; $(w3, 'iPw').value = PASSWORD;
+  $(w3, 'iPersistent').checked = false;
+  w3.doConnect();
+  const m3 = () => $(w3, 'ovSealedMismatch');
+  await until(() => visible(m3()), 2000);
+  const t3 = [...(m3() ? m3().querySelectorAll('button') : [])].find(b => /trust the new key/i.test(b.textContent));
+  if (t3) {
+    const code = t3.getAttribute('onclick');
+    if (code) w3.eval('(function(){' + code + '}).call(document.querySelector("#ovSealedMismatch"))'); else t3.click();
+  }
+  ok(await until(() => innerActions(srv2).includes('connect'), 2000), 'after "Trust the new key" the connect goes through, sealed');
+  ok(w3.localStorage.getItem('websh_sealed_pin') !== pin1, 'the new key is pinned');
+  ok(plainApi(srv2).length === 0, 'nothing in clear');
+  cleanup(env3);
+});
+
+test('sealed pin: the server key changing under an open pane stops it; no key is sent', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  const sid = p.sid;
+  await until(() => /\$ /.test(termText(p)), 1000);
+  await srv.newIdentity(); srv.restart();
+  typeKeys(win, p, 'echo AFTERMARK\r');
+  ok(await until(() => visible($(win, 'ovSealedMismatch')), 2000), 'the mismatch modal comes up');
+  await sleep(200);
+  ok(!srv.sessions[sid].input.includes('AFTERMARK'), 'the keys did not reach the shell through the unverified key');
+  ok(!srv.wire.some(w => has(w.body, 'AFTERMARK')), 'and never went out in clear');
+  cleanup(env);
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Server restart: 410
+
+test('sealed 410: a restarted server (channel gone) is invisible - reopen, resend once, nothing doubled', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  const sid = p.sid;
+  typeKeys(win, p, 'ab');
+  await until(() => srv.sessions[sid].input === 'ab', 1000);
+  const opens = srv.wire.filter(w => w.action === 'seal_open').length;
+  srv.restart();
+  typeKeys(win, p, 'cd');
+  ok(await until(() => srv.sessions[sid].input === 'abcd', 2000), 'keys typed after the restart arrive; got ' + JSON.stringify(srv.sessions[sid].input));
+  await sleep(150);
+  ok(srv.sessions[sid].input === 'abcd', 'exactly once; got ' + JSON.stringify(srv.sessions[sid].input));
+  ok(srv.wire.filter(w => w.action === 'seal_open').length === opens + 1, 'one new channel opened');
+  ok(plainApi(srv).length === 0, 'nothing in clear');
+  ok(await until(() => visible($(win, 'sealedBadge')), 1000), 'badge back');
+  cleanup(env);
+});
+
+test('sealed 410: a channel that is lost again at once is not retried forever', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  srv.forgetEvery = true;
+  const before = srv.wire.length;
+  typeKeys(win, p, 'z');
+  await sleep(800);
+  const inputs410 = srv.wire.slice(before).filter(w => w.action === 'sealed' && w.status === 410).length;
+  const opens = srv.wire.slice(before).filter(w => w.action === 'seal_open').length;
+  ok(opens <= 6, 'channel reopened a bounded number of times in 0.8 s; got ' + opens);
+  ok(inputs410 <= 6, 'no tight resend loop; 410s: ' + inputs410);
+  ok(plainApi(srv).filter(w => w.action === 'input').length === 0, 'and never a plain input');
+  cleanup(env);
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// I3 under sealed mode: keys held while the channel is unusable are never
+// delivered stale (INPUT_HOLD_MS, 20 s, as for any held keys); a short
+// blockage delivers them once, in order.
+
+const HOLD_PAST = 25000;      // past INPUT_HOLD_MS (20 s)
+
+async function sealedPane(o) {
+  const env = await mkEnv(Object.assign({sealed: true}, o || {}));
+  const p = await connect(env);
+  if (p) await until(() => /\$ /.test(termText(p)), 1500);
+  return {env, win: env.win, srv: env.srv, p};
+}
+const shellInput = (srv, p) => (srv.sessions[p.sid] || {input: ''}).input;
+function pressInModal(win, re) {
+  const m = $(win, 'ovSealedMismatch');
+  const b = [...(m ? m.querySelectorAll('button') : [])].find(x => re.test(x.textContent));
+  if (!b) return false;
+  const code = b.getAttribute('onclick');
+  if (code) win.eval('(function(){' + code + '}).call(document.querySelector("#ovSealedMismatch"))'); else b.click();
+  return true;
+}
+// "That much time went by": the page clock jumps, and the input stall
+// timer (10 s in real life, so it would have fired) is made to fire now.
+async function letTimePass(env, ms) {
+  env.win.INPUT_STALL_MS = 50;
+  env.skew += ms;
+  await sleep(400);
+}
+
+test('sealed I3: keys typed behind the key-changed modal, trusted after more than 20 s, never reach the shell', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  typeKeys(win, p, 'ok1');
+  await until(() => shellInput(srv, p) === 'ok1', 1500);
+  await srv.newIdentity(); srv.restart();
+  typeKeys(win, p, 'rm -rf LATE1\r');
+  ok(await until(() => visible($(win, 'ovSealedMismatch')), 2000), 'the modal is up');
+  await letTimePass(env, HOLD_PAST);
+  ok(pressInModal(win, /trust the new key/i), '"Trust the new key" pressed');
+  await sleep(600);
+  ok(!shellInput(srv, p).includes('LATE1'), 'the stale keys were not delivered; shell got ' + JSON.stringify(shellInput(srv, p)));
+  ok(/not sent/i.test(win.document.body.textContent), 'the user is told the keys were not sent (toast)');
+  typeKeys(win, p, 'fresh');
+  ok(await until(() => shellInput(srv, p).endsWith('fresh'), 3000), 'typing works after trusting; shell got ' + JSON.stringify(shellInput(srv, p)));
+  await sleep(200);
+  ok(shellInput(srv, p) === 'ok1fresh', 'exactly the fresh keys, nothing stale before or after them; got ' + JSON.stringify(shellInput(srv, p)));
+  cleanup(env);
+});
+
+test('sealed I3: keys typed behind the key-changed modal, trusted within a second, arrive once, in order', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  await srv.newIdentity(); srv.restart();
+  typeKeys(win, p, 'ab');
+  ok(await until(() => visible($(win, 'ovSealedMismatch')), 2000), 'the modal is up');
+  typeKeys(win, p, 'cd');
+  await sleep(300);
+  ok(shellInput(srv, p) === '', 'nothing delivered while the modal is open');
+  pressInModal(win, /trust the new key/i);
+  ok(await until(() => shellInput(srv, p) === 'abcd', 3000), 'held keys delivered after "Trust"; got ' + JSON.stringify(shellInput(srv, p)));
+  typeKeys(win, p, 'ef');
+  await until(() => shellInput(srv, p) === 'abcdef', 2000);
+  await sleep(200);
+  ok(shellInput(srv, p) === 'abcdef', 'once, in order, then later keys; got ' + JSON.stringify(shellInput(srv, p)));
+  cleanup(env);
+});
+
+test('sealed I3: a channel that cannot be opened for more than 20 s does not deliver the keys typed meanwhile when it is back', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  srv.restart(); srv.sealOpenFail = 500;
+  typeKeys(win, p, 'rm -rf LATE2\r');
+  await sleep(300);
+  await letTimePass(env, HOLD_PAST);
+  await sleep(1500);                               // the client's own retries run out meanwhile
+  srv.sealOpenFail = null;
+  win.INPUT_STALL_MS = 10000;
+  typeKeys(win, p, 'new2');
+  ok(await until(() => shellInput(srv, p).includes('new2'), 8000), 'typing works once the channel is back; got ' + JSON.stringify(shellInput(srv, p)));
+  await sleep(300);
+  ok(!shellInput(srv, p).includes('LATE2'), 'the keys typed during the outage were not delivered late; got ' + JSON.stringify(shellInput(srv, p)));
+  ok(/not sent/i.test(win.document.body.textContent), 'the user is told the keys were not sent (toast)');
+  ok(!srv.wire.some(w => has(w.body, 'LATE2')), 'and never in clear');
+  cleanup(env);
+});
+
+test('sealed I3: keys typed during a 410 backoff longer than 20 s are not delivered late', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  srv.forgetEvery = true;
+  typeKeys(win, p, 'rm -rf LATE3\r');
+  await sleep(500);
+  await letTimePass(env, HOLD_PAST);
+  srv.forgetEvery = false;
+  win.INPUT_STALL_MS = 10000;
+  typeKeys(win, p, 'new3');
+  const t0 = Date.now();
+  const gotNew = await until(() => shellInput(srv, p).includes('new3'), 4000);
+  ok(gotNew, 'a key typed once the server answers again is delivered (held through the backoff, not dropped); got ' + JSON.stringify(shellInput(srv, p)));
+  if (!gotNew) {
+    // Does the pane recover at all? Keep typing until something lands.
+    let n = 0;
+    const back = await until(() => { if (++n % 200 === 0) typeKeys(win, p, 'x'); return shellInput(srv, p).includes('x'); }, 35000);
+    ok(back, 'the pane takes keys again at some point');
+    console.log('  info: first key accepted ' + Math.round((Date.now() - t0) / 1000) + ' s after the server was healthy again');
+  }
+  await sleep(300);
+  ok(!shellInput(srv, p).includes('LATE3'), 'the keys from the backoff were not delivered late; got ' + JSON.stringify(shellInput(srv, p)));
+  ok(/not sent/i.test(win.document.body.textContent), 'the user is told the keys were not sent (toast)');
+  cleanup(env);
+});
+
+test('sealed I3: a short outage (channel down for 0.3 s) delivers the keys typed during it, once, in order', async () => {
+  const {env, win, srv, p} = await sealedPane();
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  srv.restart(); srv.sealOpenFail = 500;
+  typeKeys(win, p, 'ab');
+  await sleep(100);
+  typeKeys(win, p, 'cd');
+  setTimeout(() => { srv.sealOpenFail = null; }, 300);
+  typeKeys(win, p, 'ef');
+  ok(await until(() => shellInput(srv, p) === 'abcdef', 5000), 'all keys arrive in order; got ' + JSON.stringify(shellInput(srv, p)));
+  await sleep(300);
+  ok(shellInput(srv, p) === 'abcdef', 'exactly once; got ' + JSON.stringify(shellInput(srv, p)));
+  cleanup(env);
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Toggling with open panes
+
+test('sealed toggle: turning it on (and off) with a pane open loses and doubles no key and no output', async () => {
+  const env = await mkEnv(); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  const sid = p.sid;
+  await until(() => /\$ /.test(termText(p)), 1000);
+  win.openOptions();
+  const cb = $(win, 'optSealed');
+  let typed = '';
+  const typeSome = async (tag, n) => { for (let i = 0; i < n; i++) { const c = tag + i + ' '; typed += c; typeKeys(win, p, c); await sleep(3); } };
+  await typeSome('a', 10);
+  setCheckbox(win, cb, true);                 // on, mid-typing
+  await typeSome('b', 10);
+  srv.emit(sid, '\r\nOUTMARK-1\r\n');
+  await typeSome('c', 10);
+  ok(await until(() => srv.sessions[sid].input === typed, 3000), 'every key arrived, in order, once; got ' + JSON.stringify(srv.sessions[sid].input).slice(0, 200));
+  ok(await until(() => /OUTMARK-1/.test(termText(p)), 2000), 'output after the switch is on screen');
+  const n1 = (termText(p).match(/OUTMARK-1/g) || []).length;
+  ok(n1 === 1, 'and shown once; got ' + n1);
+  const nb = srv.wire.length;
+  typeKeys(win, p, 'Z'); typed += 'Z';
+  await until(() => srv.sessions[sid].input === typed, 2000);
+  ok(srv.wire.slice(nb).every(w => ['sealed', 'seal_open'].includes(w.action)), 'after the switch, keys go sealed: ' + srv.wire.slice(nb).map(w => w.action).join(','));
+  ok(innerActions(srv).includes('stream') || innerActions(srv).includes('output'), 'the output channel moved to the sealed path');
+  // and back off
+  setCheckbox(win, cb, false);
+  await typeSome('d', 5);
+  srv.emit(sid, '\r\nOUTMARK-2\r\n');
+  ok(await until(() => srv.sessions[sid].input === typed, 3000), 'keys after switching off arrive once; got ' + JSON.stringify(srv.sessions[sid].input.slice(-40)));
+  ok(await until(() => /OUTMARK-2/.test(termText(p)), 2000), 'output after switching off is on screen');
+  ok((termText(p).match(/OUTMARK-2/g) || []).length === 1, 'once');
+  ok((termText(p).match(/OUTMARK-1/g) || []).length === 1, 'and the earlier output was not replayed twice');
+  ok(!visible($(win, 'sealedBadge')), 'badge hidden when off');
+  cleanup(env);
+});
+
+test('sealed toggle: with SSE in use (a browser), switching on moves the stream to the sealed path, nothing lost or doubled', async () => {
+  const env = await mkEnv({eventSource: 'live'}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  const sid = p.sid;
+  ok(await until(() => srv.wire.some(w => w.kind === 'eventsource'), 1500), 'plain mode streams over EventSource (control)');
+  srv.emit(sid, 'BEFORE-1\r\n');
+  ok(await until(() => /BEFORE-1/.test(termText(p)), 1500), 'plain output on screen');
+  win.openOptions();
+  setCheckbox(win, $(win, 'optSealed'), true);
+  srv.emit(sid, 'DURING-2\r\n');
+  let typed = '';
+  for (let i = 0; i < 20; i++) { typed += 'k' + i + ' '; typeKeys(win, p, 'k' + i + ' '); await sleep(4); }
+  srv.emit(sid, 'AFTER-3\r\n');
+  ok(await until(() => srv.sessions[sid].input === typed, 3000), 'keys arrive once in order; got ' + JSON.stringify(srv.sessions[sid].input).slice(0, 120));
+  ok(await until(() => /AFTER-3/.test(termText(p)), 4000), 'output after the switch on screen');
+  for (const m of ['BEFORE-1', 'DURING-2', 'AFTER-3'])
+    ok((termText(p).match(new RegExp(m, 'g')) || []).length === 1, m + ' shown exactly once; got ' + (termText(p).match(new RegExp(m, 'g')) || []).length);
+  if (process.env.DBG) console.log('DBG', JSON.stringify(srv.inner.filter(r => r.action === 'stream' || r.action === 'output').map(r => r.query)), 'outlen', srv.sessions[sid].out.length, 'cursor', p.outCursor, JSON.stringify(termText(p)));
+  ok(await until(() => innerActions(srv).includes('stream'), 2000), 'the output channel is now the sealed stream; inner: ' + [...new Set(innerActions(srv))].join(','));
+  const es = srv.wire.filter(w => w.kind === 'eventsource').length;
+  srv.emit(sid, 'LATER-4\r\n');
+  await until(() => /LATER-4/.test(termText(p)), 2000);
+  ok(srv.wire.filter(w => w.kind === 'eventsource').length === es, 'no new plain EventSource while on');
+  ok((srv.esInstances || []).every(x => x.readyState === 2), 'the plain EventSource was closed (not left streaming in clear)');
+  cleanup(env);
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Framing: a cut reply is a dropped connection, not an end
+
+test('sealed framing: a stream cut without the end frame is restarted, not taken as the session ending', async () => {
+  const env = await mkEnv({sealed: true, eventSource: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  const sid = p.sid;
+  const streamsBefore = () => srv.inner.filter(r => r.action === 'stream' || r.action === 'output').length;
+  await until(() => (srv.sseStreams || []).length > 0, 1500);
+  ok((srv.sseStreams || []).length > 0, 'the sealed stream is used (fetch streaming); inner actions: ' + [...new Set(innerActions(srv))].join(','));
+  const n0 = streamsBefore();
+  for (const s of srv.sseStreams || []) s.cut();
+  ok(await until(() => streamsBefore() > n0, 6000), 'a new output request follows the cut');
+  ok(p.sid === sid, 'same session (not ended, not reconnected)');
+  srv.emit(sid, 'AFTERCUT\r\n');
+  ok(await until(() => /AFTERCUT/.test(termText(p)), 4000), 'output flows again');
+  cleanup(env);
+});
+
+test('sealed stream: output already waiting when the stream (re)opens is shown, also when it shares a chunk with the opening frames', async () => {
+  for (const mode of ['together', 'split', null]) {
+    const env = await mkEnv({sealed: true, eventSource: true}); const win = env.win, srv = env.srv;
+    srv.chunking = mode;
+    const p = await connect(env);
+    if (!p) { ok(false, 'setup'); cleanup(env); continue; }
+    const sid = p.sid;
+    ok(await until(() => /Welcome/.test(termText(p)), 3000), mode + ': first output shown; got ' + JSON.stringify(termText(p)));
+    for (let round = 1; round <= 3; round++) {
+      const n0 = srv.inner.filter(r => r.action === 'stream').length;
+      for (const st of srv.sseStreams || []) st.cut();
+      srv.emit(sid, 'PENDING-' + round + '\r\n');      // waiting when the client reopens
+      await until(() => srv.inner.filter(r => r.action === 'stream').length > n0, 6000);
+      ok(await until(() => termText(p).includes('PENDING-' + round), 3000), mode + ' round ' + round + ': the waiting output is on screen; screen tail ' + JSON.stringify(termText(p).slice(-60)));
+      ok((termText(p).match(new RegExp('PENDING-' + round, 'g')) || []).length <= 1, mode + ': once');
+    }
+    typeKeys(win, p, 'echo SPLITMARK\r');
+    ok(await until(() => /SPLITMARK/.test(termText(p)), 3000), mode + ': typing and echo still work');
+    cleanup(env);
+  }
+});
+
+test('sealed framing: replies split at any byte boundary are read whole (connect, input, ls, download)', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  srv.chunking = 'split';
+  const p = await connect(env);
+  ok(!!p, 'connect reply read across tiny chunks');
+  if (!p) { cleanup(env); return; }
+  ok(innerActions(srv).includes('connect'), 'and it was a sealed connect');
+  typeKeys(win, p, 'abc');
+  ok(await until(() => srv.sessions[p.sid].input === 'abc', 2000), 'input');
+  const data = randomBytes(70000);
+  srv.files['/home/u/f.bin'] = data;
+  let saved = null;
+  const origCreate = win.URL.createObjectURL;
+  win.URL.createObjectURL = blob => { saved = blob; return 'blob:x'; };
+  const res = await win.startFastDownload(p.id, '/home/u/f.bin');
+  ok(res === true, 'download finished: ' + res);
+  ok(innerActions(srv).includes('download') && innerActions(srv).includes('input'), 'input and download went sealed');
+  if (saved) { const got = new Uint8Array(await saved.arrayBuffer()); ok(same(got, data), 'downloaded bytes identical (' + got.length + ' of ' + data.length + ')'); }
+  else ok(false, 'download produced no blob');
+  win.URL.createObjectURL = origCreate;
+  cleanup(env);
+});
+
+test('sealed framing: a reply cut without the end frame is a failure, not a success', async () => {
+  const env = await mkEnv({sealed: true}); const win = env.win, srv = env.srv;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  // A download whose body is cut before the end frame must not be saved as complete.
+  srv.files['/home/u/cut.bin'] = randomBytes(5000);
+  srv.hooks.download = req => ({status: 200, headers: {'Content-Type': 'application/octet-stream', 'Content-Length': '5000', 'Content-Disposition': 'attachment; filename="cut.bin"'},
+                                body: srv.files['/home/u/cut.bin'].slice(0, 2000), truncate: true});
+  let saved = null;
+  win.URL.createObjectURL = blob => { saved = blob; return 'blob:x'; };
+  const res = await win.startFastDownload(p.id, '/home/u/cut.bin');
+  ok(res === false, 'a truncated download is reported as failed; got ' + res);
+  ok(!saved, 'and no partial file is handed to the user');
+  cleanup(env);
+});
+
+test('sealed stream: the session ending (and the stream being closed) throws nothing in the page', async () => {
+  const env = await mkEnv({sealed: true, eventSource: true}); const win = env.win, srv = env.srv;
+  const errs = [];
+  win.addEventListener('unhandledrejection', e => errs.push('unhandledrejection: ' + (e.reason && (e.reason.name + ' ' + e.reason.message))));
+  win.addEventListener('error', e => errs.push('error: ' + (e.error && (e.error.name + ' ' + e.error.message) || e.message)));
+  const before = failed;
+  const p = await connect(env);
+  if (!p) { ok(false, 'setup'); cleanup(env); return; }
+  await until(() => (srv.sseStreams || []).length > 0 && /Welcome/.test(termText(p)), 3000);
+  // An open stream closed by the page (switching the mode off closes it).
+  win.openOptions(); setCheckbox(win, $(win, 'optSealed'), false); setCheckbox(win, $(win, 'optSealed'), true);
+  await sleep(300);
+  // The shell exits: the server's end event.
+  for (const st of srv.sseStreams || []) st.endEvent();
+  srv.sessions[p.sid].alive = false;
+  await sleep(500);
+  ok(errs.length === 0, 'no uncaught error or rejection in the page; got ' + errs.slice(0, 3).join(' | '));
+  ok(failed === before, 'and none reached the test runner either');
+  cleanup(env);
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Beacon
+
+test('sealed on: the client_diag beacon is not sent (it is sent while off)', async () => {
+  for (const on of [false, true]) {
+    const env = await mkEnv({sealed: on}); const win = env.win, srv = env.srv;
+    const p = await connect(env);
+    if (!p) { ok(false, 'setup'); cleanup(env); continue; }
+    p.paintRecoveries = 1;           // a pane that needed a paint recovery: the beacon's trigger
+    win.dispatchEvent(new win.Event('pagehide'));
+    await sleep(20);
+    if (!on) ok(srv.beacons.length === 1, 'control: off, the beacon goes (proves the trigger); got ' + srv.beacons.length);
+    else ok(srv.beacons.length === 0, 'on: no client_diag beacon; got ' + srv.beacons.length);
+    cleanup(env);
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Upload padding
+
+const KiB = 1024;
+function bucket(n) {
+  n = Math.max(n, 64 * KiB);
+  let best = Infinity;
+  for (let k = 0; k < 40; k++) for (const m of [1, 1.25, 1.5, 1.75]) {
+    const b = 64 * KiB * Math.pow(2, k) * m;
+    if (b >= n && b < best) best = b;
+  }
+  return best;
+}
+function randomBytes(n) { return new Uint8Array(nodeCrypto.randomBytes(n)); }
+
+async function sealedUpload(env, data, name) {
+  const win = env.win, srv = env.srv;
+  const sid = srv.newSession();
+  const p = win.createPane(win.document.getElementById('panes'));
+  p.sid = sid; p.host = 'h'; p.persistent = true; p.cwd = '/home/u';
+  const file = new win.File([data], name);
+  const u0 = srv.uploads.length, i0 = srv.inner.length;
+  win.handleUpload(p.id, {files: [file], value: ''});
+  const banner = () => ((p.el.querySelector('[data-upload-progress] .upload-progress-text') || {}).textContent || '');
+  await until(() => /Saved to|Upload complete|Upload failed|Uploaded/i.test(banner()), 20000);
+  const pieces = srv.uploads.slice(u0);
+  const reqs = srv.inner.slice(i0).filter(r => r.action === 'upload');
+  const tmp = pieces.length ? pieces[0].name : null;
+  return {p, banner: banner(), pieces, reqs, landed: tmp ? srv.files[tmp] : null};
+}
+const same = (a, b) => a && b && a.length === b.length && Buffer.from(a).equals(Buffer.from(b));
+
+test('sealed upload: byte-identical, every piece request the same size, total rounded up to a bucket', async () => {
+  const env = await mkEnv({sealed: true}); const srv = env.srv;
+  for (const size of [1000, 100000, 300 * KiB + 7, 5000000]) {
+    const data = randomBytes(size);
+    const r = await sealedUpload(env, data, 'secret-plan-' + size + '.bin');
+    ok(/Saved to|complete|Uploaded/i.test(r.banner), size + ': upload finished; banner ' + JSON.stringify(r.banner));
+    ok(r.reqs.length > 0, size + ': pieces went sealed');
+    ok(same(r.landed, data), size + ': the file on the target is byte-identical');
+    const wire = [...new Set(r.reqs.map(x => x.wireLen))];
+    ok(wire.length === 1, size + ': every piece request has the same size on the wire; sizes ' + wire.join(','));
+    const P = r.reqs.length ? r.reqs[0].body.length : 0;
+    ok(r.reqs.every(x => x.body.length === P), size + ': every piece carries P bytes of body; ' + [...new Set(r.reqs.map(x => x.body.length))].join(','));
+    ok(r.reqs.every(x => typeof x.header.len === 'number'), size + ': each piece header has "len"');
+    const real = r.reqs.filter(x => !x.header.pad), pad = r.reqs.filter(x => x.header.pad);
+    ok(real.reduce((s, x) => s + x.header.len, 0) === size, size + ': the lens add up to the file size');
+    ok(pad.every(x => x.header.len === 0 && x.header.pad === true), size + ': padding pieces are len 0, pad true');
+    const firstPad = r.reqs.findIndex(x => x.header.pad);
+    ok(firstPad < 0 || r.reqs.slice(firstPad).every(x => x.header.pad), size + ': padding pieces come after the data');
+    const T = r.reqs.length * P, B = bucket(size);
+    ok(T >= B, size + ': total sent ' + T + ' >= bucket ' + B);
+    ok(T <= Math.ceil(B / P) * P + P, size + ': total sent ' + T + ' is the bucket in whole pieces plus at most one extra (B=' + B + ', P=' + P + ')');
+    ok(T >= 64 * KiB, size + ': at least 64 KiB in total');
+    for (const x of r.reqs) ok(!has(srv.wire.find(w => w.action === 'sealed' && w.body.length === x.wireLen).body, 'secret-plan'), 'name not in clear');
+  }
+  cleanup(env);
+});
+
+test('sealed upload: two files in the same bucket look the same on the wire', async () => {
+  const env = await mkEnv({sealed: true});
+  const a = await sealedUpload(env, randomBytes(100000), 'a.bin');
+  const b = await sealedUpload(env, randomBytes(110000), 'bb.bin');       // both in the 112 KiB bucket
+  const sa = [...new Set(a.reqs.map(x => x.wireLen))], sb = [...new Set(b.reqs.map(x => x.wireLen))];
+  ok(sa.length === 1 && sb.length === 1 && sa[0] === sb[0], 'same piece request size; ' + sa + ' vs ' + sb);
+  ok(Math.abs(a.reqs.length - b.reqs.length) <= 1, 'same count up to the random extra piece; ' + a.reqs.length + ' vs ' + b.reqs.length);
+  cleanup(env);
+});
+
+test('sealed upload: a piece cut by the network shrinks P, and the new P applies to every later piece', async () => {
+  const env = await mkEnv({sealed: true}); const srv = env.srv;
+  let cut = 0;
+  const realExchange = srv.exchange.bind(srv);
+  // The first piece request is cut on the network (no reply).
+  srv.exchange = async (kind, url, method, body) => {
+    if (/action=sealed/.test(url) && body.length > 200000 && cut === 0) { cut++; srv.wire.push({kind, url, action: 'sealed', method, body, status: 0}); throw new TypeError('Failed to fetch'); }
+    return realExchange(kind, url, method, body);
+  };
+  srv.xhrCut = (xhr, b) => { if (/action=sealed/.test(xhr.url) && b.length > 200000 && cut === 0) { cut++; return true; } return false; };
+  const data = randomBytes(9 * 1024 * 1024 + 3);
+  const r = await sealedUpload(env, data, 'big.bin');
+  ok(cut === 1, 'the first piece was cut');
+  ok(same(r.landed, data), 'the file is byte-identical despite the cut');
+  const sizes = r.reqs.map(x => x.wireLen);
+  ok(new Set(sizes).size === 1, 'every piece that reached the server after the shrink has one size; got ' + [...new Set(sizes)].join(','));
+  cleanup(env);
+});
+
+async function proxyCutUpload(replies) {
+  for (const [what, reply] of Object.entries(replies)) {
+    const env = await mkEnv({sealed: true}); const srv = env.srv;
+    let cuts = 0;
+    const realExchange = srv.exchange.bind(srv);
+    // A proxy that cuts every request body over 1 MiB.
+    const tooBig = n => n > 1024 * 1024;
+    srv.exchange = async (kind, url, method, body) => {
+      if (/action=sealed/.test(url) && tooBig(body.length)) { cuts++; srv.wire.push({kind, url, action: 'sealed', method, body, status: reply.status}); return reply; }
+      return realExchange(kind, url, method, body);
+    };
+    const data = randomBytes(6 * 1024 * 1024 + 11);
+    const r = await sealedUpload(env, data, 'proxy.bin');
+    ok(cuts >= 1, what + ': the proxy cut at least one piece (' + cuts + ')');
+    ok(same(r.landed, data), what + ': the file still lands whole and identical; banner ' + JSON.stringify(r.banner));
+    ok(/Saved to|complete|Uploaded/i.test(r.banner), what + ': finished, not failed');
+    ok(r.reqs.every(x => x.body.length <= 1024 * 1024), what + ': every piece that got through is under the cut size');
+    cleanup(env);
+  }
+}
+
+test('sealed upload: a body cut by a proxy ("client sent fewer bytes", from nginx or websh) shrinks the piece, the file lands whole (O7b)', async () => {
+  await proxyCutUpload({
+    'nginx 400 "client sent fewer bytes" (HTML)': {status: 400, bytes: enc.encode('<html><body>400 Bad Request: client sent fewer bytes than Content-Length</body></html>'), headers: {'Content-Type': 'text/html'}},
+    'websh 400 "client sent fewer bytes" (JSON)': {status: 400, bytes: enc.encode(JSON.stringify({error: 'client sent fewer bytes than Content-Length'})), headers: {'Content-Type': 'application/json'}},
+  });
+});
+
+// A cut body that reaches websh looking complete (a middlebox that
+// re-chunks and ends the body cleanly) fails decryption: "bad frame".
+// For an upload piece that is a truncation like any other. NOT in the
+// spec - a decision for the coordinator; see the report.
+test('sealed upload: a piece answered "bad frame" (a cut that looked complete) is treated as a cut too (O7b)', async () => {
+  await proxyCutUpload({
+    'bad frame': {status: 400, bytes: enc.encode(JSON.stringify({error: 'bad frame'})), headers: {'Content-Type': 'application/json'}},
+  });
+});
+
+// =====================================================================
+process.on('unhandledRejection', e => {
+  failed++;
+  failures.push(current + ': unhandled rejection: ' + (e && e.message || e));
+  console.log('  UNHANDLED REJECTION: ' + (e && e.stack || e));
+});
+(async () => {
+  for (const s of scenarios.filter(x => new RegExp(process.env.ONLY || '.').test(x.name))) {
+    current = s.name;
+    console.log('\n=== ' + s.name + ' ===');
+    try { await s.fn(); } catch (e) {
+      failed++;
+      failures.push(s.name + ': ' + e.message);
+      console.log('  THREW: ' + (e.stack || e.message));
+    }
+  }
+  for (const e of envs) try { e.dom.window.close(); } catch (x) {}
+  console.log('\n===========================================');
+  console.log('  passed: ' + passed + '   failed: ' + failed);
+  if (failed) {
+    console.log('  failures:');
+    failures.forEach(f => console.log('    - ' + f));
+  }
+  process.exit(failed ? 1 : 0);
+})();
