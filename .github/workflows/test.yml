@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        python-version: ["3.12"]
         # `with` exercises the encrypted-flow tests; `without` asserts
         # the 501 gate path so a deploy without cryptography stays sane.
         crypto: ["with", "without"]
