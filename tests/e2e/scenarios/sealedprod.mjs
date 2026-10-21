@@ -7,7 +7,10 @@
 // body, not one 200. What must hold: switched on with N panes open,
 // every pane keeps working - typed text comes back - and sealed requests
 // get answers.
-import { sleep, until, tagOf } from '../lib.mjs';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { sleep, until, tagOf, cfg } from '../lib.mjs';
 const N = +(process.env.E2E_SEALEDPROD_PANES || 6);
 export const meta = { about: `sealed mode on behind a production-like front (nginx stream + PROXY protocol, HTTP/2), ${N} persistent panes switched on live: all keep working`, ssh: true, local: true, front: 'prod' };
 
@@ -29,7 +32,17 @@ export async function run({ b, t, front }) {
   };
   try {
     const panes = [await b.connect({ persistent: true })];
-    for (let k = 1; k < N; k++) panes.push(await b.split({ persistent: true }));
+    // A grid, not six slivers: split alternately down and across so no
+    // pane is a few columns wide (a 6-column tmux pane garbles readline's
+    // redraw and the check could not read its own output).
+    const plan = [[0, 'v'], [0, 'h'], [1, 'h'], [2, 'h'], [3, 'h'], [4, 'v'], [5, 'v']];
+    for (let k = 1; k < N; k++) {
+      const [from, dir] = plan[k - 1];
+      const before = await b.ev('Object.keys(panes).length');
+      await b.ev(`(() => { splitPane(Object.keys(panes)[${from}], ${JSON.stringify(dir)}); ${b._fill(true)} doConnect(); return 1; })()`);
+      panes.push(await b._ready(before));
+    }
+    t.note('pane sizes: ' + JSON.stringify(await b.ev(`Object.values(panes).map(p => [p.term.cols, p.term.rows])`)));
     t.ok(panes.length === N, `${N} persistent panes connected (plain)`);
     // The owner is far from the server: a real round trip.
     const lat = +(process.env.E2E_SEALEDPROD_LATENCY || 80);
@@ -44,14 +57,22 @@ export async function run({ b, t, front }) {
     t.note('requests open just before the switch: ' + JSON.stringify(open(tOn - 50)));
     t.note('requests open 1.5 s after it: ' + JSON.stringify(open(Date.now())));
     const tag = tagOf('P');
-    for (const i of panes) await b.type(i, `echo ${tag}_${i}_$((40+2))\r`);
+    // Six persistent (tmux) panes split side by side are a few columns
+    // wide, and tmux scrolls inside its own screen: a long echoed line can
+    // leave the terminal before it is read. So each pane runs a command
+    // whose effect is checked on disk (the target is this machine when
+    // the file shows up there) and whose output is short (Z<i*7+40>).
+    const marks = panes.map(i => path.join(os.homedir(), `.websh-e2e-sp-${tag}-${i}`));
+    for (const i of panes) await b.type(i, `touch ~/.websh-e2e-sp-${tag}-${i}; echo Z$((${i}*7+40))\r`);
     const results = [];
     for (const i of panes) {
-      // Panes split six ways are narrow: the line wraps, so look at the
-      // screen with its rows joined (the token has no spaces).
-      const ok = await until(async () => (await b.screen(i)).replace(/\n/g, '').includes(`${tag}_${i}_42`), 15000);
-      results.push(ok >= 0);
-      t.ok(ok >= 0, `pane ${i}: typed text came back` + (ok < 0 ? '; screen: ' + JSON.stringify((await b.lines(i)).filter(Boolean).slice(-3)) : ''));
+      const want = 'Z' + (i * 7 + 40);
+      const seen = await until(async () => (await b.screen(i)).replace(/\n/g, '').includes(want), 15000);
+      const local = fs.existsSync(marks[i]) || await until(async () => fs.existsSync(marks[i]), 3000) >= 0;
+      results.push(seen >= 0);
+      t.ok(seen >= 0, `pane ${i}: the command's output came back` + (seen < 0 ? '; screen: ' + JSON.stringify((await b.lines(i)).filter(Boolean).slice(-40)) + ' size ' + JSON.stringify(await b.ev(`(() => { const p = Object.values(panes)[${i}]; return [p.term.cols, p.term.rows]; })()`)) : ''));
+      if (cfg.host === '127.0.0.1' || fs.existsSync(path.dirname(marks[i]))) t.ok(local, `pane ${i}: the typed command ran (its file exists)`);
+      try { fs.unlinkSync(marks[i]); } catch (e) {}
     }
     t.note('pane transports: ' + JSON.stringify(await b.state()));
     t.note('requests by action (inner actions too under E2E_SEALED=1): ' + JSON.stringify(b.requests));
