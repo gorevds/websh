@@ -217,8 +217,14 @@ function proxy_upload($url) {
     curl_setopt($ch, CURLOPT_INFILE, $in);
     curl_setopt($ch, CURLOPT_INFILESIZE, $len);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    // A piece is raw bytes, or the same bytes as {"b64": ...} JSON when
+    // binary uploads are blocked on the user's machine: keep its type,
+    // the backend decodes by it.
+    $ctype = isset($_SERVER['CONTENT_TYPE']) ? (string) $_SERVER['CONTENT_TYPE'] : '';
+    $semi = strpos($ctype, ';');
+    $ctype = strtolower(trim($semi === false ? $ctype : substr($ctype, 0, $semi)));
     curl_setopt($ch, CURLOPT_HTTPHEADER, backend_headers(array(
-        'Content-Type: application/octet-stream',
+        'Content-Type: ' . ($ctype === 'application/json' ? 'application/json' : 'application/octet-stream'),
         'Content-Length: ' . $len,
     )));
     curl_setopt($ch, CURLOPT_TIMEOUT, 0);

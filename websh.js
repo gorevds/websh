@@ -7441,6 +7441,8 @@ function uploadNextFile(p) {
   u.sealT = sealedUploadBucket(file.size);
   u.sealSent = 0;
   u.sealExtra = Math.random() < 0.5;
+  // This browser found binary uploads blocked recently: start as text.
+  if (!u.text && uploadTextAvailable() && uploadTextMarked()) u.text = true;
   if (serverConfig && serverConfig.upload_chunks && file.size > 0) {
     sendUploadPiece(p, u, file, 0);
   } else {
@@ -7492,6 +7494,53 @@ function uploadBodyTruncated(xhr, resp) {
   return typeof t === 'string' && re.test(t);
 }
 
+// ── Uploads as text when binary is blocked ─────────────────────────
+// An endpoint-security product that intercepts HTTPS on the owner's Mac
+// answers every application/octet-stream POST itself (503 text/html);
+// the same bytes as base64 inside JSON pass. Uploads start binary as
+// always; when binary is blocked - a reply that is not websh's, or cuts
+// that go on at the smallest piece size, where the upload would
+// otherwise give up - the upload switches to {"b64": ...} pieces and
+// carries on from the size the server has (409 resume), and the browser
+// remembers it for UPLOAD_TEXT_DAYS. Only with a server that says
+// upload_text: an older one would write the JSON into the file.
+const UPLOAD_TEXT_KEY = 'websh_upload_text';
+const UPLOAD_TEXT_DAYS = 30;
+
+function uploadTextAvailable() {
+  return !!(serverConfig && serverConfig.upload_text);
+}
+
+function uploadTextMarked() {
+  try {
+    let at = parseInt(localStorage.getItem(storageKey(UPLOAD_TEXT_KEY)) || '', 10);
+    if (!at) return false;
+    if (Date.now() - at < UPLOAD_TEXT_DAYS * 86400000) return true;
+    localStorage.removeItem(storageKey(UPLOAD_TEXT_KEY));
+  } catch (e) {}
+  return false;
+}
+
+// Switch this upload to text pieces. False when that is not possible
+// (sealed - already text -, a server without upload_text, or already
+// text): the caller then does what it did before.
+function switchUploadToText(p, u) {
+  if (u.text || sealedOn() || !uploadTextAvailable()) return false;
+  u.text = true;
+  try { localStorage.setItem(storageKey(UPLOAD_TEXT_KEY), String(Date.now())); } catch (e) {}
+  showToast('Binary uploads are blocked on this computer (antivirus or proxy); ' +
+            'sending uploads as text from now on.', 'warn');
+  // Fresh tries for the new form; the piece size stays as it is. The
+  // wall-clock budget does NOT start over (u.lastAdvance is kept): one
+  // upload has one, so a path that fails either way still ends with the
+  // visible failure in time (O7b).
+  u.chunkFails = 0;
+  u.floorFails = 0;
+  u.cutSeen = false;
+  console.log('upload: binary blocked, continuing as text');
+  return true;
+}
+
 function sendUploadPiece(p, u, file, offset) {
   if (!u || u.cancelled || p.upload !== u) return;
   // Sealed, every piece of the file is the same size on the wire: the
@@ -7500,9 +7549,11 @@ function sendUploadPiece(p, u, file, offset) {
   let step = sealed ? Math.min(u.chunkSize, u.sealT) : u.chunkSize;
   let end = Math.min(file.size, offset + step);
   let xhr = newApiXhr(sealed ? {to: step} : null);
+  // Text piece: the same bytes as {"b64": ...} (sealed mode is text already).
+  let asText = !sealed && !!u.text;
   u.xhr = xhr;
   xhr.open('POST', uploadUrl(p, u, offset), true);
-  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.setRequestHeader('Content-Type', asText ? 'application/json' : 'application/octet-stream');
   xhr.timeout = UPLOAD_CHUNK_TIMEOUT_MS;
 
   // Mid-body stall watchdog. The owner's proxy cut uploads by SIZE while
@@ -7527,7 +7578,7 @@ function sendUploadPiece(p, u, file, offset) {
       xhr.onload = xhr.onerror = xhr.ontimeout = null;   // the abort must not re-enter
       try { xhr.abort(); } catch (e) {}
       u.xhr = null;
-      retry('stalled - no data moved for ' + Math.round(stallMs / 1000) + ' s', true);
+      retry('stalled - no data moved for ' + Math.round(stallMs / 1000) + ' s', true, true);
     }, stallMs);
   };
 
@@ -7540,7 +7591,9 @@ function sendUploadPiece(p, u, file, offset) {
   let lastLoaded = 0;
   xhr.upload.onprogress = e => {
     if (!u || u.cancelled) return;
-    u.fileOffset = offset + e.loaded;
+    // A text piece is ~4/3 of the bytes it carries: show file bytes.
+    u.fileOffset = offset + (asText && e.total
+      ? Math.floor((end - offset) * Math.min(1, e.loaded / e.total)) : e.loaded);
     updateUploadProgress(p);
     if (e.loaded > lastLoaded) { lastLoaded = e.loaded; armWatchdog(); }
   };
@@ -7556,16 +7609,26 @@ function sendUploadPiece(p, u, file, offset) {
   // probable cause and an action; otherwise fall back to the specific
   // reason the caller computed.
   let giveUp = fallback => {
+    // Cut even at the smallest piece: binary itself may be what is
+    // blocked. Try text before giving up (once; see switchUploadToText).
+    // A stall is not that (no reply says binary was refused).
+    if (u.cutSeen && !u.lastFailStall && switchUploadToText(p, u)) {
+      sendUploadPiece(p, u, file, offset);
+      return;
+    }
     finishUpload(p, false, u.cutSeen
       ? 'blocked or cut short — a proxy or firewall on this network is' +
         ' likely limiting uploads; a smaller file may still go through'
       : fallback);
   };
 
-  let retry = (why, cut) => {
+  // `stall`: no reply at all (the watchdog, a timeout) - a cut, but never
+  // a reason to try text: nothing says binary was refused.
+  let retry = (why, cut, stall) => {
     if (!u || u.cancelled || p.upload !== u) return;
     clearWatchdog();
     if (cut) u.cutSeen = true;
+    u.lastFailStall = !!stall;
     u.chunkFails++;
     // Halve from the first cut (down toward the floor); a non-cut
     // failure (a plain 5xx server blip) keeps the size - the piece is
@@ -7614,6 +7677,14 @@ function sendUploadPiece(p, u, file, offset) {
       setTimeout(() => sendUploadPiece(p, u, file, offset), 3000);
       return;
     }
+    // Not websh's reply at all (an interceptor's own 503 text/html): the
+    // binary body is what is refused. Switch to text at once, no halving.
+    if ((xhr.status < 200 || xhr.status > 299) &&
+        !(resp && typeof resp === 'object' && typeof resp.error === 'string') &&
+        !uploadBodyTruncated(xhr, resp) && switchUploadToText(p, u)) {
+      sendUploadPiece(p, u, file, offset);
+      return;
+    }
     if (xhr.status !== 200 || !resp || !resp.ok) {
       // nginx or a proxy that truncated the body answers 400 (sometimes
       // 499) with "client sent fewer bytes than Content-Length" before
@@ -7648,9 +7719,13 @@ function sendUploadPiece(p, u, file, offset) {
   // (describeUploadError keeps that reason for its own callers and the
   // log line here).
   xhr.onerror = () => { clearWatchdog(); retry(describeUploadError(xhr, null, u), true); };
-  xhr.ontimeout = () => { clearWatchdog(); retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s', true); };
+  xhr.ontimeout = () => { clearWatchdog(); retry('no answer from the server for ' + Math.round(UPLOAD_CHUNK_TIMEOUT_MS / 1000) + ' s', true, true); };
   armWatchdog();
-  xhr.send(file.slice(offset, end));
+  if (!asText) { xhr.send(file.slice(offset, end)); return; }
+  file.slice(offset, end).arrayBuffer().then(buf => {
+    if (!u || u.cancelled || u.xhr !== xhr) return;
+    xhr.send('{"b64":"' + _b64enc(new Uint8Array(buf)) + '"}');
+  }, () => { if (u.xhr === xhr) { clearWatchdog(); retry('the file could not be read', false); } });
 }
 
 // Every byte of the file is on the target. Sealed, pad-only pieces of

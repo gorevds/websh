@@ -106,6 +106,20 @@ limiting uploads; a smaller file may still go through"). A genuinely
 final reply (413, invalid path) still stops at once with its own
 message, never the proxy text; a slow-but-progressing upload is never
 killed by the wall-clock cap (onprogress re-arms it).
+Where binary itself is blocked (an HTTPS-intercepting security product
+on the user's machine answers application/octet-stream POSTs itself),
+the upload does not give up: a non-websh reply, or cuts at the floor,
+switch it to `{"b64": ...}` pieces that continue from the server's size
+(the 409 resume), and the browser keeps that for 30 days. A stall (no
+reply at all) never switches, and the switch never restarts the
+upload's one wall-clock budget: a proxy that holds pieces still ends in
+the visible failure within `UPLOAD_WALLCLOCK_MS` (e2e `proxytrunc`). Off that
+path every request is what it was.
+Guard (text fallback): backend `test_upload_text.py`; frontend
+`test_upload_text.js` (`upload text: …`); e2e `uploadblocked` (an
+interceptor that answers octet-stream POSTs 503: on the code before the
+fallback both uploads failed "server error (HTTP 503)", as the owner's
+did 26 times in 12-21 Oct).
 Guard: frontend `upload in pieces: a truncated piece shrinks on the next
 try`, `a 400 "fewer bytes" truncation … completes whole`, `forward
 progress resets the try budget and keeps the shrunk size`, `an

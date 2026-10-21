@@ -160,6 +160,28 @@ whole. A truncation never reaches the server as a final error; the
 client only gives up (fast, with a "blocked or cut short" banner) when
 no piece lands within its wall-clock budget.
 
+#### Text pieces
+The same piece may come as `Content-Type: application/json` with body
+`{"b64": "<base64>"}` (standard, padded): the decoded bytes are the
+piece, and everything else - `offset` rules, `409` with `size`, the
+reply, `MAX_UPLOAD_SIZE` (applied to the decoded size), the access-log
+`bytes` - is as for a raw piece. Bad JSON or a missing / invalid `b64`
+→ `400 {"error": "invalid upload body"}`, nothing written; a body
+shorter than its Content-Length → `502 {"error": "client sent fewer
+bytes than Content-Length"}`, as for a cut raw piece. Advertised by `"upload_text": true` in
+`/api/config` (an older server would write the JSON into the file).
+Raw bodies behave exactly as before.
+
+Why: an endpoint-security product that intercepts HTTPS on a user's
+machine answered every `application/octet-stream` POST itself
+(`503 text/html`), while JSON passed. The client starts every upload
+binary; when binary is blocked - a non-2xx reply that is not websh's
+JSON, or cuts that go on at the smallest piece, where it would
+otherwise give up - it continues the same upload as text pieces from
+the size the server reports, and remembers that for the browser for
+30 days (`localStorage` `websh_upload_text`, the time it was set).
+`api.php` keeps the piece's content type.
+
 ### POST /api/upload_finalize
 Body: `session_id`, `tmp`, `final`, optional `dir`. Moves `$HOME/<tmp>`
 to its destination with collision auto-increment (`a.txt` → `a(1).txt`).
@@ -277,7 +299,8 @@ Public configuration for the client. Reply: `{"connections": [...],
 "restrict_hosts": bool, "isolate_storage": bool, "session_timeout":
 int, "version": str, "proto": int, "vault_enabled": bool}`
 (connection entries carry no secrets; deployments may extend this with
-additive fields). Also `"upload_chunks": true` and
+additive fields). Also `"upload_chunks": true`, `"upload_text": true`
+(upload pieces may be `{"b64": ...}` JSON, see `POST /api/upload`) and
 `"sealed": {"available": bool, "identity": "<fingerprint>"|null}` -
 whether this server can open a [sealed channel](#sealed-channel) (it
 can iff `cryptography` imports and its identity key loads) and the

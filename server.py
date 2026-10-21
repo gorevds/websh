@@ -1773,6 +1773,9 @@ def config_public():
         # that appends them; an older one would overwrite the file with
         # each piece.
         "upload_chunks": True,
+        # An upload piece may also come as {"b64": ...} JSON (the client's
+        # fallback when binary POSTs are blocked on the user's machine).
+        "upload_text": True,
         # Sealed channel: whether this server can open one, and the
         # fingerprint of its identity key (the browser pins it on first
         # use and shows it next to the setting).
@@ -3889,6 +3892,10 @@ SEALED_FORBIDDEN = frozenset({"seal_open", "sealed", "config", "ping",
 # The largest request accepted: a frame holding a full request body plus
 # one upload piece (the client's largest is 4 MiB) and its overhead, as
 # base64 inside {"f": ...} (4/3 of the frame).
+# A text upload piece ({"b64": ...}, see Handler._upload) is read into
+# memory to decode: the client's largest piece (4 MiB) as base64, and
+# room to spare.
+UPLOAD_TEXT_MAX_BODY = (8 * 1024 * 1024) * 4 // 3 + 1024
 SEALED_MAX_BODY = (max(MAX_BODY_SIZE, 8 * 1024 * 1024) + 64 * 1024) * 4 // 3 \
     + 1024
 
@@ -4702,7 +4709,10 @@ class Handler(BaseHTTPRequestHandler):
                 inner_headers[k] = v
         inner_headers["Content-Length"] = str(len(inner_body))
         if method == "POST":
-            inner_headers["Content-Type"] = "application/json"
+            # An upload piece inside a frame is raw bytes; everything
+            # else posted is JSON.
+            inner_headers["Content-Type"] = "application/octet-stream" \
+                if action == "upload" else "application/json"
         saved = (self.path, self.headers, self.rfile, self.wfile,
                  self.command)
         self.path = "/api/" + action + \
@@ -5865,6 +5875,39 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             length = 0
+        body_stream = self.rfile
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0]
+        if ctype.strip().lower() == "application/json" and length > 0:
+            # A text piece: {"b64": "<base64>"}, the same bytes a raw
+            # piece carries. The client falls back to it when something
+            # on the user's machine blocks binary POSTs (an HTTPS-
+            # intercepting security product answered every
+            # application/octet-stream request itself). Everything after
+            # this - offset rules, size cap, reply, access log - sees the
+            # decoded bytes, exactly as for a raw piece.
+            if length > UPLOAD_TEXT_MAX_BODY:
+                self._json({"error": "file too large"}, 413)
+                return
+            try:
+                raw = self.rfile.read(length)
+            except socket.timeout:
+                raw = b""
+            if len(raw) < length:
+                # The answer a cut raw piece gets (upload_file's 502).
+                self._json({"error": "client sent fewer bytes than "
+                                     "Content-Length"}, 502)
+                return
+            try:
+                env = json.loads(raw.decode("utf-8"))
+                b64 = env.get("b64") if isinstance(env, dict) else None
+                if not isinstance(b64, str):
+                    raise ValueError("no b64")
+                data = base64.b64decode(b64, validate=True)
+            except Exception:
+                self._json({"error": "invalid upload body"}, 400)
+                return
+            body_stream = io.BytesIO(data)
+            length = len(data)
         if length <= 0:
             self._json({"error": "empty body"}, 400)
             return
@@ -5891,7 +5934,7 @@ class Handler(BaseHTTPRequestHandler):
         if session is None:
             return
 
-        ok, err = session.upload_file(rel_path, self.rfile, length,
+        ok, err = session.upload_file(rel_path, body_stream, length,
                                       offset=offset)
         host_for_log = getattr(session, "_host", "")
         if not ok and err.startswith("offset mismatch size="):
