@@ -220,7 +220,15 @@ fallback value and must be present. The reply's `path` is always the
 directory actually listed — clients should read their position back
 from it rather than assuming the request was honoured.
 
-Entries arrive sorted directories-first by name. Clients are free to
+`type` is `d` directory, `f` regular file, `l` symlink, `o` anything
+else. A symlink whose target is a directory also has `"dir": true`
+(tested in the same remote loop, `[ -L "$f" ] && [ -d "$f" ]`); the
+bundled client lists, sorts and opens it as a folder at the link's own
+path, while `rm` and `mv` still act on the link only. Links to files
+and dangling links have no `dir`.
+
+Entries arrive sorted directories-first by name (links to directories
+count as directories). Clients are free to
 re-sort (the bundled one sorts by `mtime` descending by default).
 
 ### POST /api/rm

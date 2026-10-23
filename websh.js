@@ -8313,7 +8313,8 @@ function renderFbEntries(entries, absPath) {
   }
   for (let e of sortFbEntries(entries)) {
     let fullPath = absPath.endsWith('/') ? absPath + e.name : absPath + '/' + e.name;
-    let row = makeFbRow(e.type, e.name, e.type !== 'd' ? e.size : null, e.mtime);
+    let row = makeFbRow(e.type, e.name, fbIsDir(e) ? null : e.size, e.mtime,
+                        {dirLink: fbIsDir(e) && e.type === 'l'});
     // While a row is showing an inline editor (delete-confirm or rename)
     // it stops being a download/navigate target — otherwise the click
     // that lands next to the editor would act on the row underneath.
@@ -8322,7 +8323,9 @@ function renderFbEntries(entries, absPath) {
           row.classList.contains('fb-edit')) return;
       fn();
     });
-    if (e.type === 'd') {
+    if (fbIsDir(e)) {
+      // A link to a folder opens at the link's own path: the breadcrumbs
+      // show it, and Up goes back to the folder the link is in.
       activate(() => loadFbDir(fullPath));
     } else {
       activate(() => {
@@ -8371,10 +8374,23 @@ function makeFbRowKeyboardable(row) {
   });
 }
 
+// A folder, or a symlink whose target is one (the server's "dir": true;
+// the owner's ~/job/<name> -> an rclone mount was listed with the files
+// and a click downloaded it). Such a link is shown, sorted and opened as
+// a folder; delete and rename still act on the link only (type stays
+// "l"). A link to a file and a dangling link are unchanged.
+function fbIsDir(e) {
+  return e.type === 'd' || (e.type === 'l' && e.dir === true);
+}
+function fbRowIsDir(row) {
+  return row.dataset.type === 'd' || row.dataset.dirlink === '1';
+}
+
 function makeFbRow(type, name, size, mtime, o) {
   let row = document.createElement('div');
   row.className = 'fb-row';
-  let icon = ic(type === 'd' ? 'folder' : type === 'l' ? 'link' : 'file');
+  let dirLink = !!(o && o.dirLink);
+  let icon = ic(type === 'd' || dirLink ? 'folder' : type === 'l' ? 'link' : 'file');
   let sizeStr = '';
   if (size !== null && size !== undefined) {
     if (size < 1024) sizeStr = size + ' B';
@@ -8386,11 +8402,14 @@ function makeFbRow(type, name, size, mtime, o) {
   // the metadata columns. The ".." row gets no buttons, but the empty
   // group keeps its width so the size/date columns stay aligned.
   row.dataset.type = type;
+  if (dirLink) { row.dataset.dirlink = '1'; row.title = 'Link to a folder'; }
   row.innerHTML =
     (o && o.noActions ? '<span class="fb-ck-sp" style="width:14px;flex-shrink:0"></span>'
                       : '<input type="checkbox" class="fb-ck" tabindex="-1">') +
     '<span class="fb-ic">' + icon + '</span>' +
-    '<span class="fb-nm">' + esc(name) + '</span>' +
+    '<span class="fb-nm">' + esc(name) +
+      (dirLink ? '<span class="fb-lnk" title="Link to a folder">' + ic('link') + '</span>' : '') +
+    '</span>' +
     '<span class="fb-sz">' + esc(sizeStr) + '</span>' +
     '<span class="fb-dt">' + esc(fbDate(mtime)) + '</span>' +
     '<span class="fb-act"></span>';
@@ -8452,7 +8471,7 @@ function sortFbEntries(entries) {
     mtime: (a, b) => (a.mtime || 0) - (b.mtime || 0),
   }[settings.fbSort];
   return entries.slice().sort((a, b) => {
-    let ad = a.type === 'd' ? 0 : 1, bd = b.type === 'd' ? 0 : 1;
+    let ad = fbIsDir(a) ? 0 : 1, bd = fbIsDir(b) ? 0 : 1;
     if (ad !== bd) return ad - bd;
     if (!cmp) return byName(a, b) * dir;
     // Ties broken by name ascending regardless of `dir`, so equal sizes
@@ -8787,7 +8806,7 @@ function syncFbSel() {
   let files = 0, dirs = 0;
   for (let row of fbVisibleRows()) {
     if (!_fbSel.has(row.dataset.name)) continue;
-    if (row.dataset.type === 'd') dirs++; else files++;
+    if (fbRowIsDir(row)) dirs++; else files++;
   }
   let parts = [];
   if (files) parts.push(files + (files === 1 ? ' file' : ' files'));
@@ -8862,8 +8881,7 @@ function fbSelected(kind) {
   let dir = _fbCurPath;
   return fbVisibleRows()
     .filter(r => _fbSel.has(r.dataset.name))
-    .filter(r => !kind || (kind === 'f' ? r.dataset.type !== 'd'
-                                        : r.dataset.type === 'd'))
+    .filter(r => !kind || (kind === 'f' ? !fbRowIsDir(r) : fbRowIsDir(r)))
     .map(r => ({name: r.dataset.name, type: r.dataset.type, row: r,
                 path: (dir === '/' ? '' : dir) + '/' + r.dataset.name}));
 }

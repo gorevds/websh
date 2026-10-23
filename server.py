@@ -3554,7 +3554,9 @@ class SSHSession(object):
             'printf "PWD:%s\\0" "$PWD"; '
             'for f in * .[!.]* ..?*; do '
               '[ -e "$f" ] || [ -L "$f" ] || continue; '
-              'if [ -L "$f" ]; then t=l; '
+              # A link to a directory is "L" here (sent as type "l" +
+              # "dir": true): the browser lists and opens it as a folder.
+              'if [ -L "$f" ]; then if [ -d "$f" ]; then t=L; else t=l; fi; '
               'elif [ -d "$f" ]; then t=d; '
               'elif [ -f "$f" ]; then t=f; '
               'else t=o; fi; '
@@ -3591,13 +3593,17 @@ class SSHSession(object):
             if len(parts) != 4 or not parts[3]:
                 continue
             ftype, size_s, mtime_s, name = parts
-            entries.append({
+            entry = {
                 "name": name,
-                "type": ftype,
+                "type": "l" if ftype == "L" else ftype,
                 "size": int(size_s) if size_s.isdigit() else 0,
                 "mtime": int(mtime_s) if mtime_s.isdigit() else 0,
-            })
-        entries.sort(key=lambda e: (e["type"] != "d", e["name"].lower()))
+            }
+            if ftype == "L":
+                entry["dir"] = True     # a symlink whose target is a directory
+            entries.append(entry)
+        entries.sort(key=lambda e: (not (e["type"] == "d" or e.get("dir")),
+                                    e["name"].lower()))
         return entries, abs_path, None
 
     def remove_path(self, abs_path):
